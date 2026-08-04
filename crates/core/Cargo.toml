@@ -15,7 +15,8 @@ authors.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Proc-macro only — generates no linkage, so the no-system-libraries rule holds.
+# Pure Rust (a normal lib plus the `thiserror-impl` proc-macro; no `links` key and no
+# -sys dependency anywhere in its tree), so the no-system-libraries rule holds.
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -15,7 +15,6 @@
 //! out individually below; each one is a real behaviour that cost time to find.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// The accounting group that rclone assigns to VFS write-back uploads.
 ///
@@ -47,11 +46,14 @@ pub const GLOBAL_STATS_GROUP: &str = "global_stats";
 pub struct CoreStats {
     /// Bytes transferred so far across all active transfers.
     #[serde(default)]
-    pub bytes: u64,
+    pub bytes: i64,
     /// Total bytes expected across all active transfers.
     ///
-    /// Signed, because rclone derives this from object sizes and propagates the
-    /// `-1` "size unknown" sentinel into the sum. See [`Transfer::size`].
+    /// Signed because rclone's field is a Go `int64` and is computed by subtraction
+    /// (`stats.go`), so a transient negative is representable. Note it does *not*
+    /// propagate the `-1` unknown-size sentinel — `transfermap.go` filters those out
+    /// before summing — so this is signed for range safety, not because `-1` is
+    /// expected here. See [`Transfer::size`], where `-1` genuinely does appear.
     #[serde(default)]
     pub total_bytes: i64,
     /// Aggregate throughput in bytes per second.
@@ -65,20 +67,20 @@ pub struct CoreStats {
     /// Transfers that have **completed**. In-flight transfers are not counted here,
     /// which is why this reads `0` throughout a single upload.
     #[serde(default)]
-    pub transfers: u64,
+    pub transfers: i64,
     /// Transfers started, including those still running.
     #[serde(default)]
-    pub total_transfers: u64,
+    pub total_transfers: i64,
     #[serde(default)]
-    pub errors: u64,
+    pub errors: i64,
     #[serde(default)]
     pub fatal_error: bool,
     #[serde(default)]
     pub retry_error: bool,
     #[serde(default)]
-    pub checks: u64,
+    pub checks: i64,
     #[serde(default)]
-    pub total_checks: u64,
+    pub total_checks: i64,
     #[serde(default)]
     pub elapsed_time: f64,
     #[serde(default)]
@@ -137,8 +139,12 @@ pub struct Transfer {
     #[serde(default)]
     pub size: i64,
     /// Bytes uploaded so far.
+    ///
+    /// Signed for the same range-safety reason as [`Self::size`]: rclone's field is
+    /// a Go `int64`, and a `u64` would abort the whole response rather than one
+    /// field if it ever went negative.
     #[serde(default)]
-    pub bytes: u64,
+    pub bytes: i64,
     /// Completion percentage.
     ///
     /// Observed to top out at 98 — a transfer's entry disappears from
@@ -192,27 +198,25 @@ impl Transfer {
     ///
     /// Pass [`DiskCache::path`] for the mount in question.
     ///
-    /// `src_fs` is the cache path with a backend tag prepended — `:local{8un-i}:` —
-    /// so the tag is stripped and the remainder compared **by path component**.
-    /// A plain substring test would be wrong: two mounts cached at
-    /// `…/srv/photos` and `…/srv/photos-backup` would each claim the other's
-    /// transfers, and a `cache_path` of `/` would match everything.
+    /// For a VFS write-back upload, `src_fs` is that VFS's cache root with a backend
+    /// tag prepended (`:local{8un-i}:`). Once the tag is stripped the two strings are
+    /// **equal**, so this compares for equality rather than treating one as a prefix
+    /// of the other.
+    ///
+    /// Equality is deliberate. Prefix matching is looser than the data requires and
+    /// misattributes in two directions: siblings (`…/srv/photos` claiming
+    /// `…/srv/photos-backup`) and nesting — mounting both `remote:/srv` and
+    /// `remote:/srv/photos` from one rclone process gives cache paths where one is a
+    /// genuine prefix of the other, so the parent would absorb the child's transfers
+    /// and report a byte total that is silently too large.
     pub fn belongs_to_cache(&self, cache_path: &str) -> bool {
-        let cache = Path::new(cache_path);
-        // A degenerate cache path — empty, or bare `/` — must never match. `/` is a
-        // legitimate prefix of every absolute path as far as `starts_with` is
-        // concerned, so without this guard a misconfigured or unset value would
-        // silently claim every transfer on the host.
-        if !cache
-            .components()
-            .any(|c| matches!(c, std::path::Component::Normal(_)))
-        {
+        if cache_path.is_empty() {
             return false;
         }
         let Some(src) = self.src_fs.as_deref() else {
             return false;
         };
-        Path::new(strip_backend_tag(src)).starts_with(cache)
+        strip_backend_tag(src) == cache_path
     }
 }
 
@@ -220,9 +224,15 @@ impl Transfer {
 ///
 /// `":local{8un-i}:/var/cache/x"` becomes `"/var/cache/x"`. Anything not matching
 /// that shape is returned untouched, so a plain path passes through unchanged.
+///
+/// Splits on the closing `}:` rather than the first `:`. rclone's `ConfigString`
+/// appends overridden connection-string options inside the braces, and those can
+/// themselves contain colons — `:http,url=https://x{hash}:/path` — which a
+/// first-colon split would cut in the wrong place, silently unattributing the
+/// transfer.
 fn strip_backend_tag(fs: &str) -> &str {
     fs.strip_prefix(':')
-        .and_then(|rest| rest.find(':').map(|i| &rest[i + 1..]))
+        .and_then(|rest| rest.find("}:").map(|i| &rest[i + 2..]))
         .unwrap_or(fs)
 }
 
@@ -242,20 +252,61 @@ pub struct VfsQueue {
 }
 
 impl VfsQueue {
-    /// Total bytes still to upload.
+    /// What is still waiting to upload, including how much of it cannot be measured.
+    pub fn pending(&self) -> Pending {
+        let mut p = Pending::default();
+        for item in &self.queue {
+            p.files += 1;
+            match u64::try_from(item.size) {
+                Ok(bytes) => p.known_bytes += bytes,
+                Err(_) => p.unknown_size_files += 1,
+            }
+        }
+        p
+    }
+
+    /// Bytes still to upload, counting only files whose size rclone reported.
     ///
-    /// Items whose size rclone reported as unknown (`-1`) contribute nothing rather
-    /// than subtracting, which would otherwise understate the total.
+    /// **This is a lower bound, not a total.** Files of unknown size (`-1`)
+    /// contribute nothing. Prefer [`Self::pending`] anywhere the number is shown to
+    /// a user or used to decide whether unmounting is safe — presenting an
+    /// understated figure as a total is precisely the faked precision the design
+    /// forbids.
     pub fn pending_bytes(&self) -> u64 {
-        self.queue
-            .iter()
-            .filter_map(|i| u64::try_from(i.size).ok())
-            .sum()
+        self.pending().known_bytes
     }
 
     /// Items rclone is actively uploading right now.
     pub fn uploading(&self) -> impl Iterator<Item = &QueueItem> {
         self.queue.iter().filter(|i| i.uploading)
+    }
+}
+
+/// A summary of outstanding write-back uploads.
+///
+/// Carries the unmeasurable remainder explicitly so callers cannot mistake a lower
+/// bound for a total. "3 files, 0 bytes" reads as harmless; "3 files, ≥ 0 bytes,
+/// 3 of unknown size" does not.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pending {
+    /// Files waiting to upload.
+    pub files: u64,
+    /// Bytes across files whose size is known.
+    pub known_bytes: u64,
+    /// Files whose size rclone reported as unknown, and which therefore contribute
+    /// nothing to `known_bytes`.
+    pub unknown_size_files: u64,
+}
+
+impl Pending {
+    /// Whether anything is outstanding.
+    pub fn is_empty(&self) -> bool {
+        self.files == 0
+    }
+
+    /// Whether `known_bytes` is the whole story, or merely a floor.
+    pub fn is_exact(&self) -> bool {
+        self.unknown_size_files == 0
     }
 }
 
@@ -571,6 +622,65 @@ mod tests {
         assert!(!t.belongs_to_cache(""));
         // Nor must a root path.
         assert!(!t.belongs_to_cache("/"));
+    }
+
+    #[test]
+    fn nested_cache_paths_do_not_cross_attribute() {
+        // Mounting both `remote:/srv` and `remote:/srv/photos` from one rclone
+        // process gives cache paths where one is a genuine prefix of the other. A
+        // prefix match would let the parent absorb the child's transfers and report
+        // a byte total silently too large.
+        let child = Transfer {
+            src_fs: Some(":local{x}:/c/vfs/local/srv/photos".into()),
+            ..Default::default()
+        };
+        assert!(child.belongs_to_cache("/c/vfs/local/srv/photos"));
+        assert!(
+            !child.belongs_to_cache("/c/vfs/local/srv"),
+            "the parent mount must not claim the child's transfer"
+        );
+    }
+
+    #[test]
+    fn backend_tag_with_colons_in_options_is_stripped() {
+        // rclone's ConfigString appends overridden connection-string options inside
+        // the braces, and those can contain colons. Splitting on the first colon
+        // would cut in the wrong place and silently unattribute the transfer.
+        for src in [
+            ":http,url=https://example.com/x{h4sh}:/c/vfs/http/data",
+            ":local,default_time=2020-01-01T00:00:00Z{h4sh}:/c/vfs/http/data",
+        ] {
+            let t = Transfer {
+                src_fs: Some(src.into()),
+                ..Default::default()
+            };
+            assert!(
+                t.belongs_to_cache("/c/vfs/http/data"),
+                "failed to strip tag from {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_reports_what_it_cannot_measure() {
+        let q: VfsQueue = serde_json::from_str(
+            r#"{"queue":[{"name":"a","size":10},{"name":"b","size":-1},{"name":"c","size":-1}]}"#,
+        )
+        .unwrap();
+        let p = q.pending();
+        assert_eq!(p.files, 3);
+        assert_eq!(p.known_bytes, 10);
+        assert_eq!(p.unknown_size_files, 2);
+        assert!(
+            !p.is_exact(),
+            "callers must be able to tell this is a floor, not a total — it gates \
+             whether unmounting is safe"
+        );
+        assert!(!p.is_empty());
+
+        let q: VfsQueue = serde_json::from_str(r#"{"queue":[{"name":"a","size":10}]}"#).unwrap();
+        assert!(q.pending().is_exact());
+        assert!(VfsQueue::default().pending().is_empty());
     }
 
     #[test]

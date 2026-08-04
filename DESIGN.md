@@ -99,10 +99,14 @@ so `transferring[]` mixes every mount together and would need attributing by pat
 carries a `srcFs` containing the owning VFS's cache directory, prefixed with a backend tag
 (`:local{8un-i}:`), and the remainder matches that mount's `vfs/stats` `diskCache.path`.
 
-Attribution therefore strips the tag and compares **by path component**, not by substring: two
-mounts cached at `…/srv/photos` and `…/srv/photos-backup` must not claim each other's
-transfers, and a degenerate cache path of `/` must not claim everything. That is a bounded,
-deterministic match rather than the prefix guessing the original objection assumed.
+Attribution therefore strips the tag and compares for **equality**. Once the tag is removed
+the two strings are identical, so anything looser is looser than the data requires — and
+looser misattributes in two directions. Substring matching lets `…/srv/photos` claim
+`…/srv/photos-backup`. Prefix matching fixes that but still breaks on *nesting*: mounting
+both `remote:/srv` and `remote:/srv/photos` from one process gives cache paths where one is
+a genuine prefix of the other, and the parent would absorb the child's transfers and report
+a byte total silently too large. Equality has neither failure mode, and if a future rclone
+changes the format the fixture tests say so.
 
 The decision therefore rests on lifetime and failure isolation alone, which is the honest
 basis for it.
@@ -189,42 +193,65 @@ socket mode does not change that, and presenting it as if it does would be misle
 
 What the socket controls is exposure to **other** users on the machine:
 
-- **The rc endpoint is a UNIX socket, never a TCP bind.** A TCP listener is reachable by every
-  local user and, misconfigured, by the network.
-- The socket lives under `$XDG_RUNTIME_DIR`, which is `0700` per the XDG specification and is
-  what actually excludes other users.
-- rclone performs no `chmod` or umask handling when binding (`net.Listen` only), so the socket
-  gets `0777 & ~umask` — `0755` under the common umask `022`, `0775` under `002`. The fix is
-  **`UMask=0077` on the systemd unit**, so the socket is never created permissive in the first
-  place. Chmod-ing after rclone has bound and is accepting connections leaves a window open,
-  and belongs only as a belt-and-braces follow-up.
+- **The rc endpoint is a UNIX socket, never a TCP bind.** This is the control that matters. A
+  TCP listener is reachable by every local user and, misconfigured, from the network — which
+  would turn a shell-equivalent API into a remote one.
+- The socket lives under `$XDG_RUNTIME_DIR`, which is `0700` per the XDG specification. That
+  directory mode, not the socket's own mode, is what actually excludes other users.
+- Given the above, the socket's permissions are **defence in depth, not the primary control**.
+  rclone performs no `chmod` or umask handling when binding (`net.Listen` only), so the socket
+  gets `0777 & ~umask` — `0755` under the common umask `022`. Setting **`UMask=0077` on the
+  systemd unit** makes it `0700` from the moment it exists. That matters only if the socket
+  ever lands outside `$XDG_RUNTIME_DIR` (an override, an unusual distribution), which is
+  precisely when you want to have already been careful. Prefer it over a post-bind `chmod`,
+  which leaves a window in which rclone is already accepting connections.
+- Because the socket is the boundary, rclone is run with `--rc-no-auth`: an rc password stored
+  in a config file readable by the same user adds a step, not a boundary, and would need to be
+  passed on a command line or through the environment.
 
-### The boundary that does matter: D-Bus
+### The boundary that does matter: D-Bus, and only for sandboxed callers
 
-The service publishes its interface on the **session bus**, which every process running as
-the user can reach — including sandboxed applications granted session-bus access. That
-interface is what turns "on the session bus" into "can enumerate this user's remotes and
-mount points, and can call `Unmount(force = true)`", the one operation in the design that
-destroys data. This, not the rc socket, is where the effort goes:
+Applying the same standard honestly: an unsandboxed process running as this user is **not**
+constrained by the D-Bus interface either. It can run `fusermount -u` on the mount point, kill
+the rclone unit, or read `rclone.conf` directly. Against that caller nothing here is a
+boundary, and pretending otherwise would be the same mistake as overselling the socket mode.
 
-- The D-Bus interface is a **curated set of methods**, never a generic rc passthrough. The
-  service's job is to be the narrow safe surface over a dangerous API; proxying it wholesale
-  would hand that straight back out.
+The genuinely distinctive case is a **sandboxed application granted session-bus access** — a
+Flatpak with `--socket=session-bus`, say. It can reach this interface but cannot run
+`fusermount`, cannot see `rclone.conf`, and cannot signal the rclone process. For that caller
+the D-Bus surface is the whole attack surface, and it is the only reason this interface is a
+boundary at all. Everything below is scoped to that:
+
+- The interface is a **curated set of methods**, never a generic rc passthrough. Proxying a
+  shell-equivalent API wholesale would hand a sandboxed caller exactly what the sandbox exists
+  to withhold.
 - `core/command` and `config/dump` are never called, and never reachable from a client.
-- **A forced unmount is destructive and must be treated as such** — refused by default, with
-  `force` an explicit parameter a client has to set, never inferred. The safety check lives
-  service-side so a buggy or hostile client cannot skip it.
-- **Credentials are never read.** Mounting and reporting progress need remote *names* and
-  paths, not secrets. Note that `config/get` is not a per-field getter — it returns a whole
-  remote's configuration, credentials included — so there is no "read just the safe fields"
-  option, and none is needed.
-- Nothing published over D-Bus carries credentials or full remote configuration.
+- **Credentials are never read at all.** Mounting and reporting progress need remote *names*
+  and paths, not secrets. Note `config/get` is not a per-field getter — it returns a whole
+  remote's configuration, credentials included — so "read only the safe fields" is not on
+  offer, and is not needed. Nothing published over D-Bus carries credentials or full remote
+  configuration.
+- **A forced unmount is destructive**, and `force` is an explicit parameter that defaults to
+  off. Being service-side, the pending-uploads check cannot be skipped by a client that simply
+  omits it — but it does not stop a caller that deliberately passes `force = true`. That is a
+  guard against accident and bugs, not against malice.
+
+  Closing the malice case needs an authorization decision the bus cannot make for us. The
+  options are a polkit action for forced unmount, or accepting the risk on the grounds that a
+  sandboxed app able to destroy unuploaded data is a narrow threat. **This is deliberately
+  left open** and must be settled when the D-Bus interface is implemented rather than
+  discovered afterwards; recording it as unresolved is more useful than claiming a mitigation
+  that does not hold.
+
+One further surface to keep in mind: the on-disk cache scanner walks a path taken from an rc
+response, so it must treat `diskCache.path` as untrusted input and refuse to follow it outside
+the expected cache root.
 
 ## Data flow
 
 ```
 rclone (per mount, systemd user unit)
-   │  rc over UNIX socket (0600)
+   │  rc over UNIX socket (UMask=0077 on the unit)
    ▼
 rclone-vfsmount-trayd ──── poller ──► TransferState (carries its own fidelity tier)
    │                                        │

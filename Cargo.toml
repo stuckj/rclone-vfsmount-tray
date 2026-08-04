@@ -11,8 +11,9 @@ members = [
 # that links system C libraries (GTK4), so a bare `cargo build` / `cargo test` on a
 # machine without the GTK development headers would fail for reasons that have
 # nothing to do with what is being changed. It is built explicitly with
-# `cargo build -p rclone-vfsmount-tray-gtk`, and in CI by the Nix job, which has the
-# headers. See the note in .github/workflows/ci.yml.
+# `cargo build -p rclone-vfsmount-tray-gtk`. CI lints it today because it declares no
+# `gtk4` dependency yet; once it does, it moves to the Nix job (#6), which will have
+# the headers. See the note in .github/workflows/ci.yml.
 default-members = [
     "crates/core",
     "crates/service",

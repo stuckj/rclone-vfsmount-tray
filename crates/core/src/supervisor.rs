@@ -49,8 +49,18 @@ pub enum MountState {
 
 impl MountState {
     /// Whether the mount point is currently serving, however it got there.
+    ///
+    /// Matched exhaustively for the same reason as [`Self::is_managed`]: a future
+    /// variant defaulting to "not live" would hide a real mount from the
+    /// pending-uploads check.
     pub fn is_live(&self) -> bool {
-        matches!(self, MountState::Mounted | MountState::Foreign)
+        match self {
+            MountState::Mounted | MountState::Foreign => true,
+            MountState::Unmounted
+            | MountState::Mounting
+            | MountState::Unmounting
+            | MountState::Failed { .. } => false,
+        }
     }
 
     /// Whether this supervisor owns the mount and may act on it.
@@ -127,6 +137,7 @@ pub enum SupervisorError {
 
 /// One mount as found by [`MountSupervisor::reconcile`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiscoveredMount {
     /// Configured name, or a derived one for mounts we did not start.
     pub name: String,

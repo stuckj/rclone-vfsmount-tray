@@ -1,0 +1,17 @@
+[package]
+name = "rvt-core"
+description = "Core logic for rclone-vfsmount-tray: rc API models, cache scanning, configuration"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Pure Rust only. This crate must never link a system C library — that is what lets
+# tier-1 CI lint and test it (plus the service and tray) on a bare runner with no
+# `apt-get install` step. If a dependency drags in a system library, CI breaking is
+# the intended alarm.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

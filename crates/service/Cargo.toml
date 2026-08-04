@@ -1,0 +1,26 @@
+[package]
+name = "rclone-vfsmount-trayd"
+description = "Service that owns rclone VFS mounts and serves their state over D-Bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rclone-vfsmount-trayd"
+path = "src/main.rs"
+
+# Pure Rust — no GUI libraries, no ksni. This runs headless as a systemd user
+# service and must work with no graphical session at all.
+[dependencies]
+rvt-core = { path = "../core" }
+tokio = { workspace = true }
+zbus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

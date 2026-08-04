@@ -1,0 +1,27 @@
+[package]
+name = "rclone-vfsmount-tray-gtk"
+description = "GTK4 client for rclone-vfsmount-tray — talks to the service over D-Bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rclone-vfsmount-tray-gtk"
+path = "src/main.rs"
+
+# The ONLY crate in the workspace that links system C libraries. Because of that it
+# is excluded from `default-members` in the root Cargo.toml, so a bare `cargo build`
+# works on a machine without the GTK development headers. It is covered in CI by the
+# Nix job, which has them.
+#
+# The `gtk4` dependency is added when the windows are actually built (#41). Adding it
+# now would mean a scaffold nobody can compile.
+[dependencies]
+rvt-core = { path = "../core" }
+zbus = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Tier 1: fast pure-logic tests + lint.
+  #
+  # `rvt-core`, the service and the tray link NO system C libraries — ksni 0.3 speaks
+  # StatusNotifierItem over zbus, and everything else is pure Rust — so this runs on a
+  # bare runner with no `apt-get install` step at all.
+  #
+  # The GTK crate is deliberately excluded; it is covered by the Nix job (#6) once the
+  # flake lands. Adding GTK system dependencies here would defeat the purpose of this
+  # job. If a dependency ever drags a system library into one of the three crates
+  # below, this job failing is the intended alarm.
+  lint-test:
+    name: lint + unit tests (no system deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: |
+          cargo clippy \
+            -p rvt-core \
+            -p rclone-vfsmount-trayd \
+            -p rclone-vfsmount-tray \
+            --all-targets -- -D warnings
+
+      - name: unit + fixture tests
+        run: |
+          cargo test \
+            -p rvt-core \
+            -p rclone-vfsmount-trayd \
+            -p rclone-vfsmount-tray
+
+      - name: shellcheck
+        run: |
+          # scripts/ does not exist yet; do not fail the build over that.
+          if compgen -G 'scripts/*.sh' > /dev/null; then
+            shellcheck scripts/*.sh
+          else
+            echo "no shell scripts yet, skipping"
+          fi

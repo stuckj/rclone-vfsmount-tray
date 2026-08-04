@@ -1,0 +1,18 @@
+{
+  "arch": "amd64",
+  "decomposed": [
+    1,
+    75,
+    0
+  ],
+  "goTags": "none",
+  "goVersion": "go1.26.5",
+  "isBeta": false,
+  "isGit": false,
+  "linking": "static",
+  "os": "linux",
+  "osArch": "amd64",
+  "osKernel": "6.8.12-39-pve (x86_64)",
+  "osVersion": "ubuntu 26.04 (64 bit)",
+  "version": "v1.75.0"
+}

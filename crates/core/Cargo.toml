@@ -15,3 +15,11 @@ authors.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# Proc-macro only — generates no linkage, so the no-system-libraries rule holds.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Reports the keys a deserialize silently dropped. This is what makes the fixture
+# tests an actual wire-format guard: without it a field the model fails to read just
+# takes its default, and every test still passes. See tests/fixtures.rs.
+serde_ignored = "0.1"

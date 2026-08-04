@@ -15,6 +15,7 @@
 //! out individually below; each one is a real behaviour that cost time to find.
 
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// The accounting group that rclone assigns to VFS write-back uploads.
 ///
@@ -48,8 +49,11 @@ pub struct CoreStats {
     #[serde(default)]
     pub bytes: u64,
     /// Total bytes expected across all active transfers.
+    ///
+    /// Signed, because rclone derives this from object sizes and propagates the
+    /// `-1` "size unknown" sentinel into the sum. See [`Transfer::size`].
     #[serde(default)]
-    pub total_bytes: u64,
+    pub total_bytes: i64,
     /// Aggregate throughput in bytes per second.
     #[serde(default)]
     pub speed: f64,
@@ -123,9 +127,15 @@ pub struct Transfer {
     /// This is the **join key** to [`QueueItem::name`]: for VFS write-back uploads
     /// the two strings are identical, with no remote or cache-path prefix.
     pub name: String,
-    /// Total size of the file in bytes.
+    /// Total size of the file in bytes, or `-1` when the size is not known.
+    ///
+    /// **Signed deliberately.** rclone carries this as a Go `int64` and uses `-1`
+    /// for objects of unknown size. A `u64` here does not merely lose that value —
+    /// `serde_json` aborts the *entire* response, so one unusual transfer would
+    /// blank every mount's state rather than degrading a single number. Use
+    /// [`Self::known_size`] to get it as an option.
     #[serde(default)]
-    pub size: u64,
+    pub size: i64,
     /// Bytes uploaded so far.
     #[serde(default)]
     pub bytes: u64,
@@ -173,18 +183,47 @@ impl Transfer {
         self.group.as_deref() == Some(GLOBAL_STATS_GROUP)
     }
 
+    /// The file size, or `None` when rclone reported it as unknown (`-1`).
+    pub fn known_size(&self) -> Option<u64> {
+        u64::try_from(self.size).ok()
+    }
+
     /// Whether this transfer originates from the given VFS cache directory.
     ///
-    /// Pass [`DiskCache::path`] for the mount in question. `src_fs` embeds the cache
-    /// path but is not equal to it — rclone prefixes a backend tag such as
-    /// `:local{8un-i}:` — so this is a containment test, not equality.
+    /// Pass [`DiskCache::path`] for the mount in question.
+    ///
+    /// `src_fs` is the cache path with a backend tag prepended — `:local{8un-i}:` —
+    /// so the tag is stripped and the remainder compared **by path component**.
+    /// A plain substring test would be wrong: two mounts cached at
+    /// `…/srv/photos` and `…/srv/photos-backup` would each claim the other's
+    /// transfers, and a `cache_path` of `/` would match everything.
     pub fn belongs_to_cache(&self, cache_path: &str) -> bool {
-        !cache_path.is_empty()
-            && self
-                .src_fs
-                .as_deref()
-                .is_some_and(|s| s.contains(cache_path))
+        let cache = Path::new(cache_path);
+        // A degenerate cache path — empty, or bare `/` — must never match. `/` is a
+        // legitimate prefix of every absolute path as far as `starts_with` is
+        // concerned, so without this guard a misconfigured or unset value would
+        // silently claim every transfer on the host.
+        if !cache
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return false;
+        }
+        let Some(src) = self.src_fs.as_deref() else {
+            return false;
+        };
+        Path::new(strip_backend_tag(src)).starts_with(cache)
     }
+}
+
+/// Strip rclone's `:backend{hash}:` prefix from a filesystem string, if present.
+///
+/// `":local{8un-i}:/var/cache/x"` becomes `"/var/cache/x"`. Anything not matching
+/// that shape is returned untouched, so a plain path passes through unchanged.
+fn strip_backend_tag(fs: &str) -> &str {
+    fs.strip_prefix(':')
+        .and_then(|rest| rest.find(':').map(|i| &rest[i + 1..]))
+        .unwrap_or(fs)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,8 +243,14 @@ pub struct VfsQueue {
 
 impl VfsQueue {
     /// Total bytes still to upload.
+    ///
+    /// Items whose size rclone reported as unknown (`-1`) contribute nothing rather
+    /// than subtracting, which would otherwise understate the total.
     pub fn pending_bytes(&self) -> u64 {
-        self.queue.iter().map(|i| i.size).sum()
+        self.queue
+            .iter()
+            .filter_map(|i| u64::try_from(i.size).ok())
+            .sum()
     }
 
     /// Items rclone is actively uploading right now.
@@ -218,12 +263,18 @@ impl VfsQueue {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueueItem {
     /// Path within the VFS. The join key to [`Transfer::name`].
+    ///
+    /// Required, like [`Transfer::name`] and [`RcCommand::path`]: it is the item's
+    /// identity, and a queue entry that cannot be named cannot be displayed, joined
+    /// or acted on. Every other field is defaulted.
     pub name: String,
     /// Opaque id, required by `vfs/queue-set-expiry` to force an upload.
-    pub id: u64,
-    /// File size in bytes.
     #[serde(default)]
-    pub size: u64,
+    pub id: u64,
+    /// File size in bytes, or `-1` when unknown. Signed for the same reason as
+    /// [`Transfer::size`].
+    #[serde(default)]
+    pub size: i64,
     /// Seconds until rclone will start the upload.
     ///
     /// **Signed** — it goes negative once the item is due, and was observed at
@@ -274,6 +325,12 @@ pub struct DiskCache {
     /// either — it was measured as `0` throughout a 128 MiB upload with the data
     /// sitting in the cache. Do not put this in front of a user. Use
     /// [`VfsQueue::pending_bytes`] for outstanding bytes.
+    ///
+    /// Defaulted like every sibling: without this, rclone dropping or renaming the
+    /// field would fail the whole `vfs/stats` parse and take [`Self::path`] and
+    /// [`Self::path_meta`] with it — the two values the on-disk scanning tier needs
+    /// precisely when the rc API cannot be trusted.
+    #[serde(default)]
     pub bytes_used: i64,
     /// Files whose upload has failed. Needs surfacing — it is actionable.
     #[serde(default)]
@@ -367,12 +424,28 @@ impl RcList {
 /// One entry of `rc/list`. Note the PascalCase field names in the wire format.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RcCommand {
+    /// Command path, e.g. `vfs/queue`. Required — an entry without one has no
+    /// identity and nothing downstream could use it.
     #[serde(rename = "Path")]
     pub path: String,
     #[serde(rename = "Title", default)]
     pub title: String,
-    #[serde(rename = "AuthRequired", default)]
-    pub auth_required: bool,
+    /// **Mind the polarity.** rclone's wire field is `NoAuth`, so `true` means the
+    /// command is callable *without* authentication. Prefer [`Self::auth_required`]
+    /// over reading this directly — inverted booleans get misread.
+    ///
+    /// There is no `AuthRequired` field in rclone. Modelling one gives a value that
+    /// is always `false`, i.e. "no authentication needed" for `config/dump` and
+    /// `core/command`, which is the wrong way for a fail-open default to fail.
+    #[serde(rename = "NoAuth", default)]
+    pub no_auth: bool,
+}
+
+impl RcCommand {
+    /// Whether calling this command requires authentication.
+    pub fn auth_required(&self) -> bool {
+        !self.no_auth
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_attribution_is_containment_not_equality() {
+    fn cache_attribution_strips_the_backend_tag() {
         let t = Transfer {
             src_fs: Some(":local{8un-i}:/cache/vfs/local/srv/data".into()),
             ..Default::default()
@@ -496,6 +569,67 @@ mod tests {
         assert!(!t.belongs_to_cache("/cache/vfs/local/other"));
         // An empty path must never match everything.
         assert!(!t.belongs_to_cache(""));
+        // Nor must a root path.
+        assert!(!t.belongs_to_cache("/"));
+    }
+
+    #[test]
+    fn cache_attribution_respects_path_boundaries() {
+        // The bug a substring test has: two mounts whose cache paths share a prefix
+        // would each claim the other's transfers, so both show wrong byte totals.
+        let backup = Transfer {
+            src_fs: Some(":local{x}:/cache/vfs/local/srv/photos-backup".into()),
+            ..Default::default()
+        };
+        assert!(
+            !backup.belongs_to_cache("/cache/vfs/local/srv/photos"),
+            "'photos' must not claim a transfer belonging to 'photos-backup'"
+        );
+        assert!(backup.belongs_to_cache("/cache/vfs/local/srv/photos-backup"));
+    }
+
+    #[test]
+    fn untagged_src_fs_still_matches() {
+        let t = Transfer {
+            src_fs: Some("/cache/vfs/local/srv/data".into()),
+            ..Default::default()
+        };
+        assert!(t.belongs_to_cache("/cache/vfs/local/srv/data"));
+    }
+
+    #[test]
+    fn unknown_size_sentinel_does_not_abort_the_parse() {
+        // rclone reports -1 for objects of unknown size. Failing here would blank
+        // every mount's state over one odd transfer, not just this field.
+        let t: Transfer = serde_json::from_str(r#"{"name":"a","size":-1}"#).unwrap();
+        assert_eq!(t.size, -1);
+        assert_eq!(t.known_size(), None);
+
+        let t: Transfer = serde_json::from_str(r#"{"name":"a","size":42}"#).unwrap();
+        assert_eq!(t.known_size(), Some(42));
+
+        let s: CoreStats = serde_json::from_str(r#"{"totalBytes":-1}"#).unwrap();
+        assert_eq!(s.total_bytes, -1);
+
+        let q: VfsQueue =
+            serde_json::from_str(r#"{"queue":[{"name":"a","size":-1},{"name":"b","size":10}]}"#)
+                .unwrap();
+        assert_eq!(
+            q.pending_bytes(),
+            10,
+            "an unknown size contributes 0, never a negative"
+        );
+    }
+
+    #[test]
+    fn vfs_stats_survives_a_missing_bytes_used() {
+        // path/pathMeta must keep parsing even if rclone drops bytesUsed, because
+        // they are what the on-disk tier needs when rc cannot be trusted.
+        let s: VfsStats =
+            serde_json::from_str(r#"{"diskCache":{"path":"/p","pathMeta":"/m"}}"#).unwrap();
+        let dc = s.disk_cache.expect("diskCache");
+        assert_eq!(dc.path, "/p");
+        assert_eq!(dc.path_meta, "/m");
     }
 
     #[test]
@@ -505,5 +639,22 @@ mod tests {
                 .unwrap();
         assert!(l.has("vfs/queue"));
         assert!(!l.has("vfs/stats"));
+    }
+
+    #[test]
+    fn no_auth_polarity_is_not_inverted() {
+        // The wire field is NoAuth, and it means the opposite of "auth required".
+        // Getting this backwards means reporting config/dump as unauthenticated.
+        let l: RcList = serde_json::from_str(
+            r#"{"commands":[
+                 {"Path":"rc/noop","NoAuth":true},
+                 {"Path":"config/dump","NoAuth":false}
+               ]}"#,
+        )
+        .unwrap();
+        let noop = &l.commands[0];
+        let dump = &l.commands[1];
+        assert!(noop.no_auth && !noop.auth_required());
+        assert!(!dump.no_auth && dump.auth_required());
     }
 }

@@ -22,7 +22,10 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+# Floor imposed by the dependency tree, not a preference: zbus 5 and the zvariant
+# crates declare 1.87. Verified by the `msrv` CI job, so this cannot quietly rot —
+# it was briefly declared as 1.82, which nothing could have built.
+rust-version = "1.87"
 license = "MIT"
 repository = "https://github.com/stuckj/rclone-vfsmount-tray"
 authors = ["John Stucklen"]

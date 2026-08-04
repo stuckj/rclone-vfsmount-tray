@@ -1,16 +1,34 @@
 //! Parse the captured rclone responses in `testdata/`.
 //!
 //! These files are the literal bytes a live rclone v1.75.0 returned during the
-//! investigation in issue #9. They exist so that a future rclone changing its
-//! wire format is caught here, by a test naming the field that moved, rather than
-//! in the field as a tray icon that silently stops showing progress.
+//! investigation in issue #9. They exist so that a future rclone changing its wire
+//! format is caught here, by a test naming the field that moved, rather than in the
+//! field as a tray icon that silently stops showing progress.
 //!
-//! Every fixture is checked two ways: it must parse, and it must survive a
-//! serialize/deserialize round trip unchanged. The round trip is compared as
-//! structs rather than as JSON text, because field order and float formatting are
-//! not stable and comparing text would fail for reasons nobody cares about.
+//! # Why a round trip is not enough
+//!
+//! The obvious check — deserialize, re-serialize, deserialize again, compare — is
+//! nearly worthless on its own, and it is worth stating why so nobody reinstates it
+//! as the only guard.
+//!
+//! It runs the model's *own* codec on both sides. If the model fails to read a
+//! field, that field takes its default, serializes back as that default, and
+//! re-parses to the same default. The comparison passes. So the round trip proves
+//! the model agrees with itself; it proves nothing about whether the fixture was
+//! read. Renaming a modelled field to something rclone never sends is invisible to
+//! it — which is exactly how `RcCommand` shipped modelling a nonexistent
+//! `AuthRequired` field with a green suite.
+//!
+//! So every fixture is checked three ways:
+//!
+//! 1. it parses;
+//! 2. `serde_ignored` reports which keys the model *dropped*, and that set must
+//!    equal an explicit per-fixture list of fields we knowingly do not model — so
+//!    any added, removed or renamed field fails a test that names it;
+//! 3. it survives a round trip (kept for the self-consistency it does prove).
 
 use rvt_core::models::*;
+use std::collections::BTreeSet;
 
 fn testdata(name: &str) -> String {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/");
@@ -18,27 +36,108 @@ fn testdata(name: &str) -> String {
     std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("reading {full}: {e}"))
 }
 
-fn round_trip<T>(name: &str) -> T
+/// Parse a fixture, asserting exactly which of its keys the model ignores.
+///
+/// `expected_ignored` is the complete set of dotted paths we deliberately do not
+/// model. Anything outside it — a key we stopped reading, or a new key rclone added
+/// — fails the test and names the path.
+fn parse_fixture<T>(name: &str, expected_ignored: &[&str]) -> T
 where
     T: serde::de::DeserializeOwned + serde::Serialize + PartialEq + std::fmt::Debug,
 {
     let raw = testdata(name);
-    let parsed: T = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parsing {name}: {e}"));
+
+    let mut ignored: BTreeSet<String> = BTreeSet::new();
+    let de = &mut serde_json::Deserializer::from_str(&raw);
+    let parsed: T = serde_ignored::deserialize(de, |path| {
+        ignored.insert(normalise_indices(&path.to_string()));
+    })
+    .unwrap_or_else(|e| panic!("parsing {name}: {e}"));
+
+    let expected: BTreeSet<String> = expected_ignored.iter().map(|s| s.to_string()).collect();
+    if ignored != expected {
+        let newly_dropped: Vec<_> = ignored.difference(&expected).collect();
+        let no_longer_present: Vec<_> = expected.difference(&ignored).collect();
+        panic!(
+            "{name}: the set of unmodelled keys changed.\n  \
+             dropped but not expected (a field we stopped reading, or rclone added one): {newly_dropped:?}\n  \
+             expected but not seen (rclone removed or renamed it): {no_longer_present:?}"
+        );
+    }
+
+    // Self-consistency. Weak on its own — see the module docs — but it does catch a
+    // Serialize/Deserialize pair that disagree with each other.
     let reser = serde_json::to_string(&parsed).expect("serialize");
     let again: T =
         serde_json::from_str(&reser).unwrap_or_else(|e| panic!("re-parsing {name}: {e}"));
     assert_eq!(parsed, again, "{name} did not survive a round trip");
+
     parsed
+}
+
+/// Collapse array indices in a `serde_ignored` path so the expected sets do not
+/// depend on how many elements a fixture happens to contain:
+/// `commands.0.Help` and `commands.57.Help` both become `commands.[].Help`.
+fn normalise_indices(path: &str) -> String {
+    path.split('.')
+        .map(|seg| {
+            if !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_digit()) {
+                "[]"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Keys of `core/stats` we do not model: counters for operations this tool never
+/// performs. Listed rather than ignored silently so their disappearance is noticed.
+const CORE_STATS_UNMODELLED: &[&str] = &[
+    "deletedDirs",
+    "deletes",
+    "listed",
+    "renames",
+    "serverSideCopies",
+    "serverSideCopyBytes",
+    "serverSideMoveBytes",
+    "serverSideMoves",
+];
+
+/// `rc/list` carries per-command help text and request/response plumbing flags that
+/// are of no use to a tray applet.
+const RC_LIST_UNMODELLED: &[&str] = &[
+    "commands.[].Help",
+    "commands.[].NeedsRequest",
+    "commands.[].NeedsResponse",
+];
+
+/// Build details of the rclone binary; we gate on `decomposed`, not on these.
+const CORE_VERSION_UNMODELLED: &[&str] = &["goTags", "linking", "osArch", "osKernel", "osVersion"];
+
+fn core_stats(name: &str) -> CoreStats {
+    parse_fixture(name, CORE_STATS_UNMODELLED)
+}
+fn vfs_stats(name: &str) -> VfsStats {
+    parse_fixture(name, &[])
+}
+fn vfs_queue(name: &str) -> VfsQueue {
+    parse_fixture(name, &[])
 }
 
 #[test]
 fn core_stats_mid_upload_has_real_progress() {
-    let s: CoreStats = round_trip("core-stats-vfs-upload-midflight.json");
+    let s: CoreStats = core_stats("core-stats-vfs-upload-midflight.json");
     let t = &s.transfers_slice()[0];
 
     assert_eq!(t.name, "big.bin");
     assert_eq!(t.size, 134_217_728);
-    assert!(t.bytes > 0 && t.bytes < t.size, "mid-flight: {}", t.bytes);
+    assert_eq!(t.known_size(), Some(134_217_728));
+    assert!(
+        t.bytes > 0 && t.bytes < t.known_size().unwrap(),
+        "mid-flight: {}",
+        t.bytes
+    );
     assert_eq!(t.percentage, Some(50));
 
     // The whole point of issue #9: these are populated for a VFS write-back upload,
@@ -58,7 +157,7 @@ fn core_stats_mid_upload_has_real_progress() {
 
 #[test]
 fn core_stats_transferring_absent_when_idle() {
-    let s: CoreStats = round_trip("core-stats-idle-no-transferring.json");
+    let s: CoreStats = core_stats("core-stats-idle-no-transferring.json");
     assert!(
         !s.reported_transferring(),
         "the idle fixture must have NO transferring key — that is the behaviour \
@@ -69,7 +168,7 @@ fn core_stats_transferring_absent_when_idle() {
 
 #[test]
 fn vfs_and_job_transfers_are_separable() {
-    let s: CoreStats = round_trip("core-stats-mixed-vfs-and-job.json");
+    let s: CoreStats = core_stats("core-stats-mixed-vfs-and-job.json");
 
     // rclone really does mix a VFS write-back upload and an unrelated rc job into
     // one array, so filtering is not optional.
@@ -96,8 +195,8 @@ fn vfs_and_job_transfers_are_separable() {
 
 #[test]
 fn transfer_attributes_to_its_vfs_cache() {
-    let stats: CoreStats = round_trip("core-stats-vfs-upload-midflight.json");
-    let vfs: VfsStats = round_trip("vfs-stats-upload-in-progress.json");
+    let stats: CoreStats = core_stats("core-stats-vfs-upload-midflight.json");
+    let vfs: VfsStats = vfs_stats("vfs-stats-upload-in-progress.json");
 
     let cache_path = &vfs.disk_cache.as_ref().expect("diskCache").path;
     let t = &stats.transfers_slice()[0];
@@ -113,8 +212,8 @@ fn transfer_attributes_to_its_vfs_cache() {
 
 #[test]
 fn queue_names_join_to_transfer_names() {
-    let stats: CoreStats = round_trip("core-stats-vfs-upload-midflight.json");
-    let queue: VfsQueue = round_trip("vfs-queue-uploading.json");
+    let stats: CoreStats = core_stats("core-stats-vfs-upload-midflight.json");
+    let queue: VfsQueue = vfs_queue("vfs-queue-uploading.json");
 
     let tname = &stats.transfers_slice()[0].name;
     let qname = &queue.queue[0].name;
@@ -126,14 +225,14 @@ fn queue_names_join_to_transfer_names() {
 
 #[test]
 fn queue_queued_versus_uploading() {
-    let queued: VfsQueue = round_trip("vfs-queue-queued-not-uploading.json");
+    let queued: VfsQueue = vfs_queue("vfs-queue-queued-not-uploading.json");
     let item = &queued.queue[0];
     assert!(!item.uploading, "still waiting out --vfs-write-back");
     assert!(item.expiry > 0.0, "expiry counts down to zero");
     assert_eq!(queued.uploading().count(), 0);
-    assert_eq!(queued.pending_bytes(), item.size);
+    assert_eq!(queued.pending_bytes(), item.size as u64);
 
-    let live: VfsQueue = round_trip("vfs-queue-uploading.json");
+    let live: VfsQueue = vfs_queue("vfs-queue-uploading.json");
     let item = &live.queue[0];
     assert!(item.uploading);
     assert!(
@@ -146,7 +245,7 @@ fn queue_queued_versus_uploading() {
 
 #[test]
 fn vfs_stats_hands_over_cache_paths() {
-    let s: VfsStats = round_trip("vfs-stats-upload-in-progress.json");
+    let s: VfsStats = vfs_stats("vfs-stats-upload-in-progress.json");
     let dc = s.disk_cache.expect("diskCache present when caching is on");
 
     // These two make on-disk cache scanning possible without guessing paths.
@@ -166,7 +265,7 @@ fn vfs_stats_hands_over_cache_paths() {
 
 #[test]
 fn vfs_stats_idle_still_reports_queue_counters() {
-    let s: VfsStats = round_trip("vfs-stats-idle.json");
+    let s: VfsStats = vfs_stats("vfs-stats-idle.json");
     let dc = s.disk_cache.expect("diskCache");
     assert_eq!(dc.uploads_in_progress, 0);
     assert!(!dc.out_of_space);
@@ -175,7 +274,7 @@ fn vfs_stats_idle_still_reports_queue_counters() {
 
 #[test]
 fn vfsmeta_dirty_item_is_the_offline_signal() {
-    let m: VfsMetaItem = round_trip("vfsmeta-item-dirty.json");
+    let m: VfsMetaItem = parse_fixture("vfsmeta-item-dirty.json", &[]);
     assert!(m.dirty, "a pending upload is Dirty on disk");
     assert_eq!(m.size, 100_663_296);
     assert_eq!(m.ranges.as_ref().map(Vec::len), Some(1));
@@ -186,7 +285,7 @@ fn vfsmeta_dirty_item_is_the_offline_signal() {
 
 #[test]
 fn rc_list_supports_feature_detection() {
-    let l: RcList = round_trip("rc-list-v1.75.0.json");
+    let l: RcList = parse_fixture("rc-list-v1.75.0.json", RC_LIST_UNMODELLED);
     assert!(l.commands.len() > 50, "got {}", l.commands.len());
 
     // Every endpoint the capability ladder depends on, confirmed present in v1.75.0.
@@ -208,7 +307,7 @@ fn rc_list_supports_feature_detection() {
 
 #[test]
 fn core_version_decomposes() {
-    let v: CoreVersion = round_trip("core-version.json");
+    let v: CoreVersion = parse_fixture("core-version.json", CORE_VERSION_UNMODELLED);
     assert_eq!(v.version, "v1.75.0");
     assert_eq!(v.decomposed, vec![1, 75, 0]);
     assert!(!v.is_beta);
@@ -216,14 +315,16 @@ fn core_version_decomposes() {
 
 #[test]
 fn vfs_list_names_are_canonical_not_configured() {
-    let l: VfsList = round_trip("vfs-list.json");
+    let l: VfsList = parse_fixture("vfs-list.json", &[]);
     assert_eq!(l.vfses.len(), 1);
     // The fixture was captured from an `alias` remote configured as `dst:`, yet
-    // rclone reports the resolved path. Anything matching on this string must not
-    // assume it equals what the user configured.
-    assert!(
-        !l.vfses[0].starts_with("dst:"),
-        "expected the resolved form, got {:?}",
-        l.vfses[0]
+    // rclone reports the resolved target path. Anything matching on this string must
+    // not assume it equals what the user configured.
+    //
+    // Asserted as the exact value: `!starts_with("dst:")` would pass for any string
+    // at all, which is no assertion.
+    assert_eq!(
+        l.vfses[0], "/home/claude/.claude/jobs/f70669bc/tmp/spike9/remote-store",
+        "rclone reports the resolved path, not the configured remote name"
     );
 }

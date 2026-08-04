@@ -12,35 +12,41 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# Third-party actions are pinned to full commit SHAs rather than tags. A tag is
+# mutable and `@stable` is a *branch*, so either lets an upstream change execute in
+# a workflow that can read the repository. The trailing comment records the human
+# -readable version each SHA corresponded to when it was pinned.
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   # Tier 1: fast pure-logic tests + lint.
   #
   # `rvt-core`, the service and the tray link NO system C libraries — ksni 0.3 speaks
   # StatusNotifierItem over zbus, and everything else is pure Rust — so this runs on a
-  # bare runner with no `apt-get install` step at all.
-  #
-  # The GTK crate is deliberately excluded; it is covered by the Nix job (#6) once the
-  # flake lands. Adding GTK system dependencies here would defeat the purpose of this
-  # job. If a dependency ever drags a system library into one of the three crates
-  # below, this job failing is the intended alarm.
+  # bare runner with no `apt-get install` step at all. If a dependency ever drags a
+  # system library into one of those three crates, this job failing is the intended
+  # alarm, which is why their manifests declare deps the stubs do not yet reference.
   lint-test:
     name: lint + unit tests (no system deps)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: rustfmt
         run: cargo fmt --all -- --check
 
+      # --locked throughout: Cargo.lock is committed, and without this CI silently
+      # resolves newer semver-compatible dependencies than the lockfile pins, so the
+      # lockfile would be enforced by nothing.
       - name: clippy
         run: |
-          cargo clippy \
+          cargo clippy --locked \
             -p rvt-core \
             -p rclone-vfsmount-trayd \
             -p rclone-vfsmount-tray \
@@ -48,7 +54,7 @@ jobs:
 
       - name: unit + fixture tests
         run: |
-          cargo test \
+          cargo test --locked \
             -p rvt-core \
             -p rclone-vfsmount-trayd \
             -p rclone-vfsmount-tray
@@ -56,8 +62,59 @@ jobs:
       - name: shellcheck
         run: |
           # scripts/ does not exist yet; do not fail the build over that.
-          if compgen -G 'scripts/*.sh' > /dev/null; then
-            shellcheck scripts/*.sh
+          mapfile -t scripts < <(find scripts -name '*.sh' -type f 2>/dev/null || true)
+          if [ ${#scripts[@]} -gt 0 ]; then
+            shellcheck "${scripts[@]}"
           else
             echo "no shell scripts yet, skipping"
           fi
+
+  # The GTK crate is excluded from the workspace default-members, so nothing above
+  # touches it. It currently declares no `gtk4` dependency and therefore compiles on
+  # a bare runner — check it here so it cannot rot before the Nix job (#6) lands.
+  # Once `gtk4` is a real dependency this job needs the GTK development headers, or
+  # it should be deleted in favour of the Nix job.
+  gtk-check:
+    name: check GTK crate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --locked -p rclone-vfsmount-tray-gtk --all-targets
+
+  # Proves the declared `rust-version` is real. Without this the field is decoration:
+  # it was briefly set to 1.82 while the dependency tree required 1.87, which nothing
+  # would have caught.
+  msrv:
+    name: build at declared MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "declared MSRV: $v"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo check --locked -p rvt-core -p rclone-vfsmount-trayd -p rclone-vfsmount-tray
+
+  # rc access is equivalent to shell access as the rclone user, so a compromised
+  # dependency in this tree is a serious matter. Advisories are checked on every PR
+  # rather than discovered later.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit --deny warnings

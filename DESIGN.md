@@ -38,10 +38,12 @@ The service owns everything. The tray and the windows are both *clients* of it, 
 privileged position between them — the tray is not "the app" with a settings window bolted
 on; it is one of two equal front-ends.
 
-Only `crates/gtk` links a system C library. That boundary is load-bearing: it lets CI lint
-and test three of the four crates on a bare runner with no `apt-get install` step, so the
-common path stays fast. `crates/gtk` is excluded from the workspace `default-members` for
-the same reason — a bare `cargo build` works without GTK headers installed.
+`crates/gtk` will be the only crate that links a system C library, once it gains its `gtk4`
+dependency — today it has none, so nothing in the workspace links one. The boundary is
+nonetheless load-bearing and enforced from the start: it lets CI lint and test three of the
+four crates on a bare runner with no `apt-get install` step, so the common path stays fast.
+`crates/gtk` is excluded from the workspace `default-members` for the same reason — a bare
+`cargo build` works without GTK headers installed.
 
 ### The lifetime rule
 
@@ -68,8 +70,10 @@ filesystems.
 | Suspend / resume | mounts survive; stale handles recovered |
 
 This is the kind of property that regresses quietly — a `KillMode`, a cgroup setting, or a
-tidy-looking `Drop` impl that unmounts "for cleanliness". It is therefore asserted by
-integration tests, not just intended.
+tidy-looking `Drop` impl that unmounts "for cleanliness". It must therefore be asserted by
+integration tests rather than merely intended. Those tests do not exist yet: there is no
+supervisor implementation to test against. They land with the supervisor, and the matrix
+above is their specification.
 
 ## Decision: how the service supervises mounts
 
@@ -92,10 +96,16 @@ mostly gone.
 Historically there was a third objection to the shared daemon: `core/stats` is process-global,
 so `transferring[]` mixes every mount together and would need attributing by path prefix.
 **That objection no longer holds** — the investigation in issue #9 found that each transfer
-carries a `srcFs` containing the owning VFS's cache directory verbatim, which matches that
-mount's `vfs/stats` `diskCache.path`. Attribution is an exact match, not a guess. The
-decision therefore rests on lifetime and failure isolation alone, which is the honest basis
-for it.
+carries a `srcFs` containing the owning VFS's cache directory, prefixed with a backend tag
+(`:local{8un-i}:`), and the remainder matches that mount's `vfs/stats` `diskCache.path`.
+
+Attribution therefore strips the tag and compares **by path component**, not by substring: two
+mounts cached at `…/srv/photos` and `…/srv/photos-backup` must not claim each other's
+transfers, and a degenerate cache path of `/` must not claim everything. That is a bounded,
+deterministic match rather than the prefix guessing the original objection assumed.
+
+The decision therefore rests on lifetime and failure isolation alone, which is the honest
+basis for it.
 
 What we get: mounts survive service restart, crash and upgrade; systemd handles restart,
 backoff and rate-limiting so we do not reimplement it; and one wedged remote cannot take the
@@ -105,7 +115,11 @@ The cost is a dependency on systemd for supervision. Acceptable — the service 
 systemd user unit, and the target is Linux desktops.
 
 `MountSupervisor` in `rvt-core` exists so this stays reversible. Everything above the trait
-is written against the interface.
+is written against the interface, and the trait is deliberately **dyn-compatible** — its
+methods return boxed futures rather than `impl Future` — so the implementation can be chosen
+at runtime, consumers need not all become generic, and tests can substitute a double. These
+operations mount filesystems and fire at human frequency; one allocation per call is not
+worth optimising against those properties.
 
 ## The capability ladder
 
@@ -163,19 +177,48 @@ rclone's own documentation is explicit that rc access is equivalent to shell acc
 rclone user: `core/command` re-executes the binary, `config/dump` returns every backend
 credential, and authentication is all-or-nothing with no per-endpoint scoping.
 
-Therefore:
+### What the rc socket is and is not a boundary against
 
-- **The rc endpoint is a UNIX socket, never a TCP bind.**
-- The socket lives under `$XDG_RUNTIME_DIR` and is **explicitly `chmod 0600`**. rclone creates
-  it `0775` by default (verified in #9), and connecting to a UNIX socket needs write
-  permission — so the default lets any process in the user's group in. The default is not
-  good enough and must not be relied on.
-- `core/command` and `config/dump` are never called, and never exposed upward.
+It is worth being precise here, because it is easy to write something reassuring that is not
+true.
+
+**The rc socket is not a privilege boundary against same-user code.** Unix permissions are
+per-UID. Anything already running as this user can read `rclone.conf` and execute `rclone`
+directly, so reaching the rc socket confers nothing it did not already have. Tightening the
+socket mode does not change that, and presenting it as if it does would be misleading.
+
+What the socket controls is exposure to **other** users on the machine:
+
+- **The rc endpoint is a UNIX socket, never a TCP bind.** A TCP listener is reachable by every
+  local user and, misconfigured, by the network.
+- The socket lives under `$XDG_RUNTIME_DIR`, which is `0700` per the XDG specification and is
+  what actually excludes other users.
+- rclone performs no `chmod` or umask handling when binding (`net.Listen` only), so the socket
+  gets `0777 & ~umask` — `0755` under the common umask `022`, `0775` under `002`. The fix is
+  **`UMask=0077` on the systemd unit**, so the socket is never created permissive in the first
+  place. Chmod-ing after rclone has bound and is accepting connections leaves a window open,
+  and belongs only as a belt-and-braces follow-up.
+
+### The boundary that does matter: D-Bus
+
+The service publishes its interface on the **session bus**, which every process running as
+the user can reach — including sandboxed applications granted session-bus access. That
+interface is what turns "on the session bus" into "can enumerate this user's remotes and
+mount points, and can call `Unmount(force = true)`", the one operation in the design that
+destroys data. This, not the rc socket, is where the effort goes:
+
 - The D-Bus interface is a **curated set of methods**, never a generic rc passthrough. The
   service's job is to be the narrow safe surface over a dangerous API; proxying it wholesale
   would hand that straight back out.
-- Credentials are read field-by-field with `config/get` when needed, never dumped wholesale,
-  and never logged.
+- `core/command` and `config/dump` are never called, and never reachable from a client.
+- **A forced unmount is destructive and must be treated as such** — refused by default, with
+  `force` an explicit parameter a client has to set, never inferred. The safety check lives
+  service-side so a buggy or hostile client cannot skip it.
+- **Credentials are never read.** Mounting and reporting progress need remote *names* and
+  paths, not secrets. Note that `config/get` is not a per-field getter — it returns a whole
+  remote's configuration, credentials included — so there is no "read just the safe fields"
+  option, and none is needed.
+- Nothing published over D-Bus carries credentials or full remote configuration.
 
 ## Data flow
 

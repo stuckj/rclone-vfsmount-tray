@@ -25,9 +25,9 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     config: Option<std::path::PathBuf>,
 
-    /// Log verbosity. Overridden by `RUST_LOG` when that is set.
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Log verbosity. Takes precedence over `RUST_LOG`; defaults to `info`.
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<String>,
 
     /// Stay in the foreground and log to stderr. Useful when running outside
     /// systemd during development.
@@ -38,7 +38,13 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| args.log_level.clone());
+    // Explicit flag beats the environment, per CLI convention: someone who exported
+    // RUST_LOG for another tool should still be able to raise verbosity here.
+    let filter = args
+        .log_level
+        .clone()
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();

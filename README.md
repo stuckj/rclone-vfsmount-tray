@@ -27,11 +27,13 @@ Three processes:
 | `rclone-vfsmount-tray` | The tray icon. A client. |
 | `rclone-vfsmount-tray-gtk` | The configuration and transfer windows. Also a client. |
 
-**Mounts belong to the service, and quitting the tray does not unmount anything.** Neither
-does restarting the service for a package upgrade. That is a deliberate guarantee, and it is
-covered by tests — see [DESIGN.md](DESIGN.md) for the full lifetime matrix.
+**Mounts will belong to the service, so quitting the tray will not unmount anything** —
+neither will restarting the service for a package upgrade. That is the central design
+guarantee; see [DESIGN.md](DESIGN.md) for the full lifetime matrix, which is the
+specification the supervisor and its integration tests are being built against. None of it
+is implemented yet.
 
-You can run the service with no tray at all, which is the sensible configuration on a
+The service is designed to run with no tray at all, which is the sensible configuration on a
 headless box.
 
 ## Installing
@@ -46,28 +48,32 @@ cd rclone-vfsmount-tray
 cargo build --release
 ```
 
-Requires a Rust toolchain and, for the GTK client only, the GTK4 development headers. The
-service and tray link no system C libraries, so `cargo build` works without GTK installed —
-the GTK crate is excluded from the workspace's default members and is built explicitly:
+Requires a Rust toolchain (1.87 or newer). The core, service and tray crates link no system
+C libraries, so a bare `cargo build` needs nothing else. The GTK client is excluded from the
+workspace's default members and built explicitly:
 
 ```sh
-cargo build -p rclone-vfsmount-tray-gtk   # needs GTK4 headers
+cargo build -p rclone-vfsmount-tray-gtk
 ```
 
-At runtime you need `rclone` and `fuse3`.
+It will need the GTK4 development headers once it gains its `gtk4` dependency; today it has
+none and builds anywhere.
+
+At runtime you will need `rclone` and `fuse3`.
 
 ## Development
 
 ```sh
-cargo test                    # core, service and tray — no system deps needed
+cargo test --locked           # core, service and tray — no system deps needed
 cargo clippy --all-targets
 cargo fmt --all
 ```
 
 The tests in `crates/core/tests/fixtures.rs` parse `testdata/`, which holds real responses
-captured from a live rclone v1.75.0. They exist so that rclone changing its wire format is
-caught by a test naming the field that moved, rather than by a tray icon quietly ceasing to
-show progress.
+captured from a live rclone v1.75.0. Each fixture is checked for the keys the model
+*silently dropped* — not just that it parsed — so a renamed or removed field fails a test
+that names it, rather than defaulting quietly and letting the tray stop showing progress.
+That check is the point; a plain parse-and-round-trip would pass either way.
 
 ## Documentation
 

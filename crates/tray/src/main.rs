@@ -21,8 +21,9 @@ use clap::{Parser, Subcommand};
     about = "System tray client for rclone VFS mounts"
 )]
 struct Args {
-    #[arg(long, default_value = "info")]
-    log_level: String,
+    /// Log verbosity. Takes precedence over `RUST_LOG`; defaults to `info`.
+    #[arg(long, value_name = "LEVEL")]
+    log_level: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -53,7 +54,12 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let filter = std::env::var("RUST_LOG").unwrap_or_else(|_| args.log_level.clone());
+    // Explicit flag beats the environment, per CLI convention.
+    let filter = args
+        .log_level
+        .clone()
+        .or_else(|| std::env::var("RUST_LOG").ok())
+        .unwrap_or_else(|| "info".to_string());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();

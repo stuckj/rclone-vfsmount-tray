@@ -10,4 +10,6 @@
 pub mod models;
 pub mod supervisor;
 
-pub use supervisor::{MountState, MountSupervisor, SupervisorError};
+pub use supervisor::{
+    BoxFuture, Cause, DiscoveredMount, MountState, MountSupervisor, SupervisorError,
+};

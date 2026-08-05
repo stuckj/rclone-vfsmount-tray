@@ -147,3 +147,68 @@ fn an_implementer_can_build_every_type_it_must_return() {
         "force overrides"
     );
 }
+
+/// Every `MountState` and `SupervisorError` an implementer must be able to *return*,
+/// constructed from outside the crate.
+///
+/// This is the compile-time half of this file's job, and it is enumerated one variant
+/// at a time on purpose. The first version of this file covered two of seven error
+/// variants and three of six states — marking `SupervisorError::Supervision`
+/// `#[non_exhaustive]` (exactly the change that broke `DiscoveredMount` and `Pending`,
+/// and exactly what a future reviewer will suggest) left every test passing. A guard
+/// that covers a third of its surface is the failure this file exists to prevent.
+#[test]
+fn an_implementer_can_construct_every_state_and_error() {
+    let states = [
+        MountState::Unmounted,
+        MountState::Mounting,
+        MountState::Mounted,
+        MountState::Unmounting,
+        MountState::Failed {
+            reason: "rclone exited 1: mount point busy".into(),
+        },
+        MountState::Foreign,
+    ];
+    assert_eq!(
+        states.iter().filter(|s| s.is_live()).count(),
+        2,
+        "only Mounted and Foreign are serving"
+    );
+    assert_eq!(
+        states.iter().filter(|s| s.is_managed()).count(),
+        5,
+        "only Foreign is unmanaged"
+    );
+
+    let errors = [
+        SupervisorError::UnknownMount("photos".into()),
+        SupervisorError::BadMountPoint {
+            path: "/mnt/photos".into(),
+            reason: "not a directory".into(),
+            source: None,
+        },
+        SupervisorError::RcloneFailed {
+            reason: "exit status 1".into(),
+            source: Some(Box::new(std::io::Error::other("spawn failed"))),
+        },
+        SupervisorError::PendingUploads(Pending::new(3, 1_024, 1)),
+        SupervisorError::Busy {
+            path: "/mnt/photos".into(),
+        },
+        SupervisorError::Supervision {
+            context: "StartTransientUnit".into(),
+            source: Some(Box::new(std::io::Error::other("no session bus"))),
+        },
+        SupervisorError::NotManaged("someone-elses".into()),
+    ];
+    for e in &errors {
+        assert!(!e.to_string().is_empty(), "{e:?} rendered as nothing");
+    }
+
+    // The cause chain must survive to a log, which is the point of carrying a source.
+    let with_source = &errors[2];
+    assert!(
+        std::error::Error::source(with_source).is_some(),
+        "RcloneFailed must expose its underlying cause"
+    );
+}

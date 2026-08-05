@@ -32,28 +32,32 @@ pub use supervisor::{
 ///
 /// Returns the directive string to hand to `EnvFilter`, or the invalid level.
 pub fn resolve_log_filter(flag: Option<&str>, env: Option<String>) -> Result<String, String> {
-    match flag {
-        Some(level) => {
-            let normalised = level.trim();
-            if !matches!(
-                normalised.to_ascii_lowercase().as_str(),
-                "off" | "error" | "warn" | "info" | "debug" | "trace"
-            ) {
-                return Err(level.to_string());
-            }
-            // Return the TRIMMED value. Validating a trimmed string and then handing
-            // back the original would accept `" info "`, which `EnvFilter` reads as a
-            // target filter matching nothing — reintroducing, in the very function
-            // written to prevent it, the silent-logging bug described above.
-            Ok(normalised.to_string())
+    // `EnvFilter` does not trim, and it does not reject. A padded value parses as a
+    // *target* literally named `" info "`, matches nothing, and silences the process
+    // — no output, no warning, exit 0. A blank one parses to no directive at all and
+    // falls back to EnvFilter's own ERROR default, losing every info and warn line.
+    //
+    // This function has already shipped that bug twice: once on the flag door, then
+    // again on the environment door, both times by trimming to *decide* and returning
+    // the original. So each door now trims once, up front, and returns what it
+    // validated. Do not reintroduce a `.trim()` that feeds only a condition.
+    if let Some(raw) = flag {
+        let level = raw.trim();
+        if !matches!(
+            level.to_ascii_lowercase().as_str(),
+            "off" | "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            // Report the value as given: echoing a trimmed version back at someone
+            // who typed trailing whitespace hides the actual mistake.
+            return Err(raw.to_string());
         }
-        // A set-but-empty RUST_LOG yields zero directives, which disables logging
-        // entirely — the same silent-service failure this function exists to prevent,
-        // reached through the environment instead of the flag. Treat it as unset.
-        None => Ok(env
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "info".to_string())),
+        return Ok(level.to_string());
     }
+
+    Ok(env
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "info".to_string()))
 }
 
 #[cfg(test)]
@@ -87,8 +91,9 @@ mod log_filter_tests {
 
     #[test]
     fn a_set_but_empty_rust_log_is_treated_as_unset() {
-        // Passing "" through would hand EnvFilter zero directives and silence the
-        // process, which is the failure mode this whole function is about.
+        // Passing "" through leaves EnvFilter with no valid directive, so it falls
+        // back to its own ERROR default and the service loses every info and warn
+        // line. Not silence, but not what the operator asked for either.
         assert_eq!(
             resolve_log_filter(None, Some(String::new())).unwrap(),
             "info"
@@ -96,6 +101,21 @@ mod log_filter_tests {
         assert_eq!(
             resolve_log_filter(None, Some("   ".into())).unwrap(),
             "info"
+        );
+    }
+
+    #[test]
+    fn a_padded_rust_log_is_trimmed_not_merely_accepted() {
+        // The regression this function shipped twice: trimming to decide, returning
+        // the original. `EnvFilter` reads `" info "` as a target named `" info "`,
+        // matches nothing, and produces no output at all.
+        assert_eq!(
+            resolve_log_filter(None, Some(" info ".into())).unwrap(),
+            "info"
+        );
+        assert_eq!(
+            resolve_log_filter(None, Some(" rvt_core=debug,zbus=warn\n".into())).unwrap(),
+            "rvt_core=debug,zbus=warn"
         );
     }
 

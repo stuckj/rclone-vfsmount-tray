@@ -30,13 +30,18 @@ pub use supervisor::{
 pub fn resolve_log_filter(flag: Option<&str>, env: Option<String>) -> Result<String, String> {
     match flag {
         Some(level) => {
+            let normalised = level.trim();
             if !matches!(
-                level.trim().to_ascii_lowercase().as_str(),
+                normalised.to_ascii_lowercase().as_str(),
                 "off" | "error" | "warn" | "info" | "debug" | "trace"
             ) {
                 return Err(level.to_string());
             }
-            Ok(level.to_string())
+            // Return the TRIMMED value. Validating a trimmed string and then handing
+            // back the original would accept `" info "`, which `EnvFilter` reads as a
+            // target filter matching nothing — reintroducing, in the very function
+            // written to prevent it, the silent-logging bug described above.
+            Ok(normalised.to_string())
         }
         None => Ok(env.unwrap_or_else(|| "info".to_string())),
     }
@@ -69,6 +74,18 @@ mod log_filter_tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_normalised_away() {
+        // Not merely accepted — the returned directive must be the trimmed form.
+        // `" info "` reaches EnvFilter as a target filter matching nothing, so
+        // returning it verbatim would silence the process exactly as a typo would.
+        assert_eq!(resolve_log_filter(Some(" info "), None).unwrap(), "info");
+        assert_eq!(
+            resolve_log_filter(Some("\tdebug\n"), None).unwrap(),
+            "debug"
+        );
     }
 
     #[test]

@@ -1,10 +1,14 @@
 //! Typed models for rclone's remote-control (rc) API responses, and for the
 //! on-disk VFS cache metadata.
 //!
-//! Every shape here was measured against a live rclone **v1.75.0** during the
+//! Almost every shape here was measured against a live rclone **v1.75.0** during the
 //! investigation in issue #9, not transcribed from documentation. The fixtures in
 //! `testdata/` are the exact bytes that came back, and `tests/fixtures.rs` asserts
 //! these types still parse them.
+//!
+//! The two exceptions are [`CoreStats::last_error`] and [`CoreStats::checking`],
+//! which could not be provoked and are modelled from rclone's source instead. Both
+//! say so at the field, and both are covered by unit tests rather than a fixture.
 //!
 //! # Tolerance
 //!

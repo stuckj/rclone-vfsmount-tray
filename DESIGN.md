@@ -198,11 +198,27 @@ All from #9, against rclone v1.75.0, and all encoded as tests in `rvt-core`:
 - `transferring[]` lags `vfs/queue` by `--vfs-write-back`. That window is "queued", not "0%".
 - `vfs/stats` `diskCache.bytesUsed` read **0** throughout a 128 MiB upload. It is not pending
   bytes and not reliably cache size either. Do not show it.
-- Writes through `--vfs-cache-mode off` or `minimal` do not go through the write-back cache
-  at all — they stream via `operations.Rcat`, which reports no `srcFs`. That is user data in
-  flight through a mount that **no tier can see**, correctly excluded from upload accounting
-  but invisible rather than merely imprecise. The applet should say so when a mount is
-  configured that way, rather than implying "nothing pending" means "nothing in flight".
+### One limit that is not from #9
+
+Read from rclone's source rather than measured, and **not** covered by a test — unlike
+everything above. Recorded here because it changes what the applet may claim, and flagged
+as unverified so nobody treats it as established.
+
+Not every write through a mount enters the write-back cache:
+
+- Under `--vfs-cache-mode off`, writes stream straight to the remote via `operations.Rcat`.
+- Under `minimal`, only *write-only* opens stream. Read-write opens, and any file already in
+  the cache, go through it normally and are fully visible to T2/T3/T4.
+
+A streamed write is **visible but unattributable**: `Rcat` accounts the transfer, so it does
+appear in `core/stats` `transferring[]` with `name`, `dstFs`, `group` and byte progress — but
+`size` is `-1` and there is **no `srcFs`**, which is the field that ties a transfer to a
+mount's cache. So it cannot be attributed to a mount, and `vfs/queue` never knows about it.
+
+The consequence for the UI: on a mount configured `off` (or `minimal` with write-only
+opens), "nothing pending" does not mean "nothing in flight". The applet should say the mount
+is unmonitored rather than imply it is idle — and the T1 data is rich enough to show the
+transfer, just not to attribute it, so an "unattributed transfers" line is implementable.
 
 ## Security
 

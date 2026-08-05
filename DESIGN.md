@@ -133,7 +133,7 @@ not by comparing version numbers, which only guesses.
 
 | Tier | Source | Gives | Notes |
 |---|---|---|---|
-| **T1** | `core/stats` `transferring[]` | `{name, size, bytes, percentage, speed, speedAvg, eta, group, srcFs, dstFs}` | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). Mixes directions — see below. |
+| **T1** | `core/stats` `transferring[]` | `{name, size}` always; `{bytes, percentage, speed, speedAvg, eta, group}` once rclone attaches accounting; `srcFs`/`dstFs` when a source/destination exists | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). Mixes directions — see below. Treat every field but `name` and `size` as optional. |
 | **T2** | `vfs/queue` (per-fs) | `{name, id, size, expiry, tries, delay, uploading}` | **The minimum bar.** `sum(size)` = bytes to send; `uploading` = in flight. `vfs/queue-set-expiry` forces an upload. |
 | **T3** | `vfs/stats` (per-fs) | `diskCache{uploadsInProgress, uploadsQueued, erroredFiles, outOfSpace, path, pathMeta}` | Counts only. Does not meet the bar alone, but hands over the cache paths for T4. |
 | **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` | `sum(Size where Dirty)` = bytes to send. **Meets the bar with no rc at all**, and survives an rclone crash — a dead process's dirty items are still on disk. |
@@ -198,6 +198,11 @@ All from #9, against rclone v1.75.0, and all encoded as tests in `rvt-core`:
 - `transferring[]` lags `vfs/queue` by `--vfs-write-back`. That window is "queued", not "0%".
 - `vfs/stats` `diskCache.bytesUsed` read **0** throughout a 128 MiB upload. It is not pending
   bytes and not reliably cache size either. Do not show it.
+- Writes through `--vfs-cache-mode off` or `minimal` do not go through the write-back cache
+  at all — they stream via `operations.Rcat`, which reports no `srcFs`. That is user data in
+  flight through a mount that **no tier can see**, correctly excluded from upload accounting
+  but invisible rather than merely imprecise. The applet should say so when a mount is
+  configured that way, rather than implying "nothing pending" means "nothing in flight".
 
 ## Security
 

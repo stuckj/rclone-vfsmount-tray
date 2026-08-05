@@ -603,7 +603,13 @@ fn queue_queued_versus_uploading() {
     assert!(!item.uploading, "still waiting out --vfs-write-back");
     assert!(item.expiry > 0.0, "expiry counts down to zero");
     assert_eq!(queued.uploading().count(), 0);
-    assert_eq!(queued.pending_bytes(), item.size as u64);
+    // Pinned to the captured values rather than compared to each other: asserting
+    // pending_bytes() == item.size is tautological for a one-item queue, and `id`
+    // and `size` being transposed would leave the key set unchanged.
+    assert_eq!(item.id, 1);
+    assert_eq!(item.size, 134_217_728);
+    assert_eq!(queued.pending_bytes(), 134_217_728);
+    assert!(queued.pending().is_exact());
 
     let live: VfsQueue = vfs_queue("vfs-queue-uploading.json");
     let item = &live.queue[0];

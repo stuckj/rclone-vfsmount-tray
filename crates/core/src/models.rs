@@ -100,12 +100,24 @@ pub struct CoreStats {
     /// Text of the most recent error, present only when `errors > 0`.
     ///
     /// Without this, [`Self::errors`] can say *3* and never say why.
+    ///
+    /// **Provenance differs from the rest of this file.** Unlike every other field
+    /// here, this and [`Self::checking`] are modelled from rclone's source
+    /// (`fs/accounting/stats.go`) rather than from a capture: neither appeared in any
+    /// response the investigation in #9 collected, and neither could be provoked
+    /// afterwards — rc job errors are accounted to `job/<n>`, not to the global
+    /// group. The shapes are asserted by unit tests rather than by a fixture.
     #[serde(default)]
     pub last_error: Option<String>,
 
-    /// Files currently being checked. Emitted only while a check is in progress, and
-    /// never by the VFS paths this tool watches — modelled so that its appearance in
-    /// a recaptured fixture is not mistaken for a wire-format break.
+    /// Files currently being checked, emitted only while a check is in progress.
+    ///
+    /// This *is* reachable from a mount: rclone accounts a rename as a "moving"
+    /// check (`operations.Move` → `NewCheckingTransfer`), so renaming a file inside a
+    /// watched mount emits it. Checks never appear in [`Self::transferring`] — the
+    /// two collections are separate — so this cannot pollute upload accounting.
+    ///
+    /// See [`Self::last_error`] for provenance.
     #[serde(default)]
     pub checking: Option<Vec<String>>,
 
@@ -205,13 +217,19 @@ pub struct Transfer {
     /// Estimated seconds remaining; `null` until rclone can estimate.
     #[serde(default)]
     pub eta: Option<f64>,
-    /// Accounting group. [`GLOBAL_STATS_GROUP`] for VFS write-back uploads,
-    /// `job/<n>` for explicit rc jobs.
+    /// Accounting group: [`GLOBAL_STATS_GROUP`] for anything not started by an rc job
+    /// — write-back uploads **and** cache downloads alike — or `job/<n>` for an
+    /// explicit rc job. It does not indicate direction; see [`GLOBAL_STATS_GROUP`].
+    ///
+    /// Absent until rclone attaches accounting to the transfer: this field, along with
+    /// `bytes`, `percentage`, `speed`, `speedAvg` and `eta`, comes from the `Account`,
+    /// not from the transfer itself.
     #[serde(default)]
     pub group: Option<String>,
-    /// Source filesystem. For a VFS write-back upload this contains the VFS **cache**
-    /// directory, which matches [`DiskCache::path`] for the owning VFS — that is how
-    /// a transfer is attributed to a specific mount.
+    /// Source filesystem. For a VFS write-back upload this is the VFS **cache**
+    /// directory (behind a backend tag), equal to [`DiskCache::path`] for the owning
+    /// VFS — that is how a transfer is attributed to a mount, and how its direction is
+    /// established. For a cache *download* it is the remote instead.
     #[serde(default)]
     pub src_fs: Option<String>,
     /// Destination filesystem — the remote being uploaded to.
@@ -350,6 +368,7 @@ impl VfsQueue {
 /// bound for a total. "3 files, 0 bytes" reads as harmless; "3 files, ≥ 0 bytes,
 /// 3 of unknown size" does not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Pending {
     /// Files waiting to upload.
     pub files: u64,
@@ -810,6 +829,48 @@ mod tests {
         let dc = s.disk_cache.expect("diskCache");
         assert_eq!(dc.path, "/p");
         assert_eq!(dc.path_meta, "/m");
+    }
+
+    #[test]
+    fn conditional_core_stats_fields_are_modelled() {
+        // No fixture carries these — see the provenance note on `last_error`. Their
+        // shapes come from rclone's stats.go, so they are asserted here instead;
+        // without this a rename or a type change would pass the whole suite.
+        let s: CoreStats = serde_json::from_str(
+            r#"{"errors":2,"lastError":"failed to upload: quota exceeded",
+                "checking":["a/b.txt","c.txt"]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.errors, 2);
+        assert_eq!(
+            s.last_error.as_deref(),
+            Some("failed to upload: quota exceeded")
+        );
+        assert_eq!(
+            s.checking.as_deref(),
+            Some(&["a/b.txt".to_string(), "c.txt".to_string()][..]),
+            "checking is a list of remotes, not a count or a single string"
+        );
+
+        // Both absent is the common case and must stay distinguishable from empty.
+        let quiet: CoreStats = serde_json::from_str(r#"{"errors":0}"#).unwrap();
+        assert_eq!(quiet.last_error, None);
+        assert_eq!(quiet.checking, None);
+    }
+
+    #[test]
+    fn degenerate_cache_path_matches_nothing() {
+        // Exercises the empty-path guard for real: if src_fs strips to empty too,
+        // equality alone would match and every transfer would be claimed.
+        let t = Transfer {
+            src_fs: Some(":local{x}:".into()),
+            ..Default::default()
+        };
+        assert!(
+            !t.belongs_to_cache(""),
+            "an unset cache path must claim nothing"
+        );
+        assert!(!t.belongs_to_cache("/"));
     }
 
     #[test]

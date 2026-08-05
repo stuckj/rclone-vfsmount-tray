@@ -27,16 +27,21 @@
 //! So each fixture is pinned by an explicit [`FixtureSpec`] and checked four ways:
 //!
 //! 1. it parses;
-//! 2. the **full set of keys present in the JSON** equals `keys` — catching anything
-//!    added to or removed from the wire format;
+//! 2. every key in `keys` is present in **every** array element (not merely
+//!    somewhere), and nothing outside `keys ∪ optional` appears — catching additions,
+//!    removals, and removals from a single element of a long array;
 //! 3. the set the model **dropped** equals `ignored` — catching a model that stops
 //!    reading a field it used to read;
 //! 4. it survives a round trip (kept for the self-consistency it does prove).
 //!
-//! Together those make both directions fail loudly and name the path. The lists are
-//! deliberately verbose: they are a snapshot of the wire contract, and having to
-//! update one is the point — it is how you find out what changed when someone
-//! recaptures the fixtures against a newer rclone.
+//! Key-set checks cannot catch a *swap* between two same-typed fields, since the set
+//! is unchanged. Individual tests therefore assert distinguishing values for fields
+//! where a transposition would be plausible and wrong — `speed` against `speedAvg`,
+//! for instance.
+//!
+//! The lists are deliberately verbose: they are a snapshot of the wire contract, and
+//! having to update one is the point — it is how you find out what changed when
+//! someone recaptures the fixtures against a newer rclone.
 
 use rvt_core::models::*;
 use serde_json::Value;
@@ -44,9 +49,17 @@ use std::collections::BTreeSet;
 
 /// What we expect a fixture to contain, and how much of it we model.
 struct FixtureSpec<'a> {
-    /// Every dotted key path present in the JSON, array indices collapsed to `[]`.
+    /// Key paths that must be present, array indices collapsed to `[]`.
     keys: &'a [&'a str],
-    /// The subset of `keys` the model deliberately does not read.
+    /// Key paths rclone emits *conditionally* — legal to be present or absent.
+    ///
+    /// Without this the guard would cry wolf on its own intended workflow:
+    /// `core/stats` omits `lastError` unless `errors > 0` and `checking` unless a
+    /// check is running, so recapturing a fixture from a busy rclone would fail as
+    /// "the wire format changed" for keys that were always allowed. A guard that
+    /// fires on correct input is a guard people learn to ignore.
+    optional: &'a [&'a str],
+    /// The subset of the above the model deliberately does not read.
     ignored: &'a [&'a str],
     /// Subtrees kept as raw JSON, whose children are therefore not enumerated.
     opaque: &'a [&'a str],
@@ -58,9 +71,20 @@ fn testdata(name: &str) -> String {
     std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("reading {full}: {e}"))
 }
 
-/// Collect every dotted key path in a JSON document, collapsing array indices to
-/// `[]` and not descending into `opaque` subtrees.
-fn collect_keys(v: &Value, prefix: &str, opaque: &[&str], out: &mut BTreeSet<String>) {
+/// Collect dotted key paths from a JSON document, collapsing array indices to `[]`
+/// and not descending into `opaque` subtrees.
+///
+/// `INTERSECT` controls how array elements combine. The union answers "what keys
+/// exist anywhere", which is what detects an *added* key. The intersection answers
+/// "what keys exist in *every* element", which is what detects a key removed from
+/// one element of many — a union would hide that behind its 100 well-formed
+/// siblings.
+fn collect_keys<const INTERSECT: bool>(
+    v: &Value,
+    prefix: &str,
+    opaque: &[&str],
+    out: &mut BTreeSet<String>,
+) {
     match v {
         Value::Object(map) => {
             for (k, vv) in map {
@@ -71,15 +95,27 @@ fn collect_keys(v: &Value, prefix: &str, opaque: &[&str], out: &mut BTreeSet<Str
                 };
                 out.insert(path.clone());
                 if !opaque.contains(&path.as_str()) {
-                    collect_keys(vv, &path, opaque, out);
+                    collect_keys::<INTERSECT>(vv, &path, opaque, out);
                 }
             }
         }
         Value::Array(items) => {
             let path = format!("{prefix}.[]");
+            let mut per_element: Vec<BTreeSet<String>> = Vec::new();
             for item in items {
-                collect_keys(item, &path, opaque, out);
+                let mut s = BTreeSet::new();
+                collect_keys::<INTERSECT>(item, &path, opaque, &mut s);
+                per_element.push(s);
             }
+            let combined = if INTERSECT {
+                per_element
+                    .into_iter()
+                    .reduce(|a, b| a.intersection(&b).cloned().collect())
+                    .unwrap_or_default()
+            } else {
+                per_element.into_iter().flatten().collect()
+            };
+            out.extend(combined);
         }
         _ => {}
     }
@@ -102,13 +138,25 @@ where
     // is invisible to serde_ignored, because a missing key simply defaults.
     let doc: Value =
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{name} is not JSON: {e}"));
-    let mut present = BTreeSet::new();
-    collect_keys(&doc, "", spec.opaque, &mut present);
-    let expected_keys: BTreeSet<String> = spec.keys.iter().map(|s| s.to_string()).collect();
+    let mut anywhere = BTreeSet::new();
+    collect_keys::<false>(&doc, "", spec.opaque, &mut anywhere);
+    let mut everywhere = BTreeSet::new();
+    collect_keys::<true>(&doc, "", spec.opaque, &mut everywhere);
+
+    let required: BTreeSet<String> = spec.keys.iter().map(|s| s.to_string()).collect();
+    let optional: BTreeSet<String> = spec.optional.iter().map(|s| s.to_string()).collect();
+
+    // Required keys must appear in EVERY array element, not merely somewhere.
+    let missing: Vec<_> = required.difference(&everywhere).collect();
+    let unexpected: Vec<_> = anywhere
+        .difference(&required)
+        .filter(|k| !optional.contains(*k))
+        .collect();
     assert!(
-        present == expected_keys,
-        "{name}: the wire format changed.\n{}",
-        diff_report("keys", &present, &expected_keys)
+        missing.is_empty() && unexpected.is_empty(),
+        "{name}: the wire format changed.\n  \
+         missing (rclone removed or renamed it): {missing:?}\n  \
+         unexpected (rclone added it, or it belongs in `optional`): {unexpected:?}"
     );
 
     // (3) Everything the model declined to read.
@@ -197,6 +245,11 @@ const CORE_STATS_TRANSFER: &[&str] = &[
     "transferring.[].srcFs",
 ];
 
+/// Keys `core/stats` emits only under some conditions: `lastError` when errors have
+/// occurred, `checking` while a check is running. Legal to be absent — which every
+/// fixture here is, having been captured from a healthy idle-or-uploading rclone.
+const CORE_STATS_OPTIONAL: &[&str] = &["lastError", "checking", "checking.[]"];
+
 const CORE_STATS_IGNORED: &[&str] = &[
     "deletedDirs",
     "deletes",
@@ -223,6 +276,7 @@ fn core_stats(name: &str, with_transfers: bool) -> CoreStats {
         name,
         &FixtureSpec {
             keys: &keys,
+            optional: CORE_STATS_OPTIONAL,
             ignored: CORE_STATS_IGNORED,
             opaque: &[],
         },
@@ -251,6 +305,7 @@ const VFS_STATS_SPEC: FixtureSpec<'static> = FixtureSpec {
         "metadataCache.files",
         "opt",
     ],
+    optional: &[],
     ignored: &[],
     opaque: &["opt"],
 };
@@ -266,6 +321,7 @@ const VFS_QUEUE_SPEC: FixtureSpec<'static> = FixtureSpec {
         "queue.[].tries",
         "queue.[].uploading",
     ],
+    optional: &[],
     ignored: &[],
     opaque: &[],
 };
@@ -282,6 +338,7 @@ const RC_LIST_SPEC: FixtureSpec<'static> = FixtureSpec {
         "commands.[].Path",
         "commands.[].Title",
     ],
+    optional: &[],
     ignored: &[
         "commands.[].Help",
         "commands.[].NeedsRequest",
@@ -306,12 +363,14 @@ const CORE_VERSION_SPEC: FixtureSpec<'static> = FixtureSpec {
         "osVersion",
         "version",
     ],
+    optional: &[],
     ignored: &["goTags", "linking", "osArch", "osKernel", "osVersion"],
     opaque: &[],
 };
 
 const VFS_LIST_SPEC: FixtureSpec<'static> = FixtureSpec {
     keys: &["vfses"],
+    optional: &[],
     ignored: &[],
     opaque: &[],
 };
@@ -327,6 +386,7 @@ const VFSMETA_SPEC: FixtureSpec<'static> = FixtureSpec {
         "Rs.[].Size",
         "Size",
     ],
+    optional: &[],
     ignored: &[],
     opaque: &[],
 };
@@ -360,6 +420,15 @@ fn core_stats_mid_upload_has_real_progress() {
     assert!(t.speed_avg > 0.0);
     assert_eq!(t.eta, Some(14.0));
 
+    // Pinned exactly, and they differ: a key-set check cannot notice `speed` and
+    // `speedAvg` being transposed, because the set is unchanged and the round trip is
+    // self-consistent. A swap would show the user the wrong throughput.
+    assert_eq!(t.speed, 4_471_532.801_626_206);
+    assert_eq!(t.speed_avg, 4_475_791.878_358_628);
+    assert_ne!(t.speed, t.speed_avg);
+    // Same argument for the check counters.
+    assert_eq!((s.checks, s.total_checks), (0, 0));
+
     // --bwlimit was 4M; the reported rate should be in that neighbourhood rather
     // than a placeholder.
     assert!(
@@ -368,6 +437,92 @@ fn core_stats_mid_upload_has_real_progress() {
         t.speed
     );
 }
+
+#[test]
+fn a_vfs_download_is_not_a_pending_upload() {
+    // Captured while reading a file back through a --vfs-cache-mode full mount, with
+    // the upload queue empty. rclone puts this in the SAME `global_stats` group as a
+    // write-back upload, so a group-only filter reports it as pending upload bytes —
+    // inflating the figure that decides whether unmounting is safe.
+    let mut keys = core_stats_keys(true);
+    // A download reports no dstFs: rclone omits it when the destination is nil.
+    keys.retain(|k| *k != "transferring.[].dstFs");
+
+    let s: CoreStats = parse_fixture(
+        "core-stats-vfs-download-midflight.json",
+        &FixtureSpec {
+            keys: &keys,
+            optional: CORE_STATS_OPTIONAL,
+            ignored: CORE_STATS_IGNORED,
+            opaque: &[],
+        },
+    );
+
+    let t = &s.transfers_slice()[0];
+    assert_eq!(t.group.as_deref(), Some("global_stats"));
+    assert!(
+        t.dst_fs.is_none(),
+        "a download reports no dstFs — that asymmetry is the direction signal"
+    );
+    assert!(t.is_ungrouped(), "it really does share the uploads' group");
+
+    // srcFs here is the REMOTE, not the cache, so the cache-path test rejects it.
+    let cache = vfs_stats("vfs-stats-upload-in-progress.json")
+        .disk_cache
+        .expect("diskCache")
+        .path;
+    assert!(
+        !t.is_writeback_upload(&cache),
+        "a download must never count as a pending upload"
+    );
+    assert_eq!(s.writeback_uploads(&cache).count(), 0);
+    assert_eq!(
+        s.ungrouped_transfers().count(),
+        1,
+        "the group filter sees it"
+    );
+}
+
+/// Every file in `testdata/` must be pinned by a test.
+///
+/// Without this the guard is opt-in: dropping in a new fixture and forgetting to
+/// write a spec for it passes silently, and the file looks like coverage it is not.
+#[test]
+fn every_fixture_is_pinned() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+    let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+        .expect("testdata/")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    on_disk.sort();
+
+    let mut pinned: Vec<String> = PINNED_FIXTURES.iter().map(|s| s.to_string()).collect();
+    pinned.sort();
+
+    assert_eq!(
+        on_disk, pinned,
+        "testdata/ and PINNED_FIXTURES disagree — a fixture with no spec is not \
+         tested, and a spec with no fixture is dead"
+    );
+}
+
+/// The complete set of fixtures, asserted against `testdata/` above.
+const PINNED_FIXTURES: &[&str] = &[
+    "core-stats-idle-no-transferring.json",
+    "core-stats-mixed-vfs-and-job.json",
+    "core-stats-vfs-download-midflight.json",
+    "core-stats-vfs-upload-midflight.json",
+    "core-version.json",
+    "rc-list-v1.75.0.json",
+    "vfs-list.json",
+    "vfs-queue-queued-not-uploading.json",
+    "vfs-queue-uploading.json",
+    "vfs-stats-idle.json",
+    "vfs-stats-upload-in-progress.json",
+    "vfsmeta-item-dirty.json",
+];
 
 #[test]
 fn core_stats_transferring_absent_when_idle() {
@@ -388,7 +543,11 @@ fn vfs_and_job_transfers_are_separable() {
     // one array, so filtering is not optional.
     assert_eq!(s.transfers_slice().len(), 2, "fixture should hold both");
 
-    let vfs: Vec<_> = s.vfs_writeback_transfers().map(|t| &*t.name).collect();
+    let cache = vfs_stats("vfs-stats-upload-in-progress.json")
+        .disk_cache
+        .expect("diskCache")
+        .path;
+    let vfs: Vec<_> = s.writeback_uploads(&cache).map(|t| &*t.name).collect();
     assert_eq!(
         vfs,
         ["vfsfile.bin"],
@@ -398,7 +557,7 @@ fn vfs_and_job_transfers_are_separable() {
     let job = s
         .transfers_slice()
         .iter()
-        .find(|t| !t.is_vfs_writeback())
+        .find(|t| !t.is_ungrouped())
         .expect("the job transfer");
     assert!(
         job.group.as_deref().is_some_and(|g| g.starts_with("job/")),

@@ -35,16 +35,36 @@ struct Args {
     foreground: bool,
 }
 
+/// Resolve the log filter: explicit flag, else `RUST_LOG`, else `info`.
+///
+/// The flag is validated as a bare level and rejected otherwise. `EnvFilter`'s
+/// grammar treats an unrecognised bare word as a *target* filter, so
+/// `--log-level verbose` parses successfully, matches no target, and silences the
+/// process completely — no output, no warning, exit code 0. A typo must not turn a
+/// service into a silent one.
+///
+/// `RUST_LOG` keeps the full directive grammar, which is what people expect of it.
+fn resolve_log_filter(flag: Option<&str>) -> anyhow::Result<String> {
+    match flag {
+        Some(level) => {
+            level
+                .parse::<tracing_subscriber::filter::LevelFilter>()
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "--log-level must be one of: off, error, warn, info, debug, trace \
+                         (got {level:?}). Use RUST_LOG for per-target directives."
+                    )
+                })?;
+            Ok(level.to_string())
+        }
+        None => Ok(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string())),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Explicit flag beats the environment, per CLI convention: someone who exported
-    // RUST_LOG for another tool should still be able to raise verbosity here.
-    let filter = args
-        .log_level
-        .clone()
-        .or_else(|| std::env::var("RUST_LOG").ok())
-        .unwrap_or_else(|| "info".to_string());
+    let filter = resolve_log_filter(args.log_level.as_deref())?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();

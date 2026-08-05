@@ -38,10 +38,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # untagged; head of the `stable` branch
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # untagged; head of the `v2` branch
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag v2 (annotated) -> this commit
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -89,19 +89,23 @@ jobs:
           if [ -z "$v" ]; then echo "::error::could not read rust-version"; exit 1; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
           echo "declared MSRV: $v"
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # untagged; head of the `stable` branch
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # untagged; head of the `v2` branch
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag v2 (annotated) -> this commit
+      # VERSION comes via env rather than being interpolated into the script body:
+      # it is read from the PR's own Cargo.toml, so textual interpolation is the
+      # classic injection shape even though the blast radius here is nil.
       - name: Confirm the override actually took
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+          VERSION: ${{ steps.msrv.outputs.version }}
         run: |
           actual=$(rustc --version)
           echo "building with: $actual"
           case "$actual" in
-            *"${{ steps.msrv.outputs.version }}"*) ;;
-            *) echo "::error::expected ${{ steps.msrv.outputs.version }}, got $actual"; exit 1 ;;
+            *"$VERSION"*) ;;
+            *) echo "::error::expected $VERSION, got $actual"; exit 1 ;;
           esac
       - name: check at MSRV
         env:
@@ -119,8 +123,9 @@ jobs:
       - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
         with:
           tool: cargo-audit
-      # Vulnerabilities fail the build. `unmaintained` and `unsound` warn only:
-      # they fire regularly for transitive dependencies, and blocking every
-      # unrelated PR on one is how a security check gets disabled entirely.
-      # Exceptions belong in audit.toml with a reason and a date.
+      # Vulnerabilities, unsound advisories and yanked crates fail the build.
+      # `unmaintained` is deliberately NOT denied: it fires routinely for
+      # transitive dependencies, and blocking every unrelated PR on one is how a
+      # security check gets switched off entirely. Exceptions belong in audit.toml
+      # with a reason and a date.
       - run: cargo audit --deny unsound --deny yanked

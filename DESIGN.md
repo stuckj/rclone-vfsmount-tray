@@ -133,7 +133,7 @@ not by comparing version numbers, which only guesses.
 
 | Tier | Source | Gives | Notes |
 |---|---|---|---|
-| **T1** | `core/stats` `transferring[]` | `{name, size, bytes, percentage, speed, speedAvg, eta, group, srcFs, dstFs}` | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). |
+| **T1** | `core/stats` `transferring[]` | `{name, size, bytes, percentage, speed, speedAvg, eta, group, srcFs, dstFs}` | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). Mixes directions — see below. |
 | **T2** | `vfs/queue` (per-fs) | `{name, id, size, expiry, tries, delay, uploading}` | **The minimum bar.** `sum(size)` = bytes to send; `uploading` = in flight. `vfs/queue-set-expiry` forces an upload. |
 | **T3** | `vfs/stats` (per-fs) | `diskCache{uploadsInProgress, uploadsQueued, erroredFiles, outOfSpace, path, pathMeta}` | Counts only. Does not meet the bar alone, but hands over the cache paths for T4. |
 | **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` | `sum(Size where Dirty)` = bytes to send. **Meets the bar with no rc at all**, and survives an rclone crash — a dead process's dirty items are still on disk. |
@@ -159,6 +159,30 @@ differencing total dirty bytes as files drop out, so large files stall then jump
 A progress bar that actually means "we have no idea" is worse than a number. When the tier
 degrades mid-session — rc goes away and we drop to T4 — the UI must visibly lose precision
 rather than freeze on stale figures.
+
+### Identifying a write-back upload takes two conditions, not one
+
+`core/stats` reports every transfer in the process, and the `group` field separates rc
+jobs (`job/<n>`) from everything else (`global_stats`). It is tempting to read
+`global_stats` as "VFS write-back upload". **It is not.** VFS cache *downloads* —
+reading a file through a `--vfs-cache-mode full` mount — are ungrouped too, and appear
+in `transferring[]` with the same group.
+
+Measured, with an empty upload queue while pulling a file down:
+
+| | write-back upload | cache download |
+|---|---|---|
+| `group` | `global_stats` | `global_stats` |
+| `srcFs` | the VFS **cache** directory | the **remote** |
+| `dstFs` | the remote | **absent** |
+
+So a write-back upload is `group == global_stats` **and** `srcFs` matching that mount's
+`vfs/stats` `diskCache.path`. Filtering on the group alone shows a file being
+*downloaded* as a pending upload, and counts its bytes toward the outstanding total that
+decides whether unmounting is safe — wrong in the unsafe direction.
+
+The same cache-path match is what attributes a transfer to a *particular* mount, so one
+condition does double duty; it just must not be skipped when there is only one mount.
 
 ### Measured behaviour worth knowing
 

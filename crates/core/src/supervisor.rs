@@ -20,8 +20,25 @@
 //! rclone in the service's own process group or cgroup, and must treat
 //! [`MountSupervisor::unmount`] as the *only* path to an unmount.
 
+use crate::models::Pending;
 use std::future::Future;
 use std::pin::Pin;
+
+/// Render a pending-upload summary that never presents a floor as a total.
+fn pending_summary(p: &Pending) -> String {
+    if p.is_exact() {
+        format!(
+            "{} file(s) totalling {} bytes are still waiting to upload",
+            p.files, p.known_bytes
+        )
+    } else {
+        format!(
+            "{} file(s) are still waiting to upload — at least {} bytes, \
+             including {} of unknown size",
+            p.files, p.known_bytes, p.unknown_size_files
+        )
+    }
+}
 
 /// A boxed future, so the trait below stays usable as `dyn MountSupervisor`.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -115,8 +132,14 @@ pub enum SupervisorError {
 
     /// The unmount was refused because the write-back cache still holds unuploaded
     /// data. Callers may retry with force, having told the user what that costs.
-    #[error("{files} file(s) totalling {bytes} bytes are still waiting to upload")]
-    PendingUploads { files: u64, bytes: u64 },
+    ///
+    /// Carries the whole [`Pending`] summary rather than a bare byte count. Files of
+    /// unknown size contribute nothing to the total, so flattening this to one number
+    /// would render three unsized files as *"3 files totalling 0 bytes"* — which
+    /// reads as "nothing to lose" at the exact moment the user decides whether to
+    /// force an unmount.
+    #[error("{}", pending_summary(.0))]
+    PendingUploads(Pending),
 
     /// The mount point is busy and could not be released.
     #[error("mount point {path:?} is busy")]
@@ -225,12 +248,28 @@ mod tests {
 
     #[test]
     fn pending_upload_error_states_the_cost() {
-        let e = SupervisorError::PendingUploads {
+        let e = SupervisorError::PendingUploads(Pending {
             files: 3,
-            bytes: 1_288_490_188,
-        };
+            known_bytes: 1_288_490_188,
+            unknown_size_files: 0,
+        });
         let msg = e.to_string();
         assert!(msg.contains('3') && msg.contains("1288490188"), "{msg}");
+    }
+
+    #[test]
+    fn pending_upload_error_never_presents_a_floor_as_a_total() {
+        // Three unsized files must not read as "totalling 0 bytes" — that is what a
+        // user sees immediately before deciding whether to force an unmount.
+        let e = SupervisorError::PendingUploads(Pending {
+            files: 3,
+            known_bytes: 0,
+            unknown_size_files: 3,
+        });
+        let msg = e.to_string();
+        assert!(!msg.contains("totalling"), "{msg}");
+        assert!(msg.contains("at least"), "{msg}");
+        assert!(msg.contains("unknown"), "{msg}");
     }
 
     #[test]

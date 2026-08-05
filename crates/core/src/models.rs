@@ -16,12 +16,23 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The accounting group that rclone assigns to VFS write-back uploads.
+/// rclone's **default** accounting group — everything not running under an explicit
+/// rc job.
 ///
-/// Transfers that originate from an explicit rc job (`operations/copyfile`,
-/// `sync/copy`, …) are grouped as `job/<n>` instead. Filtering on this is how a
-/// mount's upload progress is separated from unrelated work happening in the same
-/// rclone process — see [`CoreStats::vfs_writeback_transfers`].
+/// Transfers started by an rc job (`operations/copyfile`, `sync/copy`, …) are grouped
+/// as `job/<n>` instead, so this does separate VFS activity from rc jobs.
+///
+/// **It does not indicate direction.** VFS cache *downloads* — reading a file through
+/// a `--vfs-cache-mode full` mount — are also ungrouped and also appear in
+/// `core/stats` `transferring[]` with this group. Measured, not assumed: see
+/// `testdata/core-stats-vfs-download-midflight.json`, captured while pulling a file
+/// down with an empty upload queue.
+///
+/// Treating this group as "uploads" therefore reports a download as a pending upload,
+/// which is wrong in the direction that matters — it inflates the outstanding-bytes
+/// figure that decides whether unmounting is safe. Use
+/// [`Transfer::is_writeback_upload`], which additionally requires the source to be the
+/// VFS cache.
 ///
 /// Note that `core/group-list` does **not** enumerate this group (it lists only
 /// `job/*`), so it cannot be discovered at runtime. It is a constant.
@@ -34,9 +45,9 @@ pub const GLOBAL_STATS_GROUP: &str = "global_stats";
 /// Response from `core/stats`.
 ///
 /// These figures are **process-global**: one rclone process serving several VFSes
-/// reports all of their transfers here together. Use
-/// [`CoreStats::vfs_writeback_transfers`] and [`Transfer::belongs_to_cache`] to
-/// narrow them down.
+/// reports all of their transfers here together, in both directions. Use
+/// [`CoreStats::writeback_uploads`] to narrow to one mount's pending uploads — a
+/// group filter alone is not enough, because VFS downloads share the group.
 ///
 /// `core/stats` also accepts a `group` parameter, which filters server-side and is
 /// cheaper than filtering here; and `short: true`, which omits `transferring`
@@ -86,6 +97,18 @@ pub struct CoreStats {
     #[serde(default)]
     pub transfer_time: f64,
 
+    /// Text of the most recent error, present only when `errors > 0`.
+    ///
+    /// Without this, [`Self::errors`] can say *3* and never say why.
+    #[serde(default)]
+    pub last_error: Option<String>,
+
+    /// Files currently being checked. Emitted only while a check is in progress, and
+    /// never by the VFS paths this tool watches — modelled so that its appearance in
+    /// a recaptured fixture is not mistaken for a wire-format break.
+    #[serde(default)]
+    pub checking: Option<Vec<String>>,
+
     /// Currently active transfers.
     ///
     /// **This key is absent — not an empty array — when nothing is transferring.**
@@ -109,14 +132,31 @@ impl CoreStats {
         self.transferring.is_some()
     }
 
-    /// Active transfers that are VFS write-back uploads, excluding explicit rc jobs.
+    /// Active write-back **uploads** out of the given VFS cache.
     ///
-    /// Prefer asking rclone to do this by passing `group: "global_stats"` to
-    /// `core/stats`; this exists for responses that were fetched unfiltered.
-    pub fn vfs_writeback_transfers(&self) -> impl Iterator<Item = &Transfer> {
+    /// `cache_path` is that mount's [`DiskCache::path`]. Both conditions are needed:
+    /// the group excludes rc jobs, and the cache-path match excludes VFS *downloads*,
+    /// which share the group. See [`GLOBAL_STATS_GROUP`].
+    ///
+    /// Narrowing by `group` can also be pushed to rclone by passing
+    /// `group: "global_stats"` to `core/stats`; the direction check cannot, and must
+    /// happen here.
+    pub fn writeback_uploads<'a>(
+        &'a self,
+        cache_path: &'a str,
+    ) -> impl Iterator<Item = &'a Transfer> {
         self.transfers_slice()
             .iter()
-            .filter(|t| t.is_vfs_writeback())
+            .filter(move |t| t.is_writeback_upload(cache_path))
+    }
+
+    /// Active transfers not started by an rc job.
+    ///
+    /// This is a *group* filter only, so it includes VFS downloads as well as
+    /// write-back uploads. Prefer [`Self::writeback_uploads`] unless you genuinely
+    /// want both directions.
+    pub fn ungrouped_transfers(&self) -> impl Iterator<Item = &Transfer> {
+        self.transfers_slice().iter().filter(|t| t.is_ungrouped())
     }
 }
 
@@ -180,13 +220,31 @@ pub struct Transfer {
 }
 
 impl Transfer {
-    /// Whether this transfer is a VFS write-back upload rather than an explicit job.
+    /// Whether this transfer was **not** started by an explicit rc job.
     ///
-    /// A transfer with no `group` at all is treated as *not* a write-back upload:
-    /// showing an unrelated `rclone copy` as a mount's pending upload is worse than
-    /// briefly omitting a real one.
-    pub fn is_vfs_writeback(&self) -> bool {
+    /// This says nothing about direction — VFS downloads are ungrouped too. It is a
+    /// building block for [`Self::is_writeback_upload`], not a filter to use alone.
+    ///
+    /// A transfer with no `group` at all counts as *not* ungrouped: showing an
+    /// unrelated `rclone copy` as a mount's pending upload is worse than briefly
+    /// omitting a real one.
+    pub fn is_ungrouped(&self) -> bool {
         self.group.as_deref() == Some(GLOBAL_STATS_GROUP)
+    }
+
+    /// Whether this is a write-back **upload** out of the given VFS cache.
+    ///
+    /// Requires both that the transfer is ungrouped (not an rc job) and that its
+    /// source is that mount's cache directory. The second condition is what
+    /// establishes *direction*: for an upload rclone reports `srcFs` as the cache and
+    /// `dstFs` as the remote, whereas for a cache download `srcFs` is the remote and
+    /// `dstFs` is absent entirely.
+    ///
+    /// Without it, reading a large file through a `--vfs-cache-mode full` mount would
+    /// be reported as a pending upload — inflating the outstanding-bytes figure that
+    /// gates the unmount safety check, in the unsafe direction.
+    pub fn is_writeback_upload(&self, cache_path: &str) -> bool {
+        self.is_ungrouped() && self.belongs_to_cache(cache_path)
     }
 
     /// The file size, or `None` when rclone reported it as unknown (`-1`).
@@ -225,11 +283,15 @@ impl Transfer {
 /// `":local{8un-i}:/var/cache/x"` becomes `"/var/cache/x"`. Anything not matching
 /// that shape is returned untouched, so a plain path passes through unchanged.
 ///
-/// Splits on the closing `}:` rather than the first `:`. rclone's `ConfigString`
-/// appends overridden connection-string options inside the braces, and those can
-/// themselves contain colons — `:http,url=https://x{hash}:/path` — which a
-/// first-colon split would cut in the wrong place, silently unattributing the
-/// transfer.
+/// Splits on the closing `}:`, not the first `:`. The tag rclone emits is
+/// `:<backend>{<hash>}:`, where the hash is `base64.RawURLEncoding` — an alphabet of
+/// `[A-Za-z0-9_-]` that cannot contain `}` or `:` — so the closing `}:` is
+/// unambiguous, and anchoring on it is robust to whatever appears in the backend
+/// name.
+///
+/// (An earlier version of this comment claimed connection-string options with
+/// embedded colons could appear inside the braces. They cannot: `fs.ConfigString`
+/// emits the brace form and `ConfigStringFull` the comma form, never both.)
 fn strip_backend_tag(fs: &str) -> &str {
     fs.strip_prefix(':')
         .and_then(|rest| rest.find("}:").map(|i| &rest[i + 2..]))
@@ -593,21 +655,30 @@ mod tests {
     }
 
     #[test]
-    fn writeback_transfers_exclude_jobs() {
+    fn writeback_uploads_exclude_jobs_and_downloads() {
+        const CACHE: &str = "/c/vfs/local/srv/data";
         let s: CoreStats = serde_json::from_str(
             r#"{"transferring":[
-                 {"name":"a","group":"global_stats"},
-                 {"name":"b","group":"job/12"},
-                 {"name":"c"}
+                 {"name":"upload","group":"global_stats",
+                  "srcFs":":local{x}:/c/vfs/local/srv/data","dstFs":"/srv/data"},
+                 {"name":"download","group":"global_stats","srcFs":"/srv/data"},
+                 {"name":"job","group":"job/12","srcFs":"/elsewhere"},
+                 {"name":"nogroup","srcFs":":local{x}:/c/vfs/local/srv/data"}
                ]}"#,
         )
         .unwrap();
-        let names: Vec<_> = s.vfs_writeback_transfers().map(|t| &t.name).collect();
+
+        let names: Vec<_> = s.writeback_uploads(CACHE).map(|t| &*t.name).collect();
         assert_eq!(
             names,
-            ["a"],
-            "jobs and group-less transfers must be excluded"
+            ["upload"],
+            "a cache DOWNLOAD shares the global_stats group and must not be counted \
+             as a pending upload — it would inflate the figure that gates unmounting"
         );
+
+        // The group filter alone sees both directions; that is why it is not enough.
+        let ungrouped: Vec<_> = s.ungrouped_transfers().map(|t| &*t.name).collect();
+        assert_eq!(ungrouped, ["upload", "download"]);
     }
 
     #[test]
@@ -642,13 +713,12 @@ mod tests {
     }
 
     #[test]
-    fn backend_tag_with_colons_in_options_is_stripped() {
-        // rclone's ConfigString appends overridden connection-string options inside
-        // the braces, and those can contain colons. Splitting on the first colon
-        // would cut in the wrong place and silently unattribute the transfer.
+    fn backend_tag_is_stripped() {
+        // The real shapes: `:<backend>{<base64url hash>}:`. The hash alphabet is
+        // [A-Za-z0-9_-], so the closing `}:` is an unambiguous anchor.
         for src in [
-            ":http,url=https://example.com/x{h4sh}:/c/vfs/http/data",
-            ":local,default_time=2020-01-01T00:00:00Z{h4sh}:/c/vfs/http/data",
+            ":local{8un-i}:/c/vfs/http/data",
+            ":http{_a-Z09}:/c/vfs/http/data",
         ] {
             let t = Transfer {
                 src_fs: Some(src.into()),

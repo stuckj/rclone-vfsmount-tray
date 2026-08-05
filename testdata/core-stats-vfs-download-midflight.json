@@ -1,0 +1,36 @@
+{
+  "bytes": 53473280,
+  "checks": 0,
+  "deletedDirs": 0,
+  "deletes": 0,
+  "elapsedTime": 14.315529931,
+  "errors": 0,
+  "eta": 10,
+  "fatalError": false,
+  "listed": 1,
+  "renames": 0,
+  "retryError": false,
+  "serverSideCopies": 0,
+  "serverSideCopyBytes": 0,
+  "serverSideMoveBytes": 0,
+  "serverSideMoves": 0,
+  "speed": 4575179.438638149,
+  "totalBytes": 100663296,
+  "totalChecks": 0,
+  "totalTransfers": 1,
+  "transferTime": 11.651659151,
+  "transferring": [
+    {
+      "bytes": 53473280,
+      "eta": 10,
+      "group": "global_stats",
+      "name": "pull-me.bin",
+      "percentage": 53,
+      "size": 100663296,
+      "speed": 4589511.915697529,
+      "speedAvg": 4575153.0588837555,
+      "srcFs": "/home/claude/.claude/jobs/f70669bc/tmp/spike9/remote-store"
+    }
+  ],
+  "transfers": 0
+}

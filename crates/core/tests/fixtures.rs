@@ -1,47 +1,12 @@
-//! Parse the captured rclone responses in `testdata/`.
+//! Parse the captured rclone v1.75.0 responses in `testdata/`, so a wire-format change
+//! fails a test naming the field rather than silently breaking the tray.
 //!
-//! These files are the literal bytes a live rclone v1.75.0 returned during the
-//! investigation in issue #9. They exist so that a future rclone changing its wire
-//! format is caught here, by a test naming the field that moved, rather than in the
-//! field as a tray icon that silently stops showing progress.
-//!
-//! # Why a round trip is not enough
-//!
-//! The obvious check — deserialize, re-serialize, deserialize again, compare — is
-//! nearly worthless on its own, and it is worth stating why so nobody reinstates it
-//! as the only guard.
-//!
-//! It runs the model's *own* codec on both sides. If the model fails to read a
-//! field, that field takes its default, serializes back as that default, and
-//! re-parses to the same default. The comparison passes. So the round trip proves
-//! the model agrees with itself; it proves nothing about whether the fixture was
-//! read. Renaming a modelled field to something rclone never sends is invisible to
-//! it — which is exactly how `RcCommand` shipped modelling a nonexistent
-//! `AuthRequired` field with a green suite.
-//!
-//! `serde_ignored` closes half of that: it reports the keys the model *dropped from
-//! the input*, so a model field renamed to something rclone never sends shows up as
-//! a newly-dropped key. But it says nothing about a key vanishing from the input —
-//! every field is `#[serde(default)]`, so a removed key just silently defaults.
-//!
-//! So each fixture is pinned by an explicit [`FixtureSpec`] and checked four ways:
-//!
-//! 1. it parses;
-//! 2. every key in `keys` is present in **every** array element (not merely
-//!    somewhere), and nothing outside `keys ∪ optional` appears — catching additions,
-//!    removals, and removals from a single element of a long array;
-//! 3. the set the model **dropped** equals `ignored` — catching a model that stops
-//!    reading a field it used to read;
-//! 4. it survives a round trip (kept for the self-consistency it does prove).
-//!
-//! Key-set checks cannot catch a *swap* between two same-typed fields, since the set
-//! is unchanged. Individual tests therefore assert distinguishing values for fields
-//! where a transposition would be plausible and wrong — `speed` against `speedAvg`,
-//! for instance.
-//!
-//! The lists are deliberately verbose: they are a snapshot of the wire contract, and
-//! having to update one is the point — it is how you find out what changed when
-//! someone recaptures the fixtures against a newer rclone.
+//! A round trip alone proves nothing — it runs the model's own codec both ways, so a
+//! field the model fails to read defaults and compares equal. Each fixture is therefore
+//! pinned by a [`FixtureSpec`]: every expected key must be present in every array
+//! element, nothing outside `keys ∪ optional` may appear, and the keys the model
+//! *dropped* must match `ignored`. Swaps between same-typed fields need value
+//! assertions; the key set cannot see them.
 
 use rvt_core::models::*;
 use serde_json::Value;

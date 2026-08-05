@@ -1,15 +1,8 @@
-//! Core logic for `rclone-vfsmount-tray`.
+//! Core logic for `rclone-vfsmount-tray`: [`models`] (rc API and cache metadata),
+//! [`supervisor`] (mount lifecycle), and [`resolve_log_filter`].
 //!
-//! This crate holds everything that is neither a tray icon nor a window. Today that
-//! is [`models`] — the typed models for rclone's remote-control (rc) API and its
-//! on-disk cache metadata — [`supervisor`], the abstraction over starting and
-//! stopping mounts, and [`resolve_log_filter`].
-//!
-//! The VFS cache scanner (#22) and the configuration model (#16) land here too, and
-//! are not written yet.
-//!
-//! It is deliberately pure Rust — no system C libraries — so that CI can lint and
-//! test it on a bare runner.
+//! Pure Rust — no system C libraries — so CI can lint and test it on a bare runner.
+//! The cache scanner (#22) and config model (#16) land here too.
 
 pub mod models;
 pub mod supervisor;
@@ -19,18 +12,11 @@ pub use supervisor::{
     BoxFuture, Cause, DiscoveredMount, MountState, MountSupervisor, SupervisorError,
 };
 
-/// Resolve a log filter directive from an explicit flag, `RUST_LOG`, or the default.
+/// Resolve a log filter: explicit flag, else `RUST_LOG`, else `info`.
 ///
-/// The flag is validated as a bare level and rejected otherwise, which is not
-/// pedantry: `tracing_subscriber`'s `EnvFilter` grammar treats an unrecognised bare
-/// word as a *target* filter, so `--log-level verbose` parses successfully, matches
-/// no target, and silences the process completely — no output, no warning, exit code
-/// zero. A typo must not turn a service into a silent one.
-///
-/// `RUST_LOG` keeps the full directive grammar, which is what people expect of it,
-/// and the explicit flag takes precedence over it per CLI convention.
-///
-/// Returns the directive string to hand to `EnvFilter`, or the invalid level.
+/// The flag must be a bare level. `EnvFilter` reads an unknown word as a *target*
+/// matching nothing, which silences the process — so validate, and return what was
+/// validated. Returns the offending value on rejection.
 pub fn resolve_log_filter(flag: Option<&str>, env: Option<String>) -> Result<String, String> {
     // `EnvFilter` does not trim, and it does not reject. A padded value parses as a
     // *target* literally named `" info "`, matches nothing, and silences the process

@@ -7,15 +7,21 @@ A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mo
 
 ## What it will do
 
-- Mount and unmount rclone mounts from the tray
-- Show your existing remotes, browse their paths, and configure where to mount them
-- **Surface VFS write-back cache state** — which files are still pending upload, how many
-  bytes are outstanding, and per-file progress
+A GUI for rclone mounts, in the spirit of Mountain Duck. rclone already does the hard part —
+mounting remote storage as a local filesystem with on-demand block access and a write-back
+cache, across ~70 backends. This wraps that:
 
-The last one is the gap. rclone's write-back queue is effectively invisible: copy 4 GB into
-a mount, unmount a minute later, and you lose whatever had not uploaded, with nothing to warn
-you. Existing GUIs show `core/stats` job progress, which covers explicit `copy`/`sync` but
-not writes that came in through a mount.
+- **Manage mounts** — create, edit and delete mount configs; mount and unmount them
+- **See their state** — what is up, what is not, and what went wrong
+- **See data moving** — uploads out of the write-back cache and downloads into it, with
+  per-file progress where rclone reports it
+- **Later** — file manager integration to mark files local or cloud-only
+
+The third point is the thinnest-covered today: existing rclone GUIs show `core/stats` job
+progress, which covers explicit `copy`/`sync` but not data that moved through a mount, so
+the write-back queue is effectively invisible. Nothing is *lost* when you unmount with a
+full queue — rclone's cache is on disk and resumes — but you have no way to know whether
+your data has reached the remote, or when it will.
 
 ## How it is put together
 
@@ -86,3 +92,9 @@ That check is the point; a plain parse-and-round-trip would pass either way.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## Trademark
+
+Mountain Duck® is a registered trademark of iterate GmbH. This project is not affiliated
+with, endorsed by, or derived from Mountain Duck; the name is used only to describe the kind
+of tool this is.

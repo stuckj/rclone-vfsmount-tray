@@ -5,19 +5,63 @@ A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mo
 This document records the architecture and, more importantly, the decisions behind it —
 including the ones that look arbitrary until you know what goes wrong otherwise.
 
-## The problem
+## What this is
 
-rclone can mount a remote and cache writes locally, uploading them in the background. That
-background upload queue is effectively invisible. If you copy 4 GB into a mount and unmount
-it a minute later, you lose whatever had not been uploaded, and nothing tells you.
+A GUI for rclone mounts on Linux, in the spirit of Mountain Duck.
 
-Existing GUIs do not fill this in. RcloneTray is Electron and dormant; RClone Manager and
-Rclone UI are Tauri webviews; Rclone Browser is Qt5 and window-first; RcloneDriveManager
-does mount/unmount only. They surface `core/stats` job progress, which covers explicit
-`copy`/`sync` but not writes that entered through a mount. The common workaround is grepping
-rclone's log for `vfs cache: queuing for upload`.
+**rclone already solves the hard part.** Mounting arbitrary remote storage as a local
+filesystem, with block-level on-demand access and a local write-back cache, is genuinely
+difficult, and rclone does it for 70-odd backends. This project does not reimplement any of
+that. It is the layer above: a way to set up mounts, bring them up and down, see them, and
+watch data move — without a terminal.
 
-So: **make the write-back queue visible**, and make mounting and unmounting safe around it.
+Concretely, in rough order of importance:
+
+1. **Manage mounts** — create, edit and delete mount configurations; mount and unmount them.
+2. **See their state** — which are up, which are not, and what is wrong when one fails.
+3. **See data moving** — uploads out of the write-back cache and downloads into it, with
+   per-file progress where rclone reports it.
+4. **Eventually, file manager integration** — mark files as local or cloud-only in the file
+   manager, the way Mountain Duck does in Finder and Explorer. Not yet designed or tracked.
+
+Mountain Duck is the reference for the *feel* — a tray/menu-bar app where connections are
+things you configure and watch, with sync state visible rather than inferred. Not for the
+feature list: this deliberately does not aim at its selective-sync model, its protocol
+implementations, or its bookmark ecosystem.
+
+## Why it does not already exist
+
+Existing rclone GUIs each miss part of it. RcloneTray is Electron and dormant; RClone
+Manager and Rclone UI are Tauri webviews; Rclone Browser is Qt5 and window-first;
+RcloneDriveManager does mount/unmount only.
+
+The thinnest coverage is on point 3. Existing tools surface `core/stats` job progress, which
+covers explicit `copy`/`sync` but not data that moved through a mount, so the write-back
+queue is effectively invisible — the common workaround is grepping rclone's log for
+`vfs cache: queuing for upload`. That is a gap worth closing, but it is one feature of the
+tool, not its purpose.
+
+### What is *not* the problem
+
+Unuploaded data is **not** lost when a mount goes away. rclone's write-back cache is on
+disk: dirty items survive an unmount, an rclone crash and a reboot, and upload resumes when
+the mount comes back. The cache also holds dirty content that exceeds `--vfs-cache-max-size`
+— it will not evict data it has not yet uploaded.
+
+So the cost of an unmount with a full queue is **delay and uncertainty**, not destruction:
+your data has not reached the remote, nothing tells you so, and nothing tells you when it
+does. That is what makes visibility worth building — and it is why the unmount check (#19)
+warns rather than refuses.
+
+> An earlier version of this document claimed data was lost in that situation. It was wrong,
+> and contradicted the T4 row below, which correctly notes that a dead rclone's dirty items
+> are still on disk.
+
+## Trademark
+
+Mountain Duck® is a registered trademark of iterate GmbH. This project is not affiliated
+with, endorsed by, or derived from Mountain Duck; the name is used only to describe the kind
+of tool this is.
 
 ## Process model
 

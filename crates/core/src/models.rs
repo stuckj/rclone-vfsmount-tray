@@ -1,76 +1,32 @@
-//! Typed models for rclone's remote-control (rc) API responses, and for the
-//! on-disk VFS cache metadata.
+//! Typed models for rclone's rc API responses and its on-disk VFS cache metadata.
 //!
-//! Almost every shape here was measured against a live rclone **v1.75.0** during the
-//! investigation in issue #9, not transcribed from documentation. The fixtures in
-//! `testdata/` are the exact bytes that came back, and `tests/fixtures.rs` asserts
-//! these types still parse them.
+//! Shapes were measured against a live rclone v1.75.0 (issue #9); `testdata/` holds the
+//! captured bytes and `tests/fixtures.rs` pins them. `last_error` and `checking` are the
+//! exceptions — modelled from rclone's source, since neither could be captured.
 //!
-//! The two exceptions are [`CoreStats::last_error`] and [`CoreStats::checking`],
-//! which are modelled from rclone's source because neither appeared in any captured
-//! response and neither could be *captured* afterwards. (`checking` is certainly
-//! reachable from a mount — see the field — it simply was not caught in the act.)
-//! Both say so at the field, and both are covered by unit tests rather than fixtures.
-//!
-//! # Tolerance
-//!
-//! Unknown fields are ignored rather than rejected — rclone adds fields between
-//! releases and a strict parser would turn that into a hard failure in the field.
-//! Conversely, several fields that "obviously" always exist are modelled as
-//! [`Option`], because the measurements showed otherwise. Those cases are called
-//! out individually below; each one is a real behaviour that cost time to find.
+//! Unknown fields are ignored, since rclone adds them between releases.
 
 use serde::{Deserialize, Serialize};
 
-/// rclone's **default** accounting group — everything not running under an explicit
-/// rc job.
+/// rclone's default accounting group — anything not run under an rc job (`job/<n>`).
 ///
-/// Transfers started by an rc job (`operations/copyfile`, `sync/copy`, …) are grouped
-/// as `job/<n>` instead, so this does separate VFS activity from rc jobs.
-///
-/// **It does not indicate direction.** VFS cache *downloads* — reading a file through
-/// a `--vfs-cache-mode full` mount — are also ungrouped and also appear in
-/// `core/stats` `transferring[]` with this group. Measured, not assumed: see
-/// `testdata/core-stats-vfs-download-midflight.json`, captured while pulling a file
-/// down with an empty upload queue.
-///
-/// Treating this group as "uploads" therefore reports a download as a pending upload,
-/// which is wrong in the direction that matters — it inflates the outstanding-bytes
-/// figure that decides whether unmounting is safe. Use
-/// [`Transfer::is_writeback_upload`], which additionally requires the source to be the
-/// VFS cache.
-///
-/// Note that `core/group-list` does **not** enumerate this group (it lists only
-/// `job/*`), so it cannot be discovered at runtime. It is a constant.
+/// Does **not** indicate direction: VFS cache downloads are ungrouped too. Use
+/// [`Transfer::is_writeback_upload`]. See DESIGN.md, "capability ladder".
 pub const GLOBAL_STATS_GROUP: &str = "global_stats";
 
 // ---------------------------------------------------------------------------
 // core/stats
 // ---------------------------------------------------------------------------
 
-/// Response from `core/stats`.
-///
-/// These figures are **process-global**: one rclone process serving several VFSes
-/// reports all of their transfers here together, in both directions. Use
-/// [`CoreStats::writeback_uploads`] to narrow to one mount's pending uploads — a
-/// group filter alone is not enough, because VFS downloads share the group.
-///
-/// `core/stats` also accepts a `group` parameter, which filters server-side and is
-/// cheaper than filtering here; and `short: true`, which omits `transferring`
-/// entirely when only the totals are wanted.
+/// Response from `core/stats`. Process-global: one rclone serving several VFSes reports
+/// them all here, in both directions. Narrow with [`CoreStats::writeback_uploads`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoreStats {
     /// Bytes transferred so far across all active transfers.
     #[serde(default)]
     pub bytes: i64,
-    /// Total bytes expected across all active transfers.
-    ///
-    /// Signed because rclone's field is a Go `int64` and is computed by subtraction
-    /// (`stats.go`), so a transient negative is representable. Note it does *not*
-    /// propagate the `-1` unknown-size sentinel — `transfermap.go` filters those out
-    /// before summing — so this is signed for range safety, not because `-1` is
-    /// expected here. See [`Transfer::size`], where `-1` genuinely does appear.
+    /// Total bytes expected. Signed: rclone's field is int64 and computed by subtraction.
     #[serde(default)]
     pub total_bytes: i64,
     /// Aggregate throughput in bytes per second.
@@ -103,39 +59,20 @@ pub struct CoreStats {
     #[serde(default)]
     pub transfer_time: f64,
 
-    /// Text of the most recent error, present only when `errors > 0`.
+    /// Most recent error text; present only when `errors > 0`.
     ///
-    /// Without this, [`Self::errors`] can say *3* and never say why.
-    ///
-    /// **Provenance differs from the rest of this file.** Unlike every other field
-    /// here, this and [`Self::checking`] are modelled from rclone's source
-    /// (`fs/accounting/stats.go`) rather than from a capture: neither appeared in any
-    /// response the investigation in #9 collected, and neither could be provoked
-    /// afterwards — rc job errors are accounted to `job/<n>`, not to the global
-    /// group. The shapes are asserted by unit tests rather than by a fixture.
-    ///
-    /// (`checking` is reachable from a mount — see it — but was not caught in a
-    /// capture either.)
+    /// This and [`Self::checking`] are modelled from rclone's source rather than captured —
+    /// see the module docs. Covered by unit tests, not fixtures.
     #[serde(default)]
     pub last_error: Option<String>,
 
-    /// Files currently being checked, emitted only while a check is in progress.
-    ///
-    /// This *is* reachable from a mount: rclone accounts a rename as a "moving"
-    /// check (`operations.Move` → `NewCheckingTransfer`), so renaming a file inside a
-    /// watched mount emits it. Checks never appear in [`Self::transferring`] — the
-    /// two collections are separate — so this cannot pollute upload accounting.
-    ///
-    /// See [`Self::last_error`] for provenance.
+    /// Files being checked. Reachable from a mount: rclone accounts a rename as a "moving"
+    /// check. Checks never appear in [`Self::transferring`], so they cannot skew uploads.
     #[serde(default)]
     pub checking: Option<Vec<String>>,
 
-    /// Currently active transfers.
-    ///
-    /// **This key is absent — not an empty array — when nothing is transferring.**
-    /// Modelling it as a plain `Vec` with a default would erase the difference
-    /// between "rclone told us there is nothing in flight" and "rclone did not tell
-    /// us anything", which matters when deciding whether to trust a zero.
+    /// Active transfers. **Absent, not `[]`, when nothing is in flight** — the
+    /// distinction matters when deciding whether to trust a zero.
     #[serde(default)]
     pub transferring: Option<Vec<Transfer>>,
 }
@@ -153,15 +90,8 @@ impl CoreStats {
         self.transferring.is_some()
     }
 
-    /// Active write-back **uploads** out of the given VFS cache.
-    ///
-    /// `cache_path` is that mount's [`DiskCache::path`]. Both conditions are needed:
-    /// the group excludes rc jobs, and the cache-path match excludes VFS *downloads*,
-    /// which share the group. See [`GLOBAL_STATS_GROUP`].
-    ///
-    /// Narrowing by `group` can also be pushed to rclone by passing
-    /// `group: "global_stats"` to `core/stats`; the direction check cannot, and must
-    /// happen here.
+    /// Write-back uploads out of the given VFS cache (`cache_path` = that mount's
+    /// [`DiskCache::path`]). Needs both conditions — the group alone admits downloads.
     pub fn writeback_uploads<'a>(
         &'a self,
         cache_path: &'a str,
@@ -171,11 +101,8 @@ impl CoreStats {
             .filter(move |t| t.is_writeback_upload(cache_path))
     }
 
-    /// Active transfers not started by an rc job.
-    ///
-    /// This is a *group* filter only, so it includes VFS downloads as well as
-    /// write-back uploads. Prefer [`Self::writeback_uploads`] unless you genuinely
-    /// want both directions.
+    /// Transfers not started by an rc job. Includes downloads; prefer
+    /// [`Self::writeback_uploads`] unless you want both directions.
     pub fn ungrouped_transfers(&self) -> impl Iterator<Item = &Transfer> {
         self.transfers_slice().iter().filter(|t| t.is_ungrouped())
     }
@@ -185,39 +112,20 @@ impl CoreStats {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Transfer {
-    /// Path of the file within the VFS — e.g. `photos/img.raw`.
-    ///
-    /// This is the **join key** to [`QueueItem::name`]: for VFS write-back uploads
-    /// the two strings are identical, with no remote or cache-path prefix.
+    /// Path within the VFS. The join key to [`QueueItem::name`] — identical strings.
     pub name: String,
-    /// Total size of the file in bytes, or `-1` when the size is not known.
-    ///
-    /// **Signed deliberately.** rclone carries this as a Go `int64` and uses `-1`
-    /// for objects of unknown size. A `u64` here does not merely lose that value —
-    /// `serde_json` aborts the *entire* response, so one unusual transfer would
-    /// blank every mount's state rather than degrading a single number. Use
-    /// [`Self::known_size`] to get it as an option.
+    /// Size in bytes, or `-1` when unknown. Signed: a `u64` would abort the whole
+    /// response, not just this field. See [`Self::known_size`].
     #[serde(default)]
     pub size: i64,
-    /// Bytes uploaded so far.
-    ///
-    /// Signed for the same range-safety reason as [`Self::size`]: rclone's field is
-    /// a Go `int64`, and a `u64` would abort the whole response rather than one
-    /// field if it ever went negative.
+    /// Bytes uploaded so far. Signed for the same reason as [`Self::size`].
     #[serde(default)]
     pub bytes: i64,
-    /// Completion percentage.
-    ///
-    /// Observed to top out at 98 — a transfer's entry disappears from
-    /// `transferring[]` on completion rather than reaching 100, so do not wait for
-    /// this to hit 100 to consider an upload finished.
+    /// Completion percentage. Tops out at 98 — completion is the entry disappearing.
     #[serde(default)]
     pub percentage: Option<u32>,
-    /// Instantaneous throughput in bytes per second.
-    ///
-    /// The **first** reading after a transfer starts is unreliable — it averages
-    /// over a very short window and can be several times the true rate. Discard or
-    /// suppress it rather than showing it.
+    /// Instantaneous throughput. The **first reading after a transfer starts is
+    /// unreliable** — suppress it.
     #[serde(default)]
     pub speed: f64,
     /// Smoothed average throughput in bytes per second.
@@ -226,19 +134,11 @@ pub struct Transfer {
     /// Estimated seconds remaining; `null` until rclone can estimate.
     #[serde(default)]
     pub eta: Option<f64>,
-    /// Accounting group: [`GLOBAL_STATS_GROUP`] for anything not started by an rc job
-    /// — write-back uploads **and** cache downloads alike — or `job/<n>` for an
-    /// explicit rc job. It does not indicate direction; see [`GLOBAL_STATS_GROUP`].
-    ///
-    /// Absent until rclone attaches accounting to the transfer: this field, along with
-    /// `bytes`, `percentage`, `speed`, `speedAvg` and `eta`, comes from the `Account`,
-    /// not from the transfer itself.
+    /// Accounting group. Absent until rclone attaches accounting; see
+    /// [`Self::has_accounting`] and [`GLOBAL_STATS_GROUP`].
     #[serde(default)]
     pub group: Option<String>,
-    /// Source filesystem. For a VFS write-back upload this is the VFS **cache**
-    /// directory (behind a backend tag), equal to [`DiskCache::path`] for the owning
-    /// VFS — that is how a transfer is attributed to a mount, and how its direction is
-    /// established. For a cache *download* it is the remote instead.
+    /// Source filesystem: the VFS cache for an upload, the remote for a download.
     #[serde(default)]
     pub src_fs: Option<String>,
     /// Destination filesystem — the remote being uploaded to.
@@ -247,42 +147,21 @@ pub struct Transfer {
 }
 
 impl Transfer {
-    /// Whether rclone has attached accounting to this transfer yet.
-    ///
-    /// Until it has, the wire carries only `name`, `size` and possibly `srcFs`/`dstFs`
-    /// — [`Self::bytes`], [`Self::percentage`], [`Self::speed`], [`Self::speed_avg`],
-    /// [`Self::eta`] and [`Self::group`] are all absent, and the numeric ones default
-    /// to zero rather than to "unknown". Both [`CoreStats::writeback_uploads`] and
-    /// [`CoreStats::ungrouped_transfers`] already exclude such transfers, because
-    /// both require a group; this is for code iterating
-    /// [`CoreStats::transfers_slice`] directly, where those zeros are reachable.
+    /// Whether rclone has attached accounting yet. Until it has, `bytes`, `percentage`,
+    /// `speed`, `speed_avg`, `eta` and `group` are absent and the numeric ones read as 0.
+    /// Both accessors above already exclude such transfers; this is for raw iteration.
     pub fn has_accounting(&self) -> bool {
         self.group.is_some()
     }
 
-    /// Whether this transfer was **not** started by an explicit rc job.
-    ///
-    /// This says nothing about direction — VFS downloads are ungrouped too. It is a
-    /// building block for [`Self::is_writeback_upload`], not a filter to use alone.
-    ///
-    /// A transfer with no `group` at all counts as *not* ungrouped: showing an
-    /// unrelated `rclone copy` as a mount's pending upload is worse than briefly
-    /// omitting a real one.
+    /// Not started by an rc job. Says nothing about direction — see
+    /// [`GLOBAL_STATS_GROUP`]. A transfer with no group counts as `false`.
     pub fn is_ungrouped(&self) -> bool {
         self.group.as_deref() == Some(GLOBAL_STATS_GROUP)
     }
 
-    /// Whether this is a write-back **upload** out of the given VFS cache.
-    ///
-    /// Requires both that the transfer is ungrouped (not an rc job) and that its
-    /// source is that mount's cache directory. The second condition is what
-    /// establishes *direction*: for an upload rclone reports `srcFs` as the cache and
-    /// `dstFs` as the remote, whereas for a cache download `srcFs` is the remote and
-    /// `dstFs` is absent entirely.
-    ///
-    /// Without it, reading a large file through a `--vfs-cache-mode full` mount would
-    /// be reported as a pending upload — inflating the outstanding-bytes figure that
-    /// gates the unmount safety check, in the unsafe direction.
+    /// A write-back upload out of `cache_path`: ungrouped **and** sourced from that cache.
+    /// The cache check is what establishes direction — a download's `srcFs` is the remote.
     pub fn is_writeback_upload(&self, cache_path: &str) -> bool {
         self.is_ungrouped() && self.belongs_to_cache(cache_path)
     }
@@ -292,21 +171,10 @@ impl Transfer {
         u64::try_from(self.size).ok()
     }
 
-    /// Whether this transfer originates from the given VFS cache directory.
+    /// Whether this transfer came out of `cache_path` (a mount's [`DiskCache::path`]).
     ///
-    /// Pass [`DiskCache::path`] for the mount in question.
-    ///
-    /// For a VFS write-back upload, `src_fs` is that VFS's cache root with a backend
-    /// tag prepended (`:local{8un-i}:`). Once the tag is stripped the two strings are
-    /// **equal**, so this compares for equality rather than treating one as a prefix
-    /// of the other.
-    ///
-    /// Equality is deliberate. Prefix matching is looser than the data requires and
-    /// misattributes in two directions: siblings (`…/srv/photos` claiming
-    /// `…/srv/photos-backup`) and nesting — mounting both `remote:/srv` and
-    /// `remote:/srv/photos` from one rclone process gives cache paths where one is a
-    /// genuine prefix of the other, so the parent would absorb the child's transfers
-    /// and report a byte total that is silently too large.
+    /// Compares for equality after stripping rclone's `:backend{hash}:` tag. Looser matching
+    /// misattributes between sibling and nested mounts — see DESIGN.md.
     pub fn belongs_to_cache(&self, cache_path: &str) -> bool {
         if cache_path.is_empty() {
             return false;
@@ -318,20 +186,9 @@ impl Transfer {
     }
 }
 
-/// Strip rclone's `:backend{hash}:` prefix from a filesystem string, if present.
+/// Strip rclone's `:backend{hash}:` prefix, if present.
 ///
-/// `":local{8un-i}:/var/cache/x"` becomes `"/var/cache/x"`. Anything not matching
-/// that shape is returned untouched, so a plain path passes through unchanged.
-///
-/// Splits on the closing `}:`, not the first `:`. The tag rclone emits is
-/// `:<backend>{<hash>}:`, where the hash is `base64.RawURLEncoding` — an alphabet of
-/// `[A-Za-z0-9_-]` that cannot contain `}` or `:` — so the closing `}:` is
-/// unambiguous, and anchoring on it is robust to whatever appears in the backend
-/// name.
-///
-/// (An earlier version of this comment claimed connection-string options with
-/// embedded colons could appear inside the braces. They cannot: `fs.ConfigString`
-/// emits the brace form and `ConfigStringFull` the comma form, never both.)
+/// Splits on the closing `}:`; the hash is base64url, so it cannot contain `}` or `:`.
 fn strip_backend_tag(fs: &str) -> &str {
     fs.strip_prefix(':')
         .and_then(|rest| rest.find("}:").map(|i| &rest[i + 2..]))
@@ -342,11 +199,8 @@ fn strip_backend_tag(fs: &str) -> &str {
 // vfs/queue
 // ---------------------------------------------------------------------------
 
-/// Response from `vfs/queue` for one VFS (selected with the `fs` parameter).
-///
-/// This is the minimum viable source of "how much is left to send": summing
-/// [`QueueItem::size`] gives the outstanding bytes even when no per-file progress
-/// is available.
+/// Response from `vfs/queue` for one VFS. Summing sizes answers "how much is left"
+/// even with no per-file progress.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VfsQueue {
     #[serde(default)]
@@ -367,13 +221,8 @@ impl VfsQueue {
         p
     }
 
-    /// Bytes still to upload, counting only files whose size rclone reported.
-    ///
-    /// **This is a lower bound, not a total.** Files of unknown size (`-1`)
-    /// contribute nothing. Prefer [`Self::pending`] anywhere the number is shown to
-    /// a user or used to decide whether unmounting is safe — presenting an
-    /// understated figure as a total is precisely the faked precision the design
-    /// forbids.
+    /// Bytes still to upload, **counting only files whose size is known** — a lower
+    /// bound. Prefer [`Self::pending`] anywhere a user sees the number.
     pub fn pending_bytes(&self) -> u64 {
         self.pending().known_bytes
     }
@@ -384,11 +233,8 @@ impl VfsQueue {
     }
 }
 
-/// A summary of outstanding write-back uploads.
-///
-/// Carries the unmeasurable remainder explicitly so callers cannot mistake a lower
-/// bound for a total. "3 files, 0 bytes" reads as harmless; "3 files, ≥ 0 bytes,
-/// 3 of unknown size" does not.
+/// Outstanding uploads, carrying the unmeasurable remainder so a floor cannot be
+/// mistaken for a total.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Pending {
@@ -402,11 +248,7 @@ pub struct Pending {
 }
 
 impl Pending {
-    /// Construct a summary.
-    ///
-    /// Required because this type is `#[non_exhaustive]`: a struct literal is
-    /// rejected outside this crate, and [`crate::SupervisorError::PendingUploads`]
-    /// carries it, so every out-of-crate `unmount` implementation needs to build one.
+    /// Construct a summary. Needed because this type is `#[non_exhaustive]`.
     pub fn new(files: u64, known_bytes: u64, unknown_size_files: u64) -> Self {
         Self {
             files,
@@ -429,11 +271,7 @@ impl Pending {
 /// One queued write-back upload.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QueueItem {
-    /// Path within the VFS. The join key to [`Transfer::name`].
-    ///
-    /// Required, like [`Transfer::name`] and [`RcCommand::path`]: it is the item's
-    /// identity, and a queue entry that cannot be named cannot be displayed, joined
-    /// or acted on. Every other field is defaulted.
+    /// Path within the VFS. The join key to [`Transfer::name`]; required, unlike the rest.
     pub name: String,
     /// Opaque id, required by `vfs/queue-set-expiry` to force an upload.
     #[serde(default)]
@@ -442,10 +280,7 @@ pub struct QueueItem {
     /// [`Transfer::size`].
     #[serde(default)]
     pub size: i64,
-    /// Seconds until rclone will start the upload.
-    ///
-    /// **Signed** — it goes negative once the item is due, and was observed at
-    /// `-0.32` while uploading. An unsigned type here would fail to parse.
+    /// Seconds until upload starts. **Signed** — goes negative once due.
     #[serde(default)]
     pub expiry: f64,
     /// The configured `--vfs-write-back` delay, in seconds.
@@ -488,15 +323,8 @@ pub struct VfsStats {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskCache {
-    /// **Not** the number of bytes pending upload, and not reliably the cache size
-    /// either — it was measured as `0` throughout a 128 MiB upload with the data
-    /// sitting in the cache. Do not put this in front of a user. Use
-    /// [`VfsQueue::pending_bytes`] for outstanding bytes.
-    ///
-    /// Defaulted like every sibling: without this, rclone dropping or renaming the
-    /// field would fail the whole `vfs/stats` parse and take [`Self::path`] and
-    /// [`Self::path_meta`] with it — the two values the on-disk scanning tier needs
-    /// precisely when the rc API cannot be trusted.
+    /// **Not pending bytes, and not reliably cache size** — measured as 0 throughout a
+    /// 128 MiB upload. Do not surface it. Use [`VfsQueue::pending`].
     #[serde(default)]
     pub bytes_used: i64,
     /// Files whose upload has failed. Needs surfacing — it is actionable.
@@ -537,12 +365,8 @@ pub struct MetadataCache {
 // vfs/list, core/version, rc/list
 // ---------------------------------------------------------------------------
 
-/// Response from `vfs/list` — the VFSes this rclone process is serving.
-///
-/// The names returned are rclone's canonical form, which is **not** necessarily the
-/// remote name that was configured: an `alias` remote reports the resolved target
-/// path. Both forms are accepted as the `fs` parameter elsewhere, but do not assume
-/// the string here round-trips to what the user typed.
+/// Response from `vfs/list`. Names are rclone's canonical form, which is not
+/// necessarily the configured remote name — an alias reports its resolved target.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VfsList {
     #[serde(default)]
@@ -571,10 +395,8 @@ pub struct CoreVersion {
     pub go_version: String,
 }
 
-/// Response from `rc/list` — every rc command this rclone build registers.
-///
-/// This is the right primitive for feature detection: it reflects how rclone was
-/// actually built and flagged, where a version comparison only guesses.
+/// Response from `rc/list`. The right primitive for feature detection: it reflects
+/// how rclone was built, where a version comparison only guesses.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RcList {
     #[serde(default)]
@@ -597,13 +419,8 @@ pub struct RcCommand {
     pub path: String,
     #[serde(rename = "Title", default)]
     pub title: String,
-    /// **Mind the polarity.** rclone's wire field is `NoAuth`, so `true` means the
-    /// command is callable *without* authentication. Prefer [`Self::auth_required`]
-    /// over reading this directly — inverted booleans get misread.
-    ///
-    /// There is no `AuthRequired` field in rclone. Modelling one gives a value that
-    /// is always `false`, i.e. "no authentication needed" for `config/dump` and
-    /// `core/command`, which is the wrong way for a fail-open default to fail.
+    /// **Polarity:** rclone's field is `NoAuth`, so `true` means auth is *not* required.
+    /// Prefer [`Self::auth_required`]. There is no `AuthRequired` field.
     #[serde(rename = "NoAuth", default)]
     pub no_auth: bool,
 }
@@ -619,21 +436,12 @@ impl RcCommand {
 // On-disk VFS cache metadata
 // ---------------------------------------------------------------------------
 
-/// One item of rclone's on-disk VFS cache metadata.
-///
-/// These live under `<cache>/vfsMeta/<backend>/<path>`, mirroring the data tree at
-/// `<cache>/vfs/<backend>/<path>`. Reading them is what allows pending-upload state
-/// to be reported when the rc API is unreachable — and, unlike the rc endpoints,
-/// they survive an rclone crash, because a dead process's dirty items are still on
-/// disk.
-///
-/// Note the PascalCase wire format, unlike every rc response above.
+/// One item of rclone's on-disk VFS cache metadata, at
+/// `<cache>/vfsMeta/<backend>/<path>`. Readable when the rc API is not, and it survives
+/// an rclone crash. Note the PascalCase wire format.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VfsMetaItem {
-    /// Last modification time, RFC 3339.
-    ///
-    /// Left as a string deliberately: parsing it would pull a date/time crate into
-    /// this dependency-minimal crate, and nothing needs it typed yet.
+    /// Last modification time, RFC 3339. Left as a string; nothing needs it typed yet.
     #[serde(rename = "ModTime", default)]
     pub mod_time: String,
     /// Last access time, RFC 3339.
@@ -648,12 +456,9 @@ pub struct VfsMetaItem {
     /// Fingerprint of the remote object. Observed empty on the local backend.
     #[serde(rename = "Fingerprint", default)]
     pub fingerprint: String,
-    /// **The field that matters**: the item has been modified locally and not yet
-    /// uploaded. Summing [`Self::size`] over dirty items gives the bytes still to
-    /// send.
-    ///
-    /// It stays `true` until the upload completes, so it cannot distinguish
-    /// "queued" from "uploading" — that distinction needs [`QueueItem::uploading`].
+    /// Modified locally and not yet uploaded. Summing sizes over dirty items gives bytes
+    /// still to send. Stays true until upload completes, so it cannot distinguish
+    /// "queued" from "uploading".
     #[serde(rename = "Dirty", default)]
     pub dirty: bool,
 }

@@ -1,24 +1,9 @@
-//! The abstraction over "how does an rclone mount get started and stopped".
+//! Starting and stopping rclone mounts.
 //!
-//! The concrete implementation is decided in `DESIGN.md` — one rclone process per
-//! mount, each run as a **transient systemd user unit** that the service starts over
-//! systemd's D-Bus API. The trait exists so that decision stays reversible, and so
-//! that the rest of the service is written against an interface rather than against
-//! `systemd-run`.
-//!
-//! # The invariant every implementation must uphold
-//!
-//! **A mount's lifetime is not tied to the lifetime of the process that started it.**
-//!
-//! Stopping, restarting or killing the service must leave mounts exactly as they
-//! were, because a package upgrade restarts the service and nobody expects
-//! `apt upgrade` to unmount their filesystems. Clients (the tray, the GTK windows)
-//! are further removed still: nothing they do, including exiting, may unmount
-//! anything.
-//!
-//! Concretely, an implementation must not unmount from a `Drop` impl, must not put
-//! rclone in the service's own process group or cgroup, and must treat
-//! [`MountSupervisor::unmount`] as the *only* path to an unmount.
+//! **A mount's lifetime is not tied to the process that started it.** Restarting or
+//! killing the service must leave mounts up; nothing a client does may unmount anything.
+//! So: no unmounting from `Drop`, no putting rclone in the service's own cgroup, and
+//! [`MountSupervisor::unmount`] is the only path to an unmount. See DESIGN.md.
 
 use crate::models::Pending;
 use std::future::Future;
@@ -67,9 +52,7 @@ pub enum MountState {
 impl MountState {
     /// Whether the mount point is currently serving, however it got there.
     ///
-    /// Matched exhaustively for the same reason as [`Self::is_managed`]: a future
-    /// variant defaulting to "not live" would hide a real mount from the
-    /// pending-uploads check.
+    /// Matched exhaustively so a future variant cannot silently default to "not live".
     pub fn is_live(&self) -> bool {
         match self {
             MountState::Mounted | MountState::Foreign => true,
@@ -82,10 +65,7 @@ impl MountState {
 
     /// Whether this supervisor owns the mount and may act on it.
     ///
-    /// Matched exhaustively on purpose: a `!matches!(self, Foreign)` shorthand would
-    /// silently report any future not-managed variant as managed, which is the
-    /// direction that gets someone's filesystem unmounted by a tool that never owned
-    /// it.
+    /// Matched exhaustively so a future not-managed variant cannot default to managed.
     pub fn is_managed(&self) -> bool {
         match self {
             MountState::Unmounted
@@ -133,11 +113,8 @@ pub enum SupervisorError {
     /// The unmount was refused because the write-back cache still holds unuploaded
     /// data. Callers may retry with force, having told the user what that costs.
     ///
-    /// Carries the whole [`Pending`] summary rather than a bare byte count. Files of
-    /// unknown size contribute nothing to the total, so flattening this to one number
-    /// would render three unsized files as *"3 files totalling 0 bytes"* — which
-    /// reads as "nothing to lose" at the exact moment the user decides whether to
-    /// force an unmount.
+    /// Carries [`Pending`] rather than a byte count: unsized files contribute nothing, so
+    /// one number would render three of them as "totalling 0 bytes".
     #[error("{}", pending_summary(.0))]
     PendingUploads(Pending),
 
@@ -160,11 +137,8 @@ pub enum SupervisorError {
 
 /// One mount as found by [`MountSupervisor::reconcile`].
 ///
-/// `#[non_exhaustive]` so fields can be added later without a breaking change —
-/// which means it must be built through [`DiscoveredMount::new`], since a struct
-/// literal is rejected outside this crate. That matters: the whole point of
-/// [`MountSupervisor`] is to be implemented by another crate, and without a
-/// constructor it could not be.
+/// Built via [`DiscoveredMount::new`] — `#[non_exhaustive]` rejects struct literals
+/// outside this crate, and this trait exists to be implemented outside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DiscoveredMount {
@@ -184,28 +158,11 @@ impl DiscoveredMount {
 
 /// Starts and stops rclone mounts.
 ///
-/// # Why the futures are boxed
+/// Futures are boxed so the trait stays dyn-compatible: the implementation is chosen at
+/// runtime and tests substitute a double. These operations fire at human frequency, so
+/// the allocation is irrelevant.
 ///
-/// The methods return [`BoxFuture`] rather than `impl Future`. Returning
-/// `impl Future` would make this trait dyn-incompatible, and that costs more than
-/// the allocation saves:
-///
-/// - The implementation is chosen at *runtime* — systemd where it is available,
-///   something else where it is not. That needs `Box<dyn MountSupervisor>`.
-/// - Without type erasure, every consumer becomes generic over `S: MountSupervisor`,
-///   including the zbus interface objects registered on the object server, with no
-///   escape hatch when that gets unwieldy.
-/// - Test doubles and the lifetime tests want erasure too.
-///
-/// These operations mount filesystems and fire at human frequency. One boxed future
-/// per call is not a cost worth optimising, and RPITIT would be optimising the one
-/// axis that does not matter here.
-///
-/// # The invariant
-///
-/// Implementations must uphold the lifetime rule in the module documentation: a
-/// mount's lifetime is not tied to the process that started it, and nothing a client
-/// does may unmount anything.
+/// Implementations must uphold the lifetime rule in the module docs.
 pub trait MountSupervisor: Send + Sync {
     /// Bring up a mount. Resolves once the mount point is actually serving, not once
     /// rclone has been spawned — the two are several seconds apart and the
@@ -226,17 +183,11 @@ pub trait MountSupervisor: Send + Sync {
     /// Current state of one mount.
     fn state<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<MountState, SupervisorError>>;
 
-    /// Reconcile against reality on startup.
+    /// Reconcile against reality on startup — the service may have restarted while mounts
+    /// stayed up.
     ///
-    /// The service may have been restarted while mounts stayed up, so it must
-    /// discover and adopt what is already mounted rather than assuming a blank
-    /// slate.
-    ///
-    /// Returns **every configured mount plus every live unmanaged one** — not only
-    /// the live ones. A configured mount that is down is reported as
-    /// [`MountState::Unmounted`] rather than omitted, so a caller can tell "not
-    /// mounted" from "not configured" without a second lookup. Mounts we did not
-    /// start appear as [`MountState::Foreign`].
+    /// Returns every configured mount **plus** every live unmanaged one. A configured mount
+    /// that is down is reported [`MountState::Unmounted`], not omitted.
     fn reconcile(&self) -> BoxFuture<'_, Result<Vec<DiscoveredMount>, SupervisorError>>;
 }
 

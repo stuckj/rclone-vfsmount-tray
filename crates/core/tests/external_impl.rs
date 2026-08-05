@@ -1,20 +1,10 @@
-//! Prove that `MountSupervisor` can actually be implemented from another crate.
+//! Prove [`MountSupervisor`] is implementable from another crate.
 //!
-//! This file exists because it once could not be. `DiscoveredMount` and `Pending`
-//! are `#[non_exhaustive]`, which forbids struct literals outside the defining
-//! crate — so `reconcile` returned a type the implementer had no way to construct,
-//! and `unmount` could not build the error it is required to return. The trait whose
-//! entire purpose is to be implemented by `crates/service` was unimplementable, and
-//! every unit test passed, because unit tests live *inside* `rvt-core` and are exempt
-//! from that rule.
-//!
-//! Integration tests are compiled as a separate crate, so this file is subject to the
-//! same rules as a real consumer. It is a compile-time assertion first and a
-//! behavioural test second: if `rvt-core` ever again exposes a type that an
-//! implementer cannot build, this stops compiling.
-//!
-//! Keep it written the way `crates/service` will write it — constructors, not
-//! literals, and no `pub(crate)` shortcuts.
+//! It once was not: `DiscoveredMount` and `Pending` are `#[non_exhaustive]`, so an
+//! implementer could not construct what `reconcile` and `unmount` must return — and
+//! every unit test passed, because unit tests are inside the crate and exempt.
+//! Integration tests compile separately, so this file is bound by the same rules as a
+//! real consumer. Write it the way `crates/service` will.
 
 use rvt_core::models::Pending;
 use rvt_core::{BoxFuture, DiscoveredMount, MountState, MountSupervisor, SupervisorError};
@@ -148,15 +138,9 @@ fn an_implementer_can_build_every_type_it_must_return() {
     );
 }
 
-/// Every `MountState` and `SupervisorError` an implementer must be able to *return*,
-/// constructed from outside the crate.
-///
-/// This is the compile-time half of this file's job, and it is enumerated one variant
-/// at a time on purpose. The first version of this file covered two of seven error
-/// variants and three of six states — marking `SupervisorError::Supervision`
-/// `#[non_exhaustive]` (exactly the change that broke `DiscoveredMount` and `Pending`,
-/// and exactly what a future reviewer will suggest) left every test passing. A guard
-/// that covers a third of its surface is the failure this file exists to prevent.
+/// Every state and error an implementer must be able to construct, named one by one:
+/// the first version of this file covered two of seven error variants and passed with
+/// `SupervisorError::Supervision` made `#[non_exhaustive]`.
 #[test]
 fn an_implementer_can_construct_every_state_and_error() {
     let states = [

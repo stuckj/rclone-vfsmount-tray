@@ -1,13 +1,8 @@
-//! `rclone-vfsmount-tray-gtk` — the windows.
+//! The windows: a GTK4 client of the service, like the tray. Opening or closing it has
+//! no effect on mounts.
 //!
-//! A GTK4 client, and like the tray a pure consumer of the service over D-Bus.
-//! Opening and closing it has no effect on what is mounted.
-//!
-//! This crate is excluded from the workspace's `default-members` because it is the
-//! only one that links system C libraries; see the root `Cargo.toml`.
-//!
-//! Scaffolding only — the `gtk4` dependency and the actual windows land with #41,
-//! #42, #43 and #44.
+//! Excluded from the workspace `default-members` — it is the only crate that will link
+//! a system C library. Scaffolding only; see #41 to #44.
 
 use clap::Parser;
 

@@ -1,16 +1,9 @@
-//! `rclone-vfsmount-tray` — the tray icon.
+//! The tray icon: a StatusNotifierItem client that renders what the service publishes
+//! and sends commands back. It holds no mounts — quitting it closes an icon, nothing
+//! more. Native SNI is the only thing that works on KDE Plasma 6 under Wayland.
 //!
-//! A StatusNotifierItem client. It renders the state the service publishes and
-//! sends commands back over D-Bus. It holds no mounts and owns no rclone processes:
-//! quitting it closes an icon, nothing more.
-//!
-//! Native SNI (via `ksni`) is the only thing that works on KDE Plasma 6 under
-//! Wayland — legacy XEmbed is not an option there.
-//!
-//! The subcommands below are also how the integration tests drive the system, so
-//! they must work with no tray host present at all.
-//!
-//! Scaffolding only — the tray itself lands with #25, #26 and #52.
+//! The subcommands are also how integration tests drive the system, so they must work
+//! with no tray host present. Scaffolding only; see #25, #26, #37, #52.
 
 use clap::{Parser, Subcommand};
 

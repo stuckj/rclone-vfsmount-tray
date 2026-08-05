@@ -1,15 +1,9 @@
-//! `rclone-vfsmount-trayd` — the service that owns the mounts.
+//! The service that owns the mounts. A headless systemd **user** service: starts and
+//! stops rclone mounts, polls VFS state, serves D-Bus to the tray and GTK clients.
 //!
-//! Runs as a systemd **user** service, headless. It starts and stops rclone mounts,
-//! polls their VFS write-back state, and serves both over D-Bus to the tray and GTK
-//! clients.
+//! Mounts outlive it — restarting the service leaves them up. See DESIGN.md.
 //!
-//! Mounts belong to this service, and their lifetime is deliberately decoupled even
-//! from it: restarting the service (a package upgrade, say) leaves mounts up. See
-//! `DESIGN.md`.
-//!
-//! Scaffolding only — the real implementation lands with the supervisor (#17),
-//! the rc client (#12) and the D-Bus interface (#40).
+//! Scaffolding only; see #12, #17, #40.
 
 use clap::Parser;
 

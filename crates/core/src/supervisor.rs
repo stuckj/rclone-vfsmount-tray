@@ -159,12 +159,27 @@ pub enum SupervisorError {
 }
 
 /// One mount as found by [`MountSupervisor::reconcile`].
+///
+/// `#[non_exhaustive]` so fields can be added later without a breaking change —
+/// which means it must be built through [`DiscoveredMount::new`], since a struct
+/// literal is rejected outside this crate. That matters: the whole point of
+/// [`MountSupervisor`] is to be implemented by another crate, and without a
+/// constructor it could not be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DiscoveredMount {
     /// Configured name, or a derived one for mounts we did not start.
     pub name: String,
     pub state: MountState,
+}
+
+impl DiscoveredMount {
+    pub fn new(name: impl Into<String>, state: MountState) -> Self {
+        Self {
+            name: name.into(),
+            state,
+        }
+    }
 }
 
 /// Starts and stops rclone mounts.
@@ -215,8 +230,13 @@ pub trait MountSupervisor: Send + Sync {
     ///
     /// The service may have been restarted while mounts stayed up, so it must
     /// discover and adopt what is already mounted rather than assuming a blank
-    /// slate. Returns every mount found live, including [`MountState::Foreign`] ones
-    /// that we did not start.
+    /// slate.
+    ///
+    /// Returns **every configured mount plus every live unmanaged one** — not only
+    /// the live ones. A configured mount that is down is reported as
+    /// [`MountState::Unmounted`] rather than omitted, so a caller can tell "not
+    /// mounted" from "not configured" without a second lookup. Mounts we did not
+    /// start appear as [`MountState::Foreign`].
     fn reconcile(&self) -> BoxFuture<'_, Result<Vec<DiscoveredMount>, SupervisorError>>;
 }
 

@@ -1,8 +1,12 @@
 //! Core logic for `rclone-vfsmount-tray`.
 //!
-//! This crate holds everything that is neither a tray icon nor a window: the typed
-//! models for rclone's remote-control (rc) API, the VFS cache scanner, and the
-//! configuration model.
+//! This crate holds everything that is neither a tray icon nor a window. Today that
+//! is [`models`] — the typed models for rclone's remote-control (rc) API and its
+//! on-disk cache metadata — [`supervisor`], the abstraction over starting and
+//! stopping mounts, and [`resolve_log_filter`].
+//!
+//! The VFS cache scanner (#22) and the configuration model (#16) land here too, and
+//! are not written yet.
 //!
 //! It is deliberately pure Rust — no system C libraries — so that CI can lint and
 //! test it on a bare runner.
@@ -43,7 +47,12 @@ pub fn resolve_log_filter(flag: Option<&str>, env: Option<String>) -> Result<Str
             // written to prevent it, the silent-logging bug described above.
             Ok(normalised.to_string())
         }
-        None => Ok(env.unwrap_or_else(|| "info".to_string())),
+        // A set-but-empty RUST_LOG yields zero directives, which disables logging
+        // entirely — the same silent-service failure this function exists to prevent,
+        // reached through the environment instead of the flag. Treat it as unset.
+        None => Ok(env
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "info".to_string())),
     }
 }
 
@@ -74,6 +83,20 @@ mod log_filter_tests {
                 "{bad:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn a_set_but_empty_rust_log_is_treated_as_unset() {
+        // Passing "" through would hand EnvFilter zero directives and silence the
+        // process, which is the failure mode this whole function is about.
+        assert_eq!(
+            resolve_log_filter(None, Some(String::new())).unwrap(),
+            "info"
+        );
+        assert_eq!(
+            resolve_log_filter(None, Some("   ".into())).unwrap(),
+            "info"
+        );
     }
 
     #[test]

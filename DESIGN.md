@@ -186,22 +186,24 @@ condition does double duty; it just must not be skipped when there is only one m
 
 ### Measured behaviour worth knowing
 
-All from #9, against rclone v1.75.0, and all encoded as tests in `rvt-core`:
+All measured in #9 against rclone v1.75.0. The **shape** claims are encoded as tests in
+`rvt-core`; the **timing** ones (marked ⏱) are not, and cannot be — a static fixture cannot
+express a lag or an unstable first reading. Confirming those needs the live-rclone harness
+in #38.
 
 - `transferring` is **absent, not `[]`,** when nothing is in flight. "No information" and
   "nothing in flight" are different, and the models keep them different.
 - `eta` is **null** early in a transfer.
-- The **first `speed` reading is unreliable** — it averaged several times the true rate.
-- `percentage` **never reached 100**; completion is the entry disappearing.
-- There is a **~0.6 s window** where `vfs/queue` still lists an item as `uploading` after
+- ⏱ The **first `speed` reading is unreliable** — it averaged several times the true rate.
+- `percentage` **never reached 100** in any sample; completion is the entry disappearing.
+- ⏱ There is a **~0.6 s window** where `vfs/queue` still lists an item as `uploading` after
   `core/stats` has dropped it. Hold the last known value rather than snapping to zero.
-- `transferring[]` lags `vfs/queue` by `--vfs-write-back`. That window is "queued", not "0%".
+- ⏱ `transferring[]` lags `vfs/queue` by `--vfs-write-back`. That window is "queued", not "0%".
 - `vfs/stats` `diskCache.bytesUsed` read **0** throughout a 128 MiB upload. It is not pending
   bytes and not reliably cache size either. Do not show it.
 ### One limit that is not from #9
 
-Read from rclone's source rather than measured, and **not** covered by a test — unlike
-everything above. Recorded here because it changes what the applet may claim, and flagged
+Read from rclone's source rather than measured, and not covered by a test. Recorded here because it changes what the applet may claim, and flagged
 as unverified so nobody treats it as established.
 
 Not every write through a mount enters the write-back cache:

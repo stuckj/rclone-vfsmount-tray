@@ -1,6 +1,6 @@
 [package]
 name = "rvt-core"
-description = "Core logic for rclone-vfsmount-tray: rc API models, cache scanning, configuration"
+description = "Core logic for rclone-vfsmount-tray: rc API models and mount supervision"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

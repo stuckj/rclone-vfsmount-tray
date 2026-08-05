@@ -7,8 +7,10 @@
 //! these types still parse them.
 //!
 //! The two exceptions are [`CoreStats::last_error`] and [`CoreStats::checking`],
-//! which could not be provoked and are modelled from rclone's source instead. Both
-//! say so at the field, and both are covered by unit tests rather than a fixture.
+//! which are modelled from rclone's source because neither appeared in any captured
+//! response and neither could be *captured* afterwards. (`checking` is certainly
+//! reachable from a mount — see the field — it simply was not caught in the act.)
+//! Both say so at the field, and both are covered by unit tests rather than fixtures.
 //!
 //! # Tolerance
 //!
@@ -111,6 +113,9 @@ pub struct CoreStats {
     /// response the investigation in #9 collected, and neither could be provoked
     /// afterwards — rc job errors are accounted to `job/<n>`, not to the global
     /// group. The shapes are asserted by unit tests rather than by a fixture.
+    ///
+    /// (`checking` is reachable from a mount — see it — but was not caught in a
+    /// capture either.)
     #[serde(default)]
     pub last_error: Option<String>,
 
@@ -242,6 +247,19 @@ pub struct Transfer {
 }
 
 impl Transfer {
+    /// Whether rclone has attached accounting to this transfer yet.
+    ///
+    /// Until it has, the wire carries only `name`, `size` and possibly `srcFs`/`dstFs`
+    /// — [`Self::bytes`], [`Self::percentage`], [`Self::speed`], [`Self::speed_avg`],
+    /// [`Self::eta`] and [`Self::group`] are all absent, and the numeric ones default
+    /// to zero rather than to "unknown". Both [`CoreStats::writeback_uploads`] and
+    /// [`CoreStats::ungrouped_transfers`] already exclude such transfers, because
+    /// both require a group; this is for code iterating
+    /// [`CoreStats::transfers_slice`] directly, where those zeros are reachable.
+    pub fn has_accounting(&self) -> bool {
+        self.group.is_some()
+    }
+
     /// Whether this transfer was **not** started by an explicit rc job.
     ///
     /// This says nothing about direction — VFS downloads are ungrouped too. It is a
@@ -384,6 +402,19 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// Construct a summary.
+    ///
+    /// Required because this type is `#[non_exhaustive]`: a struct literal is
+    /// rejected outside this crate, and [`crate::SupervisorError::PendingUploads`]
+    /// carries it, so every out-of-crate `unmount` implementation needs to build one.
+    pub fn new(files: u64, known_bytes: u64, unknown_size_files: u64) -> Self {
+        Self {
+            files,
+            known_bytes,
+            unknown_size_files,
+        }
+    }
+
     /// Whether anything is outstanding.
     pub fn is_empty(&self) -> bool {
         self.files == 0

@@ -71,15 +71,11 @@ impl MountSupervisor for FakeSupervisor {
 }
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    // A minimal executor, so this test needs no async runtime dependency.
-    use std::sync::Arc;
-    use std::task::{Context, Poll, Wake, Waker};
-    struct Noop;
-    impl Wake for Noop {
-        fn wake(self: Arc<Self>) {}
-    }
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    // A minimal executor, so this test needs no async runtime dependency. The futures
+    // here never actually pend, so a no-op waker is sufficient.
+    use std::task::{Context, Poll, Waker};
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
     let mut f = Box::pin(f);
     loop {
         if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {

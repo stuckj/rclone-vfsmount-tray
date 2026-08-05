@@ -248,7 +248,10 @@ const CORE_STATS_TRANSFER: &[&str] = &[
 /// Keys `core/stats` emits only under some conditions: `lastError` when errors have
 /// occurred, `checking` while a check is running. Legal to be absent — which every
 /// fixture here is, having been captured from a healthy idle-or-uploading rclone.
-const CORE_STATS_OPTIONAL: &[&str] = &["lastError", "checking", "checking.[]"];
+// NB `checking` is a string array, and `collect_keys` only records paths for object
+// keys — a `Vec<String>` produces no `checking.[]` entry, so listing one would be dead
+// weight implying the element shape is pinned when it is not.
+const CORE_STATS_OPTIONAL: &[&str] = &["lastError", "checking"];
 
 const CORE_STATS_IGNORED: &[&str] = &[
     "deletedDirs",

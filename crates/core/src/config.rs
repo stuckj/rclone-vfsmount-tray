@@ -1,0 +1,571 @@
+//! The applet's own configuration: which mounts it manages, and how it behaves.
+//!
+//! Distinct from rclone's config, which holds the remotes. This file references those by
+//! name; it never duplicates them and never contains credentials.
+//!
+//! Until the GTK editor lands (#42) this file *is* the configuration UI, so it is meant
+//! to be hand-edited. `config.example.toml` is the annotated reference.
+//!
+//! The service is the only writer — clients go through D-Bus (#40). Two processes doing
+//! read-modify-write on one TOML file loses edits.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+/// Schema version of the on-disk file.
+///
+/// Present from the first release so that a later change has somewhere to branch on. A
+/// file from the future is refused rather than guessed at — an older build silently
+/// dropping fields it does not understand is how configuration gets eaten.
+pub const CURRENT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub global: Global,
+    #[serde(default, rename = "mount")]
+    pub mounts: Vec<Mount>,
+}
+
+fn default_version() -> u32 {
+    CURRENT_VERSION
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Global {
+    /// Use this rclone instead of searching `PATH`.
+    pub rclone_path: Option<PathBuf>,
+    /// Override rclone's cache directory. Normally taken from `rclone config paths`.
+    pub cache_dir: Option<PathBuf>,
+    /// Unmount everything when the service stops.
+    ///
+    /// **Off by default, deliberately.** A package upgrade restarts the service, and
+    /// `apt upgrade` must not unmount anything (#54).
+    pub unmount_on_service_stop: bool,
+    pub poll: Poll,
+    pub notifications: Notifications,
+}
+
+/// How often to ask rclone for state, in seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Poll {
+    /// While something is uploading or downloading.
+    pub active_secs: u64,
+    /// While nothing is happening. Higher, so an idle mount costs nothing.
+    pub idle_secs: u64,
+}
+
+impl Default for Poll {
+    fn default() -> Self {
+        Self {
+            active_secs: 1,
+            idle_secs: 15,
+        }
+    }
+}
+
+/// Which events are worth interrupting someone for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Notifications {
+    /// Everything queued for a mount has finished uploading — the "safe to unplug" signal.
+    pub uploads_complete: bool,
+    /// An upload failed or ran out of retries.
+    pub upload_errors: bool,
+    /// A mount failed, or died and could not be restarted.
+    pub mount_failures: bool,
+    /// The cache is full. Silently breaks uploads, so on by default.
+    pub cache_full: bool,
+}
+
+impl Default for Notifications {
+    fn default() -> Self {
+        Self {
+            uploads_complete: true,
+            upload_errors: true,
+            mount_failures: true,
+            cache_full: true,
+        }
+    }
+}
+
+/// rclone's `--vfs-cache-mode`.
+///
+/// This is the most consequential per-mount setting: `off` and `minimal` bypass the
+/// write-back cache for write-only opens, so those writes stream straight through and no
+/// tier can attribute them to a mount. See DESIGN.md.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    Off,
+    Minimal,
+    #[default]
+    Writes,
+    Full,
+}
+
+impl CacheMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheMode::Off => "off",
+            CacheMode::Minimal => "minimal",
+            CacheMode::Writes => "writes",
+            CacheMode::Full => "full",
+        }
+    }
+
+    /// Whether writes through this mount are visible to the write-back queue.
+    pub fn has_writeback(self) -> bool {
+        matches!(self, CacheMode::Writes | CacheMode::Full)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mount {
+    /// Stable identifier, used in the tray, on D-Bus and in the systemd unit name.
+    pub name: String,
+    /// An rclone remote name, without the trailing colon.
+    pub remote: String,
+    /// Optional path within the remote. Empty means its root.
+    #[serde(default)]
+    pub path: String,
+    pub mount_point: PathBuf,
+
+    #[serde(default)]
+    pub cache_mode: CacheMode,
+    /// `--vfs-cache-max-size`, in rclone's own syntax (`10G`). Unset means unlimited.
+    #[serde(default)]
+    pub cache_max_size: Option<String>,
+    /// `--vfs-cache-max-age` (`1h`, `24h`).
+    #[serde(default)]
+    pub cache_max_age: Option<String>,
+
+    /// Mount when the service starts.
+    #[serde(default = "yes")]
+    pub auto_mount: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    /// `--allow-other`. Needs `user_allow_other` in `/etc/fuse.conf`.
+    #[serde(default)]
+    pub allow_other: bool,
+    #[serde(default)]
+    pub uid: Option<u32>,
+    #[serde(default)]
+    pub gid: Option<u32>,
+    /// Octal, as a string, so `0022` survives a round trip.
+    #[serde(default)]
+    pub umask: Option<String>,
+
+    /// Escape hatch, passed to rclone verbatim after everything above.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Mount {
+    /// The `remote:path` string rclone expects.
+    pub fn fs_spec(&self) -> String {
+        if self.path.is_empty() {
+            format!("{}:", self.remote)
+        } else {
+            format!("{}:{}", self.remote, self.path.trim_start_matches('/'))
+        }
+    }
+}
+
+/// Why a config file cannot be used.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigError {
+    #[error("config file {path} could not be read: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("config file {path} could not be written: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("config file {path} is not valid TOML: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+
+    #[error("config file {path} is version {found}, but this build understands up to {supported} — upgrade rclone-vfsmount-tray")]
+    FromTheFuture {
+        path: PathBuf,
+        found: u32,
+        supported: u32,
+    },
+
+    #[error("{0}")]
+    Invalid(String),
+
+    #[error("could not determine a config directory: neither $XDG_CONFIG_HOME nor $HOME is set")]
+    NoConfigDir,
+}
+
+impl Config {
+    /// `$XDG_CONFIG_HOME/rclone-vfsmount-tray/config.toml`, else `~/.config/...`.
+    pub fn default_path() -> Result<PathBuf, ConfigError> {
+        let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            Some(v) => PathBuf::from(v),
+            None => PathBuf::from(std::env::var_os("HOME").ok_or(ConfigError::NoConfigDir)?)
+                .join(".config"),
+        };
+        Ok(base.join("rclone-vfsmount-tray").join("config.toml"))
+    }
+
+    /// Load and validate. A missing file is the default config, not an error — a fresh
+    /// install has no mounts yet and should still start.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        };
+        let cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if cfg.version > CURRENT_VERSION {
+            return Err(ConfigError::FromTheFuture {
+                path: path.to_path_buf(),
+                found: cfg.version,
+                supported: CURRENT_VERSION,
+            });
+        }
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Write atomically: temp file in the same directory, then rename.
+    ///
+    /// A partial write here is a config file the service cannot parse on next start,
+    /// which on a headless box means no mounts and no obvious reason why.
+    pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
+        self.validate()?;
+        let dir = path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir).map_err(|source| ConfigError::Write {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+
+        let body = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Invalid(format!("could not serialise config: {e}")))?;
+
+        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, body).map_err(|source| ConfigError::Write {
+            path: tmp.clone(),
+            source,
+        })?;
+        std::fs::rename(&tmp, path).map_err(|source| {
+            let _ = std::fs::remove_file(&tmp);
+            ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    }
+
+    pub fn mount(&self, name: &str) -> Option<&Mount> {
+        self.mounts.iter().find(|m| m.name == name)
+    }
+
+    /// Reject anything that would fail confusingly later.
+    ///
+    /// Checks that do not touch the filesystem, so this stays usable on a config being
+    /// edited for a machine other than this one. Whether a mount point exists is the
+    /// supervisor's problem (#17), at the point where it matters.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let mut names = BTreeSet::new();
+        let mut points = BTreeSet::new();
+
+        for m in &self.mounts {
+            let n = m.name.trim();
+            if n.is_empty() {
+                return Err(ConfigError::Invalid("a mount has an empty name".into()));
+            }
+            if n.contains('/') || n.contains(char::is_whitespace) {
+                return Err(ConfigError::Invalid(format!(
+                    "mount name {n:?} may not contain whitespace or '/': it is used in the \
+                     systemd unit name and on D-Bus"
+                )));
+            }
+            if !names.insert(n.to_string()) {
+                return Err(ConfigError::Invalid(format!("duplicate mount name {n:?}")));
+            }
+            if m.remote.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!("mount {n:?} has no remote")));
+            }
+            if m.remote.contains(':') {
+                return Err(ConfigError::Invalid(format!(
+                    "mount {n:?}: remote should be the name alone, without a colon — put any \
+                     path in `path`"
+                )));
+            }
+            if !m.mount_point.is_absolute() {
+                return Err(ConfigError::Invalid(format!(
+                    "mount {n:?}: mount_point must be absolute, got {}",
+                    m.mount_point.display()
+                )));
+            }
+            if !points.insert(m.mount_point.clone()) {
+                return Err(ConfigError::Invalid(format!(
+                    "mount {n:?}: two mounts share the mount point {}",
+                    m.mount_point.display()
+                )));
+            }
+            if let Some(u) = &m.umask {
+                if u32::from_str_radix(u.trim_start_matches("0o"), 8).is_err() {
+                    return Err(ConfigError::Invalid(format!(
+                        "mount {n:?}: umask {u:?} is not octal"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mount(name: &str, point: &str) -> Mount {
+        Mount {
+            name: name.into(),
+            remote: "backup".into(),
+            path: String::new(),
+            mount_point: PathBuf::from(point),
+            cache_mode: CacheMode::Writes,
+            cache_max_size: None,
+            cache_max_age: None,
+            auto_mount: true,
+            read_only: false,
+            allow_other: false,
+            uid: None,
+            gid: None,
+            umask: None,
+            extra_args: Vec::new(),
+        }
+    }
+
+    fn with(mounts: Vec<Mount>) -> Config {
+        Config {
+            version: CURRENT_VERSION,
+            global: Global::default(),
+            mounts,
+        }
+    }
+
+    #[test]
+    fn round_trips_through_toml() {
+        let mut c = with(vec![mount("photos", "/mnt/photos")]);
+        c.mounts[0].path = "pictures/raw".into();
+        c.mounts[0].cache_max_size = Some("10G".into());
+        c.mounts[0].umask = Some("0022".into());
+        c.mounts[0].extra_args = vec!["--transfers".into(), "8".into()];
+        c.global.unmount_on_service_stop = true;
+
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert_eq!(toml::from_str::<Config>(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn a_minimal_mount_needs_only_three_fields() {
+        // This file is hand-edited until #42, so the required set has to stay small.
+        let c: Config = toml::from_str(
+            r#"
+            [[mount]]
+            name = "photos"
+            remote = "backup"
+            mount_point = "/mnt/photos"
+            "#,
+        )
+        .unwrap();
+        let m = &c.mounts[0];
+        assert_eq!(c.version, CURRENT_VERSION);
+        assert_eq!(m.cache_mode, CacheMode::Writes);
+        assert!(m.auto_mount, "a configured mount should come up by default");
+        assert!(!c.global.unmount_on_service_stop, "must default off");
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn a_typo_is_rejected_rather_than_ignored() {
+        // deny_unknown_fields: silently dropping `mountpoint` would leave someone
+        // wondering why their edit did nothing.
+        let e = toml::from_str::<Config>(
+            r#"
+            [[mount]]
+            name = "photos"
+            remote = "backup"
+            mountpoint = "/mnt/photos"
+            "#,
+        );
+        assert!(e.is_err());
+    }
+
+    #[test]
+    fn fs_spec_matches_what_rclone_expects() {
+        let mut m = mount("photos", "/mnt/photos");
+        assert_eq!(m.fs_spec(), "backup:");
+        m.path = "pictures".into();
+        assert_eq!(m.fs_spec(), "backup:pictures");
+        m.path = "/pictures".into();
+        assert_eq!(m.fs_spec(), "backup:pictures", "leading slash is dropped");
+    }
+
+    #[test]
+    fn validation_rejects_the_confusing_cases() {
+        let dup_name = with(vec![mount("a", "/mnt/one"), mount("a", "/mnt/two")]);
+        assert!(dup_name
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+
+        let dup_point = with(vec![mount("a", "/mnt/one"), mount("b", "/mnt/one")]);
+        assert!(dup_point
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("share"));
+
+        let relative = with(vec![mount("a", "mnt/one")]);
+        assert!(relative
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("absolute"));
+
+        let mut spaced = with(vec![mount("my mount", "/mnt/one")]);
+        assert!(
+            spaced.validate().is_err(),
+            "name reaches a systemd unit name"
+        );
+        spaced.mounts[0].name = "ok".into();
+        assert!(spaced.validate().is_ok());
+
+        let mut colon = with(vec![mount("a", "/mnt/one")]);
+        colon.mounts[0].remote = "backup:".into();
+        assert!(colon
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("without a colon"));
+
+        let mut bad_umask = with(vec![mount("a", "/mnt/one")]);
+        bad_umask.mounts[0].umask = Some("rwxr".into());
+        assert!(bad_umask
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("octal"));
+    }
+
+    #[test]
+    fn cache_mode_knows_which_modes_have_a_write_back_queue() {
+        assert!(CacheMode::Writes.has_writeback() && CacheMode::Full.has_writeback());
+        // Under these, write-only opens stream via Rcat and no tier attributes them.
+        assert!(!CacheMode::Off.has_writeback() && !CacheMode::Minimal.has_writeback());
+        assert_eq!(CacheMode::Full.as_str(), "full");
+    }
+
+    #[test]
+    fn a_missing_file_is_the_default_config() {
+        let dir = std::env::temp_dir().join(format!("rvt-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        assert_eq!(Config::load(&path).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn save_then_load_survives_the_trip() {
+        let dir = std::env::temp_dir().join(format!("rvt-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        let c = with(vec![mount("photos", "/mnt/photos")]);
+        c.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), c);
+
+        // No temp files left behind.
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(strays.is_empty(), "left temp files: {strays:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_schema_is_refused_not_guessed_at() {
+        let dir = std::env::temp_dir().join(format!("rvt-ver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, format!("version = {}\n", CURRENT_VERSION + 1)).unwrap();
+
+        let e = Config::load(&path).unwrap_err().to_string();
+        assert!(e.contains("upgrade"), "should say what to do: {e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_refuses_to_write_an_invalid_config() {
+        // Better to fail the D-Bus call than to persist something the service cannot
+        // load on its next start.
+        let dir = std::env::temp_dir().join(format!("rvt-inv-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let bad = with(vec![mount("a", "/mnt/one"), mount("a", "/mnt/two")]);
+        assert!(bad.save(&path).is_err());
+        assert!(!path.exists(), "nothing should have been written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_path_follows_xdg() {
+        // Not parallel-safe with other env-touching tests, hence being the only one.
+        let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-probe");
+        assert_eq!(
+            Config::default_path().unwrap(),
+            PathBuf::from("/tmp/xdg-probe/rclone-vfsmount-tray/config.toml")
+        );
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", "/home/probe");
+        assert_eq!(
+            Config::default_path().unwrap(),
+            PathBuf::from("/home/probe/.config/rclone-vfsmount-tray/config.toml")
+        );
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+}

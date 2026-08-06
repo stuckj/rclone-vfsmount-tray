@@ -1,0 +1,96 @@
+# rclone-vfsmount-tray configuration
+#
+# Lives at $XDG_CONFIG_HOME/rclone-vfsmount-tray/config.toml, or
+# ~/.config/rclone-vfsmount-tray/config.toml.
+#
+# This file is meant to be hand-edited — the graphical mount editor is not built yet.
+# The service watches it and reloads on change, so no restart is needed.
+#
+# It references rclone remotes by name. It never contains credentials; those stay in
+# rclone's own config, which `rclone config` manages.
+
+# Schema version. Leave it alone unless a release note says otherwise; a file claiming a
+# newer version than the installed build is refused rather than half-read.
+version = 1
+
+
+[global]
+# Use a specific rclone rather than searching $PATH.
+# rclone_path = "/usr/local/bin/rclone"
+
+# Override rclone's cache directory. Normally discovered from `rclone config paths`.
+# cache_dir = "/var/cache/rclone"
+
+# Unmount everything when the service stops.
+#
+# Off by default, and worth leaving off. Mounts are deliberately independent of the
+# service's lifetime: a package upgrade restarts it, and that should not pull your
+# filesystems out from under whatever is using them. Unuploaded data is safe either
+# way — rclone's cache is on disk and resumes — but an unmount you did not ask for is
+# still disruptive.
+unmount_on_service_stop = false
+
+[global.poll]
+# How often to ask rclone what is happening, in seconds.
+active_secs = 1   # while data is moving
+idle_secs = 15    # while nothing is
+
+[global.notifications]
+uploads_complete = true   # everything queued for a mount has finished — "safe to unplug"
+upload_errors = true      # an upload failed or ran out of retries
+mount_failures = true     # a mount failed, or died and could not be restarted
+cache_full = true         # the cache is out of room, which silently stalls uploads
+
+
+# One [[mount]] block per mount. Only name, remote and mount_point are required.
+[[mount]]
+# Used in the tray, on D-Bus and in the systemd unit name, so no spaces or slashes.
+name = "photos"
+
+# An rclone remote name, without the trailing colon — `backup`, not `backup:`.
+# `rclone listremotes` shows what you have.
+remote = "backup"
+
+# Optional path within that remote. Omit for its root.
+path = "pictures/raw"
+
+# Where it appears in the filesystem. Must be absolute.
+mount_point = "/home/you/mnt/photos"
+
+# How much rclone caches locally. This is the setting that matters most:
+#
+#   off      no cache. Writes stream straight through and are invisible to this tool.
+#   minimal  cache metadata and read-write opens; write-only opens still stream.
+#   writes   cache writes locally and upload in the background.  <- default
+#   full     cache reads as well, so re-reads are local.
+#
+# Only `writes` and `full` give a write-back queue, which is what upload progress is
+# derived from. Under `off` and `minimal`, "nothing pending" does not mean "nothing in
+# flight".
+cache_mode = "writes"
+
+# Cache limits, in rclone's syntax. Unset means no limit.
+# Note that rclone will not evict data it has not yet uploaded, so a full cache stalls
+# rather than loses.
+cache_max_size = "10G"
+cache_max_age = "24h"
+
+# Mount when the service starts.
+auto_mount = true
+
+# read_only = false
+# allow_other = false      # needs user_allow_other in /etc/fuse.conf
+# uid = 1000
+# gid = 1000
+# umask = "0022"
+
+# Anything else, passed to rclone verbatim. An escape hatch for flags this tool does not
+# model — if you find yourself relying on it, that is worth an issue.
+# extra_args = ["--transfers", "8", "--checkers", "16"]
+
+
+# [[mount]]
+# name = "documents"
+# remote = "gdrive"
+# mount_point = "/home/you/mnt/documents"
+# cache_mode = "full"

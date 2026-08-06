@@ -1,13 +1,18 @@
-//! Core logic for `rclone-vfsmount-tray`: [`models`] (rc API and cache metadata),
+//! Core logic for `rclone-vfsmount-tray`: [`config`] (the applet's own settings),
+//! [`models`] (rc API and cache metadata), [`rclone`] (finding and querying the binary),
 //! [`supervisor`] (mount lifecycle), and [`resolve_log_filter`].
 //!
 //! Pure Rust — no system C libraries — so CI can lint and test it on a bare runner.
-//! The cache scanner (#22) and config model (#16) land here too.
+//! The cache scanner (#22) lands here too.
 
+pub mod config;
 pub mod models;
+pub mod rclone;
 pub mod supervisor;
 
+pub use config::{CacheMode, Config, ConfigError, Mount};
 pub use models::Pending;
+pub use rclone::{Rclone, RcloneError};
 pub use supervisor::{
     BoxFuture, Cause, DiscoveredMount, MountState, MountSupervisor, SupervisorError,
 };

@@ -18,9 +18,11 @@ serde_json = { workspace = true }
 # Pure Rust (a normal lib plus the `thiserror-impl` proc-macro; no `links` key and no
 # -sys dependency anywhere in its tree), so the no-system-libraries rule holds.
 thiserror = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 # Reports the keys a deserialize silently dropped. This is what makes the fixture
 # tests an actual wire-format guard: without it a field the model fails to read just
 # takes its default, and every test still passes. See tests/fixtures.rs.
 serde_ignored = "0.1"
+toml = { workspace = true }

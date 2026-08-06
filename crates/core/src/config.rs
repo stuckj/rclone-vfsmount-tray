@@ -415,11 +415,20 @@ impl Config {
                      any path in `path`"
                 )));
             }
-            // rclone's own rule for a config name (fs/fspath `configNameRe`): letters,
-            // digits, `_ . + @ -` and interior spaces, not starting with `-` or a space
-            // and not ending with a space. Checked here so the problem is reported
-            // against the config that holds it, rather than as rclone's opaque "config
-            // name contains invalid characters" at mount time.
+            // A deliberately conservative subset of rclone's config-name rule, so the
+            // problem is reported against the config that holds it rather than as
+            // rclone's opaque "config name contains invalid characters" at mount time.
+            //
+            // This transcribes rclone's *error text* (`fs/fspath` `errInvalidCharacters`),
+            // not `configNameRe` itself. The regex is
+            // `[\w\p{L}\p{N}.+@]+(?:[ -]+[\w\p{L}\p{N}.+@-]+)*`, whose two halves
+            // differ only in `-`, and that overlap means it also rejects a name ending in
+            // a *lone* hyphen — `backup-` is invalid while `backup--`, `my -` and `a-b-`
+            // are fine. Matching that exactly needs a backtracking scanner, which is not
+            // worth it here: the gap only ever *under*-rejects, so no legal name is
+            // blocked, and the cost is that `backup-` gets rclone's error instead of ours.
+            // Verified against the compiled regex — the trailing-lone-hyphen family is the
+            // only divergence.
             //
             // A comma is the sharp one: rclone reads `backup,key=value:` as a connection
             // string and silently applies the override instead of failing.

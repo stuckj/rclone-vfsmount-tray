@@ -1,0 +1,70 @@
+name: CodeQL
+
+# "Advanced setup" for code scanning: the analysis lives in this file rather than in
+# repository settings. The `Protect main` ruleset requires a CodeQL result, so without
+# this (or GitHub's default setup, which is a settings toggle and replaces this file)
+# pull requests stay blocked with nothing to run.
+#
+# Switching to default setup later means deleting this workflow — the two are mutually
+# exclusive and GitHub will disable one when the other is enabled.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # CodeQL query packs are updated continuously, so a weekly run catches new findings
+    # on code nobody has touched. Offset from the cargo-audit cron in ci.yml.
+    - cron: "41 7 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      # Uploading results is the whole point; the rest stay read-only.
+      security-events: write
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust support is newer than CodeQL's older languages, so treat a failure
+          # here as informative rather than assuming the analysis is sound.
+          - language: rust
+            build-mode: manual
+          # Analyses the workflow files themselves — relevant here because CI pins
+          # third-party actions by SHA and grants `security-events: write` above.
+          - language: actions
+            build-mode: none
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: github/codeql-action/init@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3.37.6
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      # Built explicitly rather than with `autobuild`: the GTK crate is excluded from
+      # `default-members` (see the root Cargo.toml), so a bare build would skip it, and
+      # `--workspace` keeps the analysis over the same code CI lints. `--locked` for the
+      # same reason as everywhere else — the committed lockfile should be what is used.
+      - name: Build for analysis
+        if: matrix.build-mode == 'manual'
+        run: cargo build --locked --workspace --all-targets
+
+      - uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3.37.6
+        with:
+          category: "/language:${{ matrix.language }}"

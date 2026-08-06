@@ -33,5 +33,13 @@ updates:
     commit-message:
       prefix: "ci"
     groups:
+      # codeql-action/init and codeql-action/analyze are separate dependencies to
+      # dependabot but must run the SAME version — mismatched, the job fails with
+      # "Loaded a configuration file for version X, but running version Y". Splitting
+      # them across two PRs means both fail and neither can merge alone, which is
+      # exactly what happened with the v3 -> v4 bump. No update-types filter here:
+      # they must stay together for majors especially.
+      codeql:
+        patterns: ["github/codeql-action*"]
       actions:
         update-types: [minor, patch]

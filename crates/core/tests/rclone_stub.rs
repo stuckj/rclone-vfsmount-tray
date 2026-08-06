@@ -20,8 +20,11 @@ const VERSION_OUTPUT: &str = r#"rclone v1.75.0
 - go/linking: static
 - go/tags: none"#;
 
+// Three lines, as rclone prints them (cmd/config/config.go). The parser ignores the
+// third; the stub carries it so that is actually exercised rather than assumed.
 const CONFIG_PATHS_OUTPUT: &str = "Config file: /home/user/.config/rclone/rclone.conf\n\
-                                   Cache dir:   /home/user/.cache/rclone\n";
+                                   Cache dir:   /home/user/.cache/rclone\n\
+                                   Temp dir:    /tmp\n";
 
 struct Stub {
     dir: PathBuf,

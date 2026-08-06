@@ -142,6 +142,11 @@ impl Rclone {
     fn which(bin: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
+            // POSIX reads an empty PATH element as the current directory. For a
+            // background service that means running whatever `./rclone` happens to be,
+            // and it yields a relative path that systemd's ExecStart would resolve
+            // against its own search path rather than the binary we just verified.
+            .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join(bin))
             .find(|c| c.is_file())
     }

@@ -11,7 +11,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Schema version of the on-disk file.
 ///
@@ -20,7 +24,7 @@ use std::path::{Path, PathBuf};
 /// dropping fields it does not understand is how configuration gets eaten.
 pub const CURRENT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default = "default_version")]
@@ -33,6 +37,30 @@ pub struct Config {
 
 fn default_version() -> u32 {
     CURRENT_VERSION
+}
+
+impl Default for Config {
+    /// `#[serde(default = ...)]` only applies when deserialising, so a derived `Default`
+    /// would give `version: 0` — and that is the value a fresh install saves.
+    fn default() -> Self {
+        Self {
+            version: CURRENT_VERSION,
+            global: Global::default(),
+            mounts: Vec::new(),
+        }
+    }
+}
+
+/// Reads `version` and nothing else.
+///
+/// The real parse uses `deny_unknown_fields`, so a v2 file that adds a field dies there —
+/// reporting "not valid TOML", which is both unhelpful and untrue — before the version
+/// check could produce an actionable error. The version has to be read by something that
+/// tolerates fields this build has never heard of.
+#[derive(Deserialize)]
+struct VersionProbe {
+    #[serde(default = "default_version")]
+    version: u32,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -120,8 +148,20 @@ impl CacheMode {
         }
     }
 
-    /// Whether writes through this mount are visible to the write-back queue.
+    /// Whether this mount has a write-back cache at all — whether `vfs/queue`,
+    /// `vfs/stats` and the cache scanner can report anything for it.
+    ///
+    /// rclone builds the cache, and its queue, for any mode above `off`
+    /// (`vfs.SetCacheMode`: `cacheMode > CacheModeOff`).
     pub fn has_writeback(self) -> bool {
+        !matches!(self, CacheMode::Off)
+    }
+
+    /// Whether *every* write reaches that queue.
+    ///
+    /// Under `minimal` only write-only opens of uncached files stream past it, so `false`
+    /// means "may also have writes we cannot see", not "has no queue".
+    pub fn all_writes_queued(self) -> bool {
         matches!(self, CacheMode::Writes | CacheMode::Full)
     }
 }
@@ -246,17 +286,21 @@ impl Config {
                 })
             }
         };
+        let probe: VersionProbe = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if probe.version > CURRENT_VERSION {
+            return Err(ConfigError::FromTheFuture {
+                path: path.to_path_buf(),
+                found: probe.version,
+                supported: CURRENT_VERSION,
+            });
+        }
         let cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
         })?;
-        if cfg.version > CURRENT_VERSION {
-            return Err(ConfigError::FromTheFuture {
-                path: path.to_path_buf(),
-                found: cfg.version,
-                supported: CURRENT_VERSION,
-            });
-        }
         cfg.validate()?;
         Ok(cfg)
     }
@@ -276,18 +320,41 @@ impl Config {
         let body = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::Invalid(format!("could not serialise config: {e}")))?;
 
-        let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
-        std::fs::write(&tmp, body).map_err(|source| ConfigError::Write {
-            path: tmp.clone(),
-            source,
+        // Unique per call, not per process: two concurrent saves sharing one temp path
+        // can interleave truncate and write, and rename a spliced file into place.
+        let tmp = path.with_extension(format!(
+            "toml.tmp.{}.{}",
+            std::process::id(),
+            SAVE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let write_tmp = || -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            // rename() is atomic against a reader, not against a crash: without this the
+            // rename can land while the contents are still only in page cache.
+            f.sync_all()
+        };
+        write_tmp().map_err(|source| {
+            let _ = std::fs::remove_file(&tmp);
+            ConfigError::Write {
+                path: tmp.clone(),
+                source,
+            }
         })?;
+
         std::fs::rename(&tmp, path).map_err(|source| {
             let _ = std::fs::remove_file(&tmp);
             ConfigError::Write {
                 path: path.to_path_buf(),
                 source,
             }
-        })
+        })?;
+
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+        Ok(())
     }
 
     pub fn mount(&self, name: &str) -> Option<&Mount> {
@@ -304,11 +371,13 @@ impl Config {
         let mut points = BTreeSet::new();
 
         for m in &self.mounts {
-            let n = m.name.trim();
+            // Not trimmed: `m.name` is what reaches the systemd unit name, D-Bus and
+            // `Config::mount()`, so padding has to fail here rather than later.
+            let n = m.name.as_str();
             if n.is_empty() {
                 return Err(ConfigError::Invalid("a mount has an empty name".into()));
             }
-            if n.contains('/') || n.contains(char::is_whitespace) {
+            if n.contains('/') || n.chars().any(char::is_whitespace) {
                 return Err(ConfigError::Invalid(format!(
                     "mount name {n:?} may not contain whitespace or '/': it is used in the \
                      systemd unit name and on D-Bus"
@@ -488,11 +557,24 @@ mod tests {
     }
 
     #[test]
-    fn cache_mode_knows_which_modes_have_a_write_back_queue() {
-        assert!(CacheMode::Writes.has_writeback() && CacheMode::Full.has_writeback());
-        // Under these, write-only opens stream via Rcat and no tier attributes them.
-        assert!(!CacheMode::Off.has_writeback() && !CacheMode::Minimal.has_writeback());
+    fn cache_mode_distinguishes_having_a_queue_from_catching_every_write() {
+        // `minimal` does have a queue: read-write opens, and any file already cached, go
+        // through it. Only write-only opens of uncached files stream past.
+        assert!(CacheMode::Minimal.has_writeback());
+        assert!(!CacheMode::Minimal.all_writes_queued());
+        assert!(!CacheMode::Off.has_writeback());
+        assert!(CacheMode::Writes.all_writes_queued() && CacheMode::Full.all_writes_queued());
         assert_eq!(CacheMode::Full.as_str(), "full");
+    }
+
+    #[test]
+    fn a_padded_name_is_rejected_rather_than_stored_unfindable() {
+        // Validating the trimmed value while storing the padded one lets " photos "
+        // through, then `mount("photos")` finds nothing and the systemd unit name
+        // contains a space.
+        let mut c = with(vec![mount("x", "/mnt/one")]);
+        c.mounts[0].name = " photos ".into();
+        assert!(c.validate().is_err(), "padding must fail validation");
     }
 
     #[test]
@@ -500,7 +582,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rvt-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("config.toml");
-        assert_eq!(Config::load(&path).unwrap(), Config::default());
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(
+            cfg.version, CURRENT_VERSION,
+            "a fresh install must not write a version no release ever produced"
+        );
     }
 
     #[test]
@@ -529,7 +616,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rvt-ver-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, format!("version = {}\n", CURRENT_VERSION + 1)).unwrap();
+        // With an unknown field too: that is what a real schema bump looks like, and the
+        // strict parse would otherwise reject it before the version check ran.
+        std::fs::write(
+            &path,
+            format!(
+                "version = {}\nsomething_added_later = true\n",
+                CURRENT_VERSION + 1
+            ),
+        )
+        .unwrap();
 
         let e = Config::load(&path).unwrap_err().to_string();
         assert!(e.contains("upgrade"), "should say what to do: {e}");

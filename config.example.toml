@@ -4,7 +4,7 @@
 # ~/.config/rclone-vfsmount-tray/config.toml.
 #
 # This file is meant to be hand-edited — the graphical mount editor is not built yet.
-# The service watches it and reloads on change, so no restart is needed.
+# Restart the service after editing; it does not watch this file yet.
 #
 # It references rclone remotes by name. It never contains credentials; those stay in
 # rclone's own config, which `rclone config` manages.
@@ -69,9 +69,16 @@ mount_point = "/home/you/mnt/photos"
 # flight".
 cache_mode = "writes"
 
-# Cache limits, in rclone's syntax. Unset means no limit.
-# Note that rclone will not evict data it has not yet uploaded, so a full cache stalls
-# rather than loses.
+# Cache limits, in rclone's syntax.
+#
+# These two do NOT default the same way. Omitting cache_max_size means no size limit,
+# but omitting cache_max_age does not mean no age limit — rclone defaults
+# --vfs-cache-max-age to 1h, so cached files are evicted an hour after last use. On a
+# `full` mount that quietly turns re-reads back into downloads. Set it to "off" for no
+# age limit.
+#
+# rclone will not evict data it has not yet uploaded, so a full cache stalls rather
+# than loses.
 cache_max_size = "10G"
 cache_max_age = "24h"
 

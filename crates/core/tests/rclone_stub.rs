@@ -136,6 +136,11 @@ fn unparsable_version_output_says_what_it_saw() {
 
 #[test]
 fn a_missing_binary_lists_where_it_looked() {
+    // Takes the lock without building a stub. This still spawns, and the child inherits
+    // the write fd another test holds open on its stub between `fs::write` and `execve`
+    // — the exact ETXTBSY the lock exists to prevent. Measured 6/1000 without this.
+    let _guard = serialised();
+
     let missing = Path::new("/nonexistent/definitely/not/rclone");
     match Rclone::discover(Some(missing)) {
         Err(RcloneError::NotExecutable { path, .. }) => assert_eq!(path, missing),

@@ -44,7 +44,8 @@ cache_full = true         # the cache is out of room, which silently stalls uplo
 
 # One [[mount]] block per mount. Only name, remote and mount_point are required.
 [[mount]]
-# Used in the tray, on D-Bus and in the systemd unit name, so no spaces or slashes.
+# Used in the tray, on D-Bus and in the systemd unit name, so it is an identifier rather
+# than free text: ASCII letters, digits, '-', '_' and '.' only. "." and ".." are reserved.
 name = "photos"
 
 # An rclone remote name, without the trailing colon — `backup`, not `backup:`.

@@ -408,20 +408,33 @@ impl Config {
             if !names.insert(n.to_string()) {
                 return Err(ConfigError::Invalid(format!("duplicate mount name {n:?}")));
             }
-            // Same trap as the name: checking a trimmed value while storing the original
-            // lets `" backup "` through, and rclone rejects a config name that starts or
-            // ends with a space (fs/fspath `configNameRe`). Interior spaces are legal.
-            if m.remote.is_empty() || m.remote.trim() != m.remote {
-                return Err(ConfigError::Invalid(format!(
-                    "mount {n:?}: remote {:?} is empty or padded with whitespace; an rclone \
-                     remote name may not start or end with a space",
-                    m.remote
-                )));
-            }
+            // The colon case first, so it keeps its more specific advice.
             if m.remote.contains(':') {
                 return Err(ConfigError::Invalid(format!(
-                    "mount {n:?}: remote should be the name alone, without a colon — put any \
-                     path in `path`"
+                    "mount {n:?}: remote should be the name alone, without a colon — put \
+                     any path in `path`"
+                )));
+            }
+            // rclone's own rule for a config name (fs/fspath `configNameRe`): letters,
+            // digits, `_ . + @ -` and interior spaces, not starting with `-` or a space
+            // and not ending with a space. Checked here so the problem is reported
+            // against the config that holds it, rather than as rclone's opaque "config
+            // name contains invalid characters" at mount time.
+            //
+            // A comma is the sharp one: rclone reads `backup,key=value:` as a connection
+            // string and silently applies the override instead of failing.
+            let bad_char =
+                |c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '+' | '@' | '-' | ' '));
+            if m.remote.is_empty()
+                || m.remote.chars().any(bad_char)
+                || m.remote.starts_with(['-', ' '])
+                || m.remote.ends_with(' ')
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mount {n:?}: remote {:?} is not a usable rclone remote name — letters, \
+                     digits, `_`, `.`, `+`, `@`, `-` and interior spaces only, not starting \
+                     with `-` or a space and not ending with a space",
+                    m.remote
                 )));
             }
             if !m.mount_point.is_absolute() {

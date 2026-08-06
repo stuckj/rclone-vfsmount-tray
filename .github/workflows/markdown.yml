@@ -1,0 +1,39 @@
+name: Markdown
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: markdown-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  markdown:
+    name: lint + link check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: markdownlint
+        uses: DavidAnson/markdownlint-cli2-action@992badcdf24e3b8eb7e87ff9287fe931bcb00c6e # v20.0.0
+        with:
+          # Excluding target/: `cargo doc` writes dependency licence files there, and a
+          # local run after a build would otherwise lint vendored markdown. CI has no
+          # target/ at this point, but the two should behave the same.
+          globs: |
+            **/*.md
+            !target/**
+
+      # The Pages site does not exist until the first release publishes it, so links
+      # into it are ignored in markdown-link-check.json rather than failing every PR.
+      - name: link check
+        uses: gaurav-nelson/github-action-markdown-link-check@d53a906aa6b22b8979d33bc86170567e619495ec # v1.0.15
+        with:
+          use-quiet-mode: "yes"
+          config-file: ".github/markdown-link-check.json"

@@ -40,12 +40,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Rust support is newer than CodeQL's older languages, so treat a failure
-          # here as informative rather than assuming the analysis is sound.
+          # The Rust extractor is buildless and REJECTS build-mode: manual outright
+          # ("Rust does not support the manual build mode"). It reads source, so it
+          # covers the GTK crate too despite that being excluded from
+          # `default-members` — no build step needed, and none would help.
           - language: rust
-            build-mode: manual
+            build-mode: none
           # Analyses the workflow files themselves — relevant here because CI pins
-          # third-party actions by SHA and grants `security-events: write` above.
+          # third-party actions by SHA and this job grants `security-events: write`.
           - language: actions
             build-mode: none
 
@@ -56,14 +58,6 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-
-      # Built explicitly rather than with `autobuild`: the GTK crate is excluded from
-      # `default-members` (see the root Cargo.toml), so a bare build would skip it, and
-      # `--workspace` keeps the analysis over the same code CI lints. `--locked` for the
-      # same reason as everywhere else — the committed lockfile should be what is used.
-      - name: Build for analysis
-        if: matrix.build-mode == 'manual'
-        run: cargo build --locked --workspace --all-targets
 
       - uses: github/codeql-action/analyze@c4dd10e44af883a891fe31ced449bcb4a6728b9b # v3.37.6
         with:

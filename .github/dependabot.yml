@@ -1,20 +1,37 @@
+# Dependabot version updates.
+#
+# NB this file is only read from the DEFAULT BRANCH — nothing happens until it is on
+# `main`, regardless of what a pull request branch contains.
 version: 2
 updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule:
       interval: weekly
+      day: monday
     open-pull-requests-limit: 5
+    labels: [dependencies, rust]
+    commit-message:
+      prefix: "deps"
+      include: scope
     groups:
-      # Patch and minor bumps arrive as one PR rather than a dozen; majors stay
-      # separate because they need reading.
+      # One PR for the routine churn rather than a dozen. Majors stay separate
+      # because they need reading.
       minor-and-patch:
         update-types: [minor, patch]
 
-  # Actions are pinned to commit SHAs in the workflows, which means they cannot be
-  # updated by hand realistically — dependabot rewrites the SHA and updates the
-  # trailing version comment.
+  # The workflows pin actions to commit SHAs, which is not maintainable by hand —
+  # dependabot rewrites the SHA and updates the trailing version comment for us.
+  # That is the main reason this ecosystem is enabled at all.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, github_actions]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        update-types: [minor, patch]

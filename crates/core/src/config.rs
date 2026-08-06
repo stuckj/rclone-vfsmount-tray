@@ -367,27 +367,56 @@ impl Config {
     /// edited for a machine other than this one. Whether a mount point exists is the
     /// supervisor's problem (#17), at the point where it matters.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // A relative override reintroduces the CWD execution that discovery's
+        // absolute-only PATH filter exists to prevent.
+        if let Some(p) = &self.global.rclone_path {
+            if !p.is_absolute() {
+                return Err(ConfigError::Invalid(format!(
+                    "global.rclone_path must be absolute, got {}",
+                    p.display()
+                )));
+            }
+        }
+
         let mut names = BTreeSet::new();
         let mut points = BTreeSet::new();
 
         for m in &self.mounts {
-            // Not trimmed: `m.name` is what reaches the systemd unit name, D-Bus and
-            // `Config::mount()`, so padding has to fail here rather than later.
+            // Checked as stored, not trimmed: this string reaches the systemd unit
+            // name, D-Bus and `Config::mount()`.
             let n = m.name.as_str();
             if n.is_empty() {
                 return Err(ConfigError::Invalid("a mount has an empty name".into()));
             }
-            if n.contains('/') || n.chars().any(char::is_whitespace) {
+            if n == "." || n == ".." {
                 return Err(ConfigError::Invalid(format!(
-                    "mount name {n:?} may not contain whitespace or '/': it is used in the \
-                     systemd unit name and on D-Bus"
+                    "mount name {n:?} is reserved: the name is used to build paths"
+                )));
+            }
+            // An identifier, not free text. Restricted now because the cost is
+            // asymmetric — loosening later is additive, tightening invalidates configs
+            // people already wrote.
+            if !n
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "mount name {n:?} may only contain ASCII letters, digits, '-', '_' and \
+                     '.': it is used in the systemd unit name, on D-Bus and in lookups"
                 )));
             }
             if !names.insert(n.to_string()) {
                 return Err(ConfigError::Invalid(format!("duplicate mount name {n:?}")));
             }
-            if m.remote.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!("mount {n:?} has no remote")));
+            // Same trap as the name: checking a trimmed value while storing the original
+            // lets `" backup "` through, and rclone rejects a config name that starts or
+            // ends with a space (fs/fspath `configNameRe`). Interior spaces are legal.
+            if m.remote.is_empty() || m.remote.trim() != m.remote {
+                return Err(ConfigError::Invalid(format!(
+                    "mount {n:?}: remote {:?} is empty or padded with whitespace; an rclone \
+                     remote name may not start or end with a space",
+                    m.remote
+                )));
             }
             if m.remote.contains(':') {
                 return Err(ConfigError::Invalid(format!(
@@ -565,6 +594,49 @@ mod tests {
         assert!(!CacheMode::Off.has_writeback());
         assert!(CacheMode::Writes.all_writes_queued() && CacheMode::Full.all_writes_queued());
         assert_eq!(CacheMode::Full.as_str(), "full");
+    }
+
+    #[test]
+    fn the_identifier_rule_matches_what_its_message_claims() {
+        // The message names systemd and D-Bus, so it has to be an identifier rule —
+        // `..` walks out of a path just as `/` does.
+        for bad in ["..", ".", "a/b", "a\"b", "a%b", "a b", "\u{65e5}\u{672c}"] {
+            let mut c = with(vec![mount("placeholder", "/mnt/one")]);
+            c.mounts[0].name = bad.into();
+            assert!(c.validate().is_err(), "{bad:?} should be rejected");
+        }
+        for good in ["photos", "backup-2", "my_mount", "media.tv"] {
+            let mut c = with(vec![mount("placeholder", "/mnt/one")]);
+            c.mounts[0].name = good.into();
+            assert!(c.validate().is_ok(), "{good:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn a_padded_remote_is_rejected_rather_than_stored_unusable() {
+        let mut c = with(vec![mount("a", "/mnt/one")]);
+        c.mounts[0].remote = " backup ".into();
+        assert_eq!(
+            c.mounts[0].fs_spec(),
+            " backup :",
+            "what would reach rclone"
+        );
+        assert!(
+            c.validate().is_err(),
+            "rclone rejects an edge-padded config name"
+        );
+        // Interior spaces are legal to rclone, so do not over-reject.
+        c.mounts[0].remote = "my backup".into();
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn a_relative_rclone_path_override_is_rejected() {
+        let mut c = with(vec![mount("a", "/mnt/one")]);
+        c.global.rclone_path = Some(PathBuf::from("./rclone"));
+        assert!(c.validate().is_err(), "would run from the process CWD");
+        c.global.rclone_path = Some(PathBuf::from("/usr/local/bin/rclone"));
+        assert!(c.validate().is_ok());
     }
 
     #[test]

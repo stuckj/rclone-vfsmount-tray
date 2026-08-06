@@ -4,11 +4,25 @@
 //! output parsers are tested end-to-end without needing rclone installed. The stub emits
 //! the exact output a real rclone v1.75.0 produces — captured, not invented.
 //!
-//! Its own integration test binary because it manipulates `PATH`, which is
-//! process-global; keeping it separate stops that racing other tests.
+//! Serialised, because two races make it flaky otherwise — measured at 2/20 runs.
 
 use rvt_core::rclone::{Rclone, RcloneError, MINIMUM_VERSION};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+
+/// Serialises this binary. Two races, one lock:
+///
+/// * The write fd for one stub is still open when another test forks; the child inherits
+///   it (`O_CLOEXEC` closes on exec, not fork) and Linux refuses to `execve` a file any
+///   process holds open for writing — ETXTBSY.
+/// * `discovery_finds_rclone_on_path` calls `set_var`, and `setenv` can realloc `environ`
+///   under a concurrent `getenv` or fork.
+static STUB_LOCK: Mutex<()> = Mutex::new(());
+
+fn serialised() -> MutexGuard<'static, ()> {
+    // A panicking test must not wedge the rest of the file.
+    STUB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Real `rclone version` output, from the machine used in #9.
 const VERSION_OUTPUT: &str = r#"rclone v1.75.0
@@ -28,6 +42,7 @@ const CONFIG_PATHS_OUTPUT: &str = "Config file: /home/user/.config/rclone/rclone
 
 struct Stub {
     dir: PathBuf,
+    _guard: MutexGuard<'static, ()>,
 }
 
 impl Stub {
@@ -42,6 +57,7 @@ impl Stub {
 
     /// Write a stub `rclone` that reports `version` and canned subcommand output.
     fn build(tag: &str, version: &str, fail_paths: bool) -> Self {
+        let _guard = serialised();
         let dir = std::env::temp_dir().join(format!("rvt-stub-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -73,7 +89,7 @@ esac
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        Stub { dir }
+        Stub { dir, _guard }
     }
 
     fn bin(&self) -> PathBuf {

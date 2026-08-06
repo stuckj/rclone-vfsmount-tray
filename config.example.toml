@@ -59,14 +59,16 @@ mount_point = "/home/you/mnt/photos"
 
 # How much rclone caches locally. This is the setting that matters most:
 #
-#   off      no cache. Writes stream straight through and are invisible to this tool.
-#   minimal  cache metadata and read-write opens; write-only opens still stream.
+#   off      no cache. Writes stream straight to the remote.
+#   minimal  read-write opens, and any file already cached, go through the cache;
+#            write-only opens of uncached files still stream.
 #   writes   cache writes locally and upload in the background.  <- default
 #   full     cache reads as well, so re-reads are local.
 #
-# Only `writes` and `full` give a write-back queue, which is what upload progress is
-# derived from. Under `off` and `minimal`, "nothing pending" does not mean "nothing in
-# flight".
+# `off` has no write-back queue at all. `minimal` has one, but not every write reaches
+# it. Only `writes` and `full` put every write through the queue, which is what upload
+# progress is derived from — so under `off` and `minimal`, "nothing pending" does not
+# mean "nothing in flight".
 cache_mode = "writes"
 
 # Cache limits, in rclone's syntax.

@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Nix
+result
+result-*
+.direnv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local scratch
+/scratch/

@@ -1,0 +1,26 @@
+[package]
+name = "rvt-core"
+description = "Core logic for rclone-vfsmount-tray: rc API models and mount supervision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Pure Rust only. This crate must never link a system C library — that is what lets
+# tier-1 CI lint and test it (plus the service and tray) on a bare runner with no
+# `apt-get install` step. If a dependency drags in a system library, CI breaking is
+# the intended alarm.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Pure Rust (a normal lib plus the `thiserror-impl` proc-macro; no `links` key and no
+# -sys dependency anywhere in its tree), so the no-system-libraries rule holds.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Reports the keys a deserialize silently dropped. This is what makes the fixture
+# tests an actual wire-format guard: without it a field the model fails to read just
+# takes its default, and every test still passes. See tests/fixtures.rs.
+serde_ignored = "0.1"

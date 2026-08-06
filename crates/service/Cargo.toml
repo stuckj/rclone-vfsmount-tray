@@ -1,0 +1,33 @@
+[package]
+name = "rclone-vfsmount-trayd"
+description = "Service that owns rclone VFS mounts and serves their state over D-Bus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "rclone-vfsmount-trayd"
+path = "src/main.rs"
+
+# Pure Rust — no GUI libraries, no ksni. This runs headless as a systemd user
+# service and must work with no graphical session at all.
+#
+# NOTE: most of these are not referenced by the stub in src/main.rs yet. They are
+# declared deliberately, not by accident: they are what the tier-1 CI job actually
+# compiles, so if any of them ever starts pulling in a system C library, CI breaks on
+# a bare runner and we find out immediately. Do not prune them as "unused" — that
+# disarms the tripwire. They are all used by the issues that fill this crate in
+# (#12, #17, #40).
+[dependencies]
+rvt-core = { path = "../core" }
+tokio = { workspace = true }
+zbus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

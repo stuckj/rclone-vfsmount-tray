@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Advisories are published continuously; without this the audit job only runs
+    # when somebody happens to open a PR.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Tier 1: fast pure-logic tests + lint.
+  #
+  # `rvt-core`, the service and the tray link NO system C libraries — ksni 0.3 speaks
+  # StatusNotifierItem over zbus, and everything else is pure Rust — so this runs on a
+  # bare runner with no `apt-get install` step at all. If a dependency ever drags a
+  # system library into one of those three crates, this job failing is the intended
+  # alarm, which is why their manifests declare deps the stubs do not yet reference.
+  #
+  # Third-party actions are pinned to full commit SHAs: a tag is mutable, and
+  # `dtolnay/rust-toolchain@stable` is a *branch*, so either would let an upstream
+  # change execute in a workflow that can read the repository. The trailing comment
+  # records what each SHA actually resolves to, which is not always a release tag.
+  lint-test:
+    name: lint + unit tests (no system deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag v2 (annotated) -> this commit
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      # --locked throughout: Cargo.lock is committed, and without this CI silently
+      # resolves newer semver-compatible dependencies than the lockfile pins, so the
+      # lockfile would be enforced by nothing.
+      #
+      # --workspace covers the GTK crate too. It is excluded from default-members so
+      # a bare `cargo build` needs no GTK headers, but it declares no `gtk4`
+      # dependency yet, so it lints for free here. When `gtk4` lands this must move
+      # to the Nix job (#6) or gain the system packages.
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: unit + fixture tests
+        run: cargo test --locked --workspace
+
+      - name: shellcheck
+        run: |
+          mapfile -t scripts < <(find scripts -name '*.sh' -type f 2>/dev/null || true)
+          if [ ${#scripts[@]} -gt 0 ]; then
+            shellcheck "${scripts[@]}"
+          else
+            echo "no shell scripts yet, skipping"
+          fi
+
+  # Proves the declared `rust-version` is real.
+  #
+  # RUSTUP_TOOLCHAIN is set explicitly and deliberately: `rust-toolchain.toml` in the
+  # working directory takes precedence over the toolchain rustup was told to default
+  # to, so installing 1.87 and setting it default is NOT enough — cargo would quietly
+  # run on stable and this job would prove nothing. That is exactly the failure mode
+  # it exists to catch, so it must not have it itself.
+  msrv:
+    name: build at declared MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          v=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          if [ -z "$v" ]; then echo "::error::could not read rust-version"; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "declared MSRV: $v"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag v2 (annotated) -> this commit
+      # VERSION comes via env rather than being interpolated into the script body:
+      # it is read from the PR's own Cargo.toml, so textual interpolation is the
+      # classic injection shape even though the blast radius here is nil.
+      - name: Confirm the override actually took
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+          VERSION: ${{ steps.msrv.outputs.version }}
+        run: |
+          actual=$(rustc --version)
+          echo "building with: $actual"
+          case "$actual" in
+            *"$VERSION"*) ;;
+            *) echo "::error::expected $VERSION, got $actual"; exit 1 ;;
+          esac
+      - name: check at MSRV
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+        run: cargo check --locked --workspace --all-targets
+
+  # rc access is equivalent to shell access as the rclone user, so a compromised
+  # dependency in this tree is a serious matter.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@cb33e69fad06166ca28a42b2575e4dadabf62ee8 # v2.85.8
+        with:
+          tool: cargo-audit
+      # Vulnerabilities, unsound advisories and yanked crates fail the build.
+      # `unmaintained` is deliberately NOT denied: it fires routinely for
+      # transitive dependencies, and blocking every unrelated PR on one is how a
+      # security check gets switched off entirely. Exceptions belong in audit.toml
+      # with a reason and a date.
+      - run: cargo audit --deny unsound --deny yanked

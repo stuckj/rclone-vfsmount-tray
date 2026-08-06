@@ -1,0 +1,37 @@
+{
+  "bytes": 68153344,
+  "checks": 0,
+  "deletedDirs": 0,
+  "deletes": 0,
+  "elapsedTime": 21.630000688,
+  "errors": 0,
+  "eta": 14,
+  "fatalError": false,
+  "listed": 0,
+  "renames": 0,
+  "retryError": false,
+  "serverSideCopies": 0,
+  "serverSideCopyBytes": 0,
+  "serverSideMoveBytes": 0,
+  "serverSideMoves": 0,
+  "speed": 4475774.33443377,
+  "totalBytes": 134217728,
+  "totalChecks": 0,
+  "totalTransfers": 1,
+  "transferTime": 15.241993929,
+  "transferring": [
+    {
+      "bytes": 68153344,
+      "dstFs": "/home/claude/.claude/jobs/f70669bc/tmp/spike9/remote-store",
+      "eta": 14,
+      "group": "global_stats",
+      "name": "big.bin",
+      "percentage": 50,
+      "size": 134217728,
+      "speed": 4471532.801626206,
+      "speedAvg": 4475791.878358628,
+      "srcFs": ":local{8un-i}:/home/claude/.claude/jobs/f70669bc/tmp/spike9/cache/vfs/local/home/claude/.claude/jobs/f70669bc/tmp/spike9/remote-store"
+    }
+  ],
+  "transfers": 0
+}

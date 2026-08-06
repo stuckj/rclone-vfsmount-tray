@@ -1,0 +1,49 @@
+{
+  "bytes": 71786496,
+  "checks": 0,
+  "deletedDirs": 0,
+  "deletes": 0,
+  "elapsedTime": 22.514820607,
+  "errors": 0,
+  "eta": 28,
+  "fatalError": false,
+  "listed": 0,
+  "renames": 0,
+  "retryError": false,
+  "serverSideCopies": 0,
+  "serverSideCopyBytes": 0,
+  "serverSideMoveBytes": 0,
+  "serverSideMoves": 0,
+  "speed": 4580794.362700177,
+  "totalBytes": 201326592,
+  "totalChecks": 0,
+  "totalTransfers": 2,
+  "transferTime": 16.105343433,
+  "transferring": [
+    {
+      "bytes": 39940096,
+      "dstFs": "/home/claude/.claude/jobs/f70669bc/tmp/spike9/remote-store",
+      "eta": 24,
+      "group": "global_stats",
+      "name": "vfsfile.bin",
+      "percentage": 39,
+      "size": 100663296,
+      "speed": 2480040.3266950483,
+      "speedAvg": 2483901.902853864,
+      "srcFs": ":local{8un-i}:/home/claude/.claude/jobs/f70669bc/tmp/spike9/cache/vfs/local/home/claude/.claude/jobs/f70669bc/tmp/spike9/remote-store"
+    },
+    {
+      "bytes": 31846400,
+      "dstFs": "/home/claude/.claude/jobs/f70669bc/tmp/spike9/other-dst",
+      "eta": 32,
+      "group": "job/12",
+      "name": "unrelated.bin",
+      "percentage": 31,
+      "size": 100663296,
+      "speed": 2096692.344269385,
+      "speedAvg": 2096426.9324740856,
+      "srcFs": "/home/claude/.claude/jobs/f70669bc/tmp/spike9/other-src"
+    }
+  ],
+  "transfers": 0
+}

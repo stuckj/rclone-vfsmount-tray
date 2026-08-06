@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/service",
+    "crates/tray",
+    "crates/gtk",
+]
+
+# `crates/gtk` is deliberately excluded from the default set. It is the only crate
+# that links system C libraries (GTK4), so a bare `cargo build` / `cargo test` on a
+# machine without the GTK development headers would fail for reasons that have
+# nothing to do with what is being changed. It is built explicitly with
+# `cargo build -p rclone-vfsmount-tray-gtk`. CI lints it today because it declares no
+# `gtk4` dependency yet; once it does, it moves to the Nix job (#6), which will have
+# the headers. See the note in .github/workflows/ci.yml.
+default-members = [
+    "crates/core",
+    "crates/service",
+    "crates/tray",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Floor imposed by the dependency tree, not a preference: zbus 5 and the zvariant
+# crates declare 1.87. Verified by the `msrv` CI job, so this cannot quietly rot —
+# it was briefly declared as 1.82, which nothing could have built.
+rust-version = "1.87"
+license = "MIT"
+repository = "https://github.com/stuckj/rclone-vfsmount-tray"
+authors = ["John Stucklen"]
+
+# Shared dependency versions, referenced from member crates with `.workspace = true`.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal", "fs", "net"] }
+zbus = "5"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+
+[profile.release]
+lto = "thin"
+strip = true

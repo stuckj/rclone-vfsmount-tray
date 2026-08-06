@@ -1,0 +1,13 @@
+{
+  "queue": [
+    {
+      "delay": 3,
+      "expiry": -0.32414583,
+      "id": 1,
+      "name": "big.bin",
+      "size": 134217728,
+      "tries": 1,
+      "uploading": true
+    }
+  ]
+}

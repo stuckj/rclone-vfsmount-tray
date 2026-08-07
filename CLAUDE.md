@@ -69,8 +69,19 @@ reasoning. Code comments state the rule and point there.
 
 ## Conventions
 
-Comments are restrained — roughly 10-20% of lines. Explain what would otherwise be
-re-derived, never what the code already says.
+Comments describe the code, not the project's history. Explain what a reader would
+otherwise re-derive — a non-obvious ordering constraint, an external behaviour depended
+on, an alternative that looks right and is not.
+
+Two things never belong in a comment: general best-practice advice, and development
+history. What broke while building it, which review caught it, what an earlier design
+assumed, how often a test flaked — all of that goes in the commit message, the PR, or
+the issue, where it is permanent and searchable and out of the reader's way. Prefer
+naming the constraint over narrating the discovery.
+
+There is no target ratio. When something is genuinely subtle, explain it at length; that
+is rare but real. Do not pad toward a percentage, and do not cut a comment that is doing
+real work to hit one.
 
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.

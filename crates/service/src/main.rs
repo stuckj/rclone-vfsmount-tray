@@ -5,6 +5,9 @@
 //!
 //! Scaffolding only; see #12, #17, #40.
 
+mod supervisor;
+mod systemd;
+
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -29,7 +32,23 @@ struct Args {
     foreground: bool,
 }
 
-fn main() -> anyhow::Result<()> {
+/// Where rc sockets go. `XDG_RUNTIME_DIR` is per-user and mode 0700, which is what keeps
+/// the sockets unreachable by other logins; `/tmp` is not a substitute, so its absence is
+/// an error rather than something to paper over with a fallback.
+fn runtime_dir() -> anyhow::Result<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "XDG_RUNTIME_DIR is not set. It is normally provided by the session; \
+                 running under systemd --user supplies it."
+            )
+        })?;
+    Ok(std::path::PathBuf::from(base).join("rclone-vfsmount-tray"))
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let filter =
@@ -45,6 +64,29 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
-    tracing::warn!("not implemented yet — see issues #12, #17 and #40");
+
+    let config_path = match &args.config {
+        Some(p) => p.clone(),
+        None => rvt_core::Config::default_path()?,
+    };
+    let config = std::sync::Arc::new(rvt_core::Config::load(&config_path)?);
+    let rclone = rvt_core::Rclone::discover(config.global.rclone_path.as_deref())?;
+    tracing::info!(path = %rclone.path().display(), version = %rclone.version(), "found rclone");
+
+    let units = systemd::dbus::SystemdUnits::connect().await?;
+    let sup = supervisor::SystemdSupervisor::new(
+        config.clone(),
+        rclone.path().to_path_buf(),
+        units,
+        runtime_dir()?,
+    );
+
+    // Reconcile before doing anything else. The service may have restarted while its
+    // mounts stayed up, and a mount somebody else started is still worth reporting.
+    for found in rvt_core::supervisor::MountSupervisor::reconcile(&sup).await? {
+        tracing::info!(name = %found.name, state = ?found.state, "found mount");
+    }
+
+    tracing::warn!("serving is not implemented yet — see issues #12 and #40");
     Ok(())
 }

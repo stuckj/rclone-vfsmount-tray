@@ -209,9 +209,21 @@ pub mod dbus {
             Box::pin(async move {
                 let mgr = self.manager().await?;
                 // A unit that was never started is not loaded at all, and `GetUnit`
-                // errors rather than reporting a state — that is Inactive, not a fault.
-                let Ok(path) = mgr.get_unit(unit).await else {
-                    return Ok(UnitStatus::Inactive);
+                // answers `NoSuchUnit` rather than reporting a state — that is Inactive,
+                // not a fault.
+                //
+                // Every *other* failure must be reported. Treating an unreachable manager
+                // as "no unit" would make every live mount resolve to `Foreign`, telling
+                // the user their own mounts belong to somebody else and refusing to
+                // unmount them, rather than saying the init system cannot be reached.
+                let path = match mgr.get_unit(unit).await {
+                    Ok(p) => p,
+                    Err(zbus::Error::MethodError(name, _, _))
+                        if name.as_str().ends_with(".NoSuchUnit") =>
+                    {
+                        return Ok(UnitStatus::Inactive)
+                    }
+                    Err(e) => return Err(supervision(&format!("looking up unit {unit}"), e)),
                 };
                 let proxy = UnitProxy::builder(&self.conn)
                     .path(path)

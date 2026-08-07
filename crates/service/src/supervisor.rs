@@ -42,6 +42,15 @@ pub struct SystemdSupervisor<M: UnitManager> {
     /// Where rc sockets live — `$XDG_RUNTIME_DIR/rclone-vfsmount-tray`.
     runtime_dir: PathBuf,
     ready_timeout: Duration,
+    /// How long to wait for a mount point to be released after stopping its unit.
+    gone_timeout: Duration,
+    /// How long to wait for systemd to free the unit name.
+    unit_gone_timeout: Duration,
+    /// Paths to treat as stale. `ENOTCONN` needs a real FUSE daemon that has died, which
+    /// a unit test cannot arrange, so the probe needs a seam or the stale handling cannot
+    /// be tested at all.
+    #[cfg(test)]
+    stale_paths: std::collections::HashSet<PathBuf>,
 }
 
 impl<M: UnitManager> SystemdSupervisor<M> {
@@ -53,6 +62,10 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             mountinfo_path: PathBuf::from("/proc/self/mountinfo"),
             runtime_dir,
             ready_timeout: READY_TIMEOUT,
+            gone_timeout: Duration::from_secs(30),
+            unit_gone_timeout: Duration::from_secs(35),
+            #[cfg(test)]
+            stale_paths: std::collections::HashSet::new(),
         }
     }
 
@@ -61,6 +74,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     fn with_test_overrides(mut self, mountinfo_path: PathBuf, ready_timeout: Duration) -> Self {
         self.mountinfo_path = mountinfo_path;
         self.ready_timeout = ready_timeout;
+        self.gone_timeout = Duration::from_millis(300);
+        self.unit_gone_timeout = Duration::from_millis(300);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_stale(mut self, paths: &[&Path]) -> Self {
+        self.stale_paths = paths.iter().map(|p| p.to_path_buf()).collect();
         self
     }
 
@@ -122,7 +143,11 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// When a FUSE daemon dies without unmounting, the kernel keeps the mountinfo entry
     /// and every operation on it fails with `ENOTCONN`. It is indistinguishable from a
     /// healthy mount by path alone, so it has to be probed.
-    async fn is_stale(path: &Path) -> bool {
+    async fn is_stale(&self, path: &Path) -> bool {
+        #[cfg(test)]
+        if !self.stale_paths.is_empty() {
+            return self.stale_paths.contains(path);
+        }
         let p = path.to_path_buf();
         // A probe that never answers is a mount that is not serving, which is what the
         // caller wants to know — but it is not the *stale* case, which is specifically a
@@ -153,7 +178,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         // kernel is concerned. Calling it Foreign would be doubly wrong: it is ours, and
         // it would be neither startable (something is already there) nor stoppable
         // (foreign mounts refuse to unmount without force).
-        if live && Self::is_stale(&point).await {
+        if live && self.is_stale(&point).await {
             return Ok(MountState::Failed {
                 reason: format!(
                     "{} is mounted but not responding — the rclone serving it exited \
@@ -370,12 +395,20 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 // A mount point the kernel still lists but nothing is serving. Left
                 // alone it blocks every future attempt, since rclone cannot mount over
                 // it — so clear it rather than reporting success onto a dead mount.
-                if Self::is_stale(&point).await {
+                if self.is_stale(&point).await {
                     Self::fusermount(&point, false).await?;
-                } else {
-                    // Already serving, however it got there. This is the path taken
-                    // after a service restart, when every mount is already up.
+                } else if self.units.status(&m.unit_name()).await? != UnitStatus::Inactive {
+                    // Already serving, and it is ours. This is the path taken after a
+                    // service restart, when every mount is already up.
                     return Ok(());
+                } else {
+                    // Something else is mounted there. Reporting success would tell the
+                    // user their configured cache mode, read-only flag and rc socket were
+                    // applied, when what is serving is a process we did not start.
+                    return Err(SupervisorError::NotManaged(format!(
+                        "{name}: {} is already mounted by something we did not start",
+                        point.display()
+                    )));
                 }
             }
 
@@ -395,7 +428,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // the name, so wait for it rather than reporting a failure the user cannot
             // act on. This is the ordinary remount gesture.
             if unit == UnitStatus::Deactivating {
-                self.await_unit_gone(m, Duration::from_secs(35)).await?;
+                self.await_unit_gone(m, self.unit_gone_timeout).await?;
             }
 
             // rclone binds its rc socket with a bare listen and will not replace a stale
@@ -463,20 +496,24 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // is unknown is the correct default rather than a gap.
 
             if ours {
+                // `StopUnit` only enqueues a job, so the unit has not stopped — let alone
+                // failed — when this returns. Clearing the failed state has to wait until
+                // it has actually settled, or it clears nothing: rclone exiting non-zero
+                // on SIGTERM, or outliving the 30s stop timeout while flushing a large
+                // write-back queue, both land in `failed` *after* an eager reset, leaving
+                // a mount the user just unmounted reporting as failed.
                 self.units.stop(&m.unit_name()).await?;
-                // A stopped unit that failed stays loaded, and `StartTransientUnit`
-                // refuses a name that is still loaded — so without this the mount could
-                // never be started again.
-                self.units.reset_failed(&m.unit_name()).await?;
                 if !live {
                     // Nothing was mounted; stopping the unit is the whole job. This is the
                     // path for a unit that was restart-looping without ever serving.
-                    return self.await_unit_gone(m, Duration::from_secs(35)).await;
+                    self.await_unit_gone(m, self.unit_gone_timeout).await?;
+                    return self.units.reset_failed(&m.unit_name()).await;
                 }
-                if self.await_gone(m, Duration::from_secs(30)).await {
+                if self.await_gone(m, self.gone_timeout).await {
                     // The mount point is released, but the name is not free until systemd
                     // finishes the job — and a remount immediately after would collide.
-                    return self.await_unit_gone(m, Duration::from_secs(35)).await;
+                    self.await_unit_gone(m, self.unit_gone_timeout).await?;
+                    return self.units.reset_failed(&m.unit_name()).await;
                 }
             }
 
@@ -484,6 +521,26 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // point, or it is a stale point left by an rclone that died.
             if !mountinfo::is_mounted_at(&self.live_mounts(), &point) {
                 return Ok(());
+            }
+            // Ownership was decided from the unit name; the release acts on a path. Those
+            // can disagree — a hand-edited `mount_point` (the documented workflow until
+            // #42) leaves a unit serving one path while the config names another, and
+            // releasing blind would tear down a filesystem the user never asked about,
+            // possibly one another unit of ours is serving.
+            let live_now = self.live_mounts();
+            let entry = live_now
+                .iter()
+                .find(|e| e.is_rclone() && e.mount_point == point);
+            if let Some(e) = entry {
+                if e.source != m.fs_spec() {
+                    return Err(SupervisorError::NotManaged(format!(
+                        "{name}: {} is serving {}, not {} — refusing to unmount something \
+                     this mount does not own",
+                        point.display(),
+                        e.source,
+                        m.fs_spec()
+                    )));
+                }
             }
             Self::fusermount(&point, false).await?;
             if self.await_gone(m, Duration::from_secs(10)).await {
@@ -975,6 +1032,109 @@ mod tests {
 
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&real);
+    }
+
+    #[tokio::test]
+    async fn a_mount_point_that_no_longer_responds_is_reported_as_failed() {
+        // The kernel still lists it, so a path check alone says "mounted". Every
+        // operation on it returns ENOTCONN.
+        let s = supervisor("stale", true, &[], UnitStatus::Inactive);
+        let point = mount_point("stale");
+        let s = s.with_stale(&[&point]);
+        match s.state("backup").await.unwrap() {
+            MountState::Failed { reason } => {
+                assert!(reason.contains("not responding"), "{reason}");
+            }
+            other => panic!("a dead mount point must not read as {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mounting_over_a_dead_mount_point_clears_it_first() {
+        // rclone cannot mount over an occupied path, so without this the mount is
+        // unrecoverable from the applet: every attempt returns success onto a dead mount.
+        let s = supervisor("staleclear", true, &[], UnitStatus::Inactive);
+        let point = mount_point("staleclear");
+        let s = s.with_stale(&[&point]);
+        let e = s
+            .mount("backup")
+            .await
+            .expect_err("there is no real filesystem here to release");
+        let msg = e.to_string();
+        assert!(
+            !msg.contains("already mounted by something we did not start"),
+            "a stale point is ours to clear, not somebody else's mount: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mounting_waits_out_a_unit_that_is_still_stopping() {
+        // The remount gesture. rclone can hold the unit name for the whole 30s stop
+        // timeout while it flushes, and starting into that returns systemd's raw
+        // "unit already exists".
+        let s = supervisor("remount", false, &[], UnitStatus::Deactivating);
+        let e = s.mount("backup").await.expect_err("the fake never settles");
+        match e {
+            SupervisorError::Supervision { context, .. } => assert!(
+                context.contains("still shutting down"),
+                "it must wait for the name, not collide with it: {context}"
+            ),
+            other => panic!("expected a wait-then-give-up, got {other:?}"),
+        }
+        assert!(
+            s.units.started.lock().unwrap().is_empty(),
+            "nothing may be started while the old unit still holds the name"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_unit_ends_the_wait_instead_of_burning_the_timeout() {
+        // Without the early exit the user waits the full readiness window to be told
+        // something systemd already knew.
+        let s = supervisor("earlyexit", false, &[], UnitStatus::Failed).with_test_overrides(
+            fixture("earlyexit2", &mountinfo_with(&[])),
+            Duration::from_secs(20),
+        );
+        let started = std::time::Instant::now();
+        let _ = s.mount("backup").await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}: a unit that has already failed will never become ready",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn unmount_refuses_a_path_serving_a_different_remote() {
+        // Ownership is decided from the unit name but the release acts on a path. A
+        // hand-edited mount_point can put those out of step, and releasing blind would
+        // tear down a filesystem the user never named.
+        let mp = mount_point("mismatch");
+        let mut c = Config::default();
+        c.mounts.push(Mount {
+            remote: "somethingelse".into(),
+            ..config_with_backup(mp.clone()).mounts[0].clone()
+        });
+        let units = FakeUnits::default();
+        *units.status.lock().unwrap() = UnitStatus::Active;
+        let s = SystemdSupervisor::new(
+            Arc::new(c),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            std::env::temp_dir().join(format!("rvt-run-mm-{}", std::process::id())),
+        )
+        .with_test_overrides(
+            // mountinfo says backup:pictures is what is actually there.
+            fixture("mismatch", &mountinfo_with(&[&mp.to_string_lossy()])),
+            Duration::from_millis(300),
+        );
+
+        match s.unmount("backup", false).await {
+            Err(SupervisorError::NotManaged(why)) => {
+                assert!(why.contains("is serving"), "{why}");
+            }
+            other => panic!("expected a refusal naming the mismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

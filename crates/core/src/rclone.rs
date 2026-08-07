@@ -13,9 +13,16 @@ use std::process::Command;
 /// Feature availability is detected with `rc/list` (#13), not inferred from a version —
 /// that is the point of #13. This exists only to reject an rclone so old that nothing
 /// downstream could work. Behaviour has been verified against **1.75.0** (#9).
+///
+/// 1.61 rather than 1.60, because every mount is started with
+/// `--rc-addr unix://<path>`. The `unix://` prefix is handled by `lib/http`, which
+/// arrived in 1.61; 1.60 registers `--rc-addr` as a plain address and binds it with
+/// `net.Listen("tcp", …)`, so rclone dies before mounting with "too many colons in
+/// address". Admitting 1.60 would mean admitting a version on which no mount can start
+/// at all — silently, since discovery would accept it.
 pub const MINIMUM_VERSION: Version = Version {
     major: 1,
-    minor: 60,
+    minor: 61,
     patch: 0,
 };
 
@@ -327,7 +334,7 @@ mod tests {
         assert!("".parse::<Version>().is_err());
         assert!("not-a-version".parse::<Version>().is_err());
 
-        let old: Version = "1.59.9".parse().unwrap();
+        let old: Version = "1.60.9".parse().unwrap();
         let new: Version = "1.75.0".parse().unwrap();
         assert!(old < MINIMUM_VERSION && new > MINIMUM_VERSION);
     }

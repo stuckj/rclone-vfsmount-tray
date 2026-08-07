@@ -56,12 +56,14 @@ impl Tier {
         self == Tier::T1
     }
 
-    /// Whether this tier can distinguish a file being uploaded from one merely queued.
+    /// Whether this tier can mark a *particular file* as uploading rather than queued.
     ///
     /// T4 cannot: `Dirty` stays true until the upload completes, so queued and uploading
-    /// are indistinguishable on disk.
+    /// are indistinguishable on disk. Neither can T3 — `vfs/stats` reports
+    /// `uploadsInProgress`/`uploadsQueued` as aggregate counts and never names a file, so
+    /// there is nothing there to mark.
     pub fn has_in_flight_flag(self) -> bool {
-        matches!(self, Tier::T1 | Tier::T2 | Tier::T3)
+        matches!(self, Tier::T1 | Tier::T2)
     }
 }
 
@@ -125,14 +127,18 @@ impl Capabilities {
         self.degraded.as_deref()
     }
 
-    /// Whether the outstanding-bytes question can be answered at all.
+    /// Whether **rc** can say what is outstanding, i.e. whether `vfs/queue` is available.
     ///
-    /// `vfs/queue` enumerates the queue; failing that the disk scan always works, so the
-    /// only thing that could make this false is an rc endpoint that answers but lacks
-    /// `vfs/queue` *and* a cache directory we cannot read. Kept as a predicate so callers
-    /// ask the capability set rather than inferring it from a single tier.
-    pub fn can_answer_outstanding(&self) -> bool {
-        self.has("vfs/queue") || self.tier() == Tier::T4
+    /// Deliberately not "can the question be answered at all": the on-disk scan answers it
+    /// with no rc whatsoever, so that version would be true unconditionally and tell a
+    /// caller nothing. Phrased this way it is also monotonic — learning more about an
+    /// rclone can only ever turn it from false to true. The earlier phrasing made a build
+    /// with `vfs/stats` look *less* capable than one with no rc at all, which inverts
+    /// DESIGN.md: `vfs/stats` is what hands the cache paths to the scanner.
+    ///
+    /// A `false` here means fall to the scan, not that the answer is unavailable.
+    pub fn rc_can_answer_outstanding(&self) -> bool {
+        self.has("vfs/queue")
     }
 
     pub fn has(&self, command: &str) -> bool {
@@ -248,14 +254,13 @@ mod tests {
         let c = Capabilities::from_paths(["core/stats", "vfs/queue"]);
         assert_eq!(c.tier(), Tier::T1);
         assert!(!c.tier().meets_the_bar());
-        assert!(c.can_answer_outstanding(), "vfs/queue is right there");
+        assert!(c.rc_can_answer_outstanding(), "vfs/queue is right there");
 
-        // No rc at all: the disk scan answers.
-        assert!(Capabilities::default().can_answer_outstanding());
+        // No rc at all: nothing to ask, and the disk scan is what answers.
+        assert!(!Capabilities::default().rc_can_answer_outstanding());
 
-        // An rc endpoint with neither the queue nor anything above it.
         let thin = Capabilities::from_paths(["core/stats"]);
-        assert!(!thin.can_answer_outstanding());
+        assert!(!thin.rc_can_answer_outstanding());
     }
 
     #[test]
@@ -286,10 +291,35 @@ mod tests {
     }
 
     #[test]
+    fn asking_rc_about_the_queue_is_monotonic() {
+        // Learning more about an rclone must never turn this from true to false.
+        assert!(!Capabilities::default().rc_can_answer_outstanding());
+        assert!(!Capabilities::from_paths(["vfs/stats"]).rc_can_answer_outstanding());
+        assert!(!Capabilities::from_paths(["core/stats", "vfs/stats"]).rc_can_answer_outstanding());
+        assert!(Capabilities::from_paths(["vfs/queue"]).rc_can_answer_outstanding());
+        assert!(full_house().rc_can_answer_outstanding());
+    }
+
+    #[test]
+    fn forcing_an_upload_needs_the_endpoint_that_does_it() {
+        // Offering the action without the endpoint turns a missing feature into a 404 the
+        // user sees as an error.
+        assert!(full_house().can_force_upload());
+        assert!(
+            !Capabilities::from_paths(["vfs/queue"]).can_force_upload(),
+            "the queue alone cannot force an upload"
+        );
+        assert!(!Capabilities::default().can_force_upload());
+    }
+
+    #[test]
     fn t4_cannot_tell_queued_from_uploading() {
         // `Dirty` stays true until the upload completes, so the two are the same on disk.
         assert!(!Tier::T4.has_in_flight_flag());
         assert!(Tier::T2.has_in_flight_flag());
+        assert!(Tier::T1.has_in_flight_flag());
+        // T3 has counts, not files, so it has nothing to mark as in flight.
+        assert!(!Tier::T3.has_in_flight_flag());
     }
 
     #[test]

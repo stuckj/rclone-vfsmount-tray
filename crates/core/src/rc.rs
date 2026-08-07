@@ -245,8 +245,9 @@ impl RcClient {
             }
 
             // A private socket in a directory others can write to is not private: they
-            // cannot alter it, but they can unlink it and put their own there. This is
-            // the check that makes the whole path trustworthy rather than just its leaf.
+            // cannot alter it, but they can unlink it and put their own there. Only the
+            // immediate parent is checked, and only its mode — the peer-credential check
+            // after connecting is what makes the path as a whole trustworthy.
             if let Some(dir) = self.socket.parent() {
                 match std::fs::metadata(dir) {
                     Ok(d) if d.mode() & 0o022 != 0 => {
@@ -758,15 +759,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Accepts, waits, then resets — a crash-looping rclone. Counts connections so a
+    /// test can tell how many attempts actually ran.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn the_timeout_bounds_the_whole_call_not_each_attempt() {
-        // The peer must fail *slowly and repeatedly*, not hang. A peer that never answers
-        // produces exactly one attempt — the timeout arm does not retry — so it cannot
-        // tell a per-attempt budget from a whole-call one. Accepting and then resetting
-        // after a delay is a transport fault, which does retry, so the budget is the only
-        // thing that can stop the loop. This is what a crash-looping rclone looks like.
-        let dir = std::env::temp_dir().join(format!("rvt-slowfail-{}", std::process::id()));
+    async fn slow_failing_server(
+        tag: &str,
+        delay: Duration,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("rvt-slowfail-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -774,16 +781,79 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        let server = tokio::spawn(async move {
+        let connects = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = connects.clone();
+        let handle = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    tokio::time::sleep(delay).await;
                     drop(stream);
                 });
             }
         });
+        (dir, socket, connects, handle)
+    }
 
-        let budget = Duration::from_millis(400);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_peer_that_never_answers_times_out() {
+        // Pins the timeout arm itself. Without this nothing in the suite produces a
+        // `Timeout` from a real call, so the whole expiry path could be removed unnoticed
+        // — and a wedged rclone would freeze every poll tick forever.
+        let dir = std::env::temp_dir().join(format!("rvt-wedged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("rc.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let held = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                keep.push(s);
+            }
+        });
+
+        let budget = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let e = RcClient::new(&socket)
+            .with_limits(budget, 3)
+            .call::<Version>("core/version", serde_json::json!({}))
+            .await
+            .expect_err("a peer that never answers must time out");
+        let elapsed = started.elapsed();
+
+        match e {
+            RcError::Timeout { after, .. } => assert_eq!(after, budget),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < budget * 3,
+            "took {elapsed:?} for a {budget:?} budget"
+        );
+
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_timeout_bounds_the_whole_call_not_each_attempt() {
+        use std::sync::atomic::Ordering;
+
+        // The parameters matter. The peer must fail slowly enough that several attempts
+        // do not fit in the budget, and the budget must leave room for a second attempt
+        // after the first backoff — otherwise the loop stops at the backoff guard after
+        // one attempt and a per-attempt budget is indistinguishable from a whole-call one.
+        //
+        // 250ms failures, 600ms budget: attempt 1 fails at 250ms, backoff 100ms, attempt 2
+        // starts at 350ms with 250ms left and is cut off by the budget at 600ms. A
+        // per-attempt budget would instead give each attempt its own 600ms.
+        let delay = Duration::from_millis(250);
+        let budget = Duration::from_millis(600);
+        let (dir, socket, connects, server) = slow_failing_server("budget", delay).await;
+
         let started = std::time::Instant::now();
         let e = RcClient::new(&socket)
             .with_limits(budget, 5)
@@ -791,14 +861,19 @@ mod tests {
             .await
             .expect_err("every attempt fails");
         let elapsed = started.elapsed();
+        let attempts = connects.load(Ordering::SeqCst);
 
         assert!(
-            e.is_unreachable(),
-            "a peer that keeps resetting is unreachable, got {e:?}"
+            attempts >= 2,
+            "only {attempts} attempt(s) ran, so this test cannot distinguish a whole-call \
+             budget from a per-attempt one — the parameters are wrong, not the code"
         );
-        // Five attempts at 300ms each would be 1.5s. The budget is what must stop it.
         assert!(
-            elapsed < budget + Duration::from_millis(250),
+            matches!(e, RcError::Timeout { .. }),
+            "the budget, not the attempt limit, must end this: {e:?}"
+        );
+        assert!(
+            elapsed < budget + delay,
             "the call took {elapsed:?} against a {budget:?} budget — the timeout is being \
              applied per attempt rather than to the whole call"
         );

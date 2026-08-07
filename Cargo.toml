@@ -36,8 +36,13 @@ authors = ["John Stucklen"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal", "fs", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "signal", "fs", "net", "io-util"] }
 zbus = "5"
+# Pure Rust HTTP/1.1. rclone's rc server chunks larger responses, so this is not a
+# place to hand-roll a parser.
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

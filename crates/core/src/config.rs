@@ -974,6 +974,47 @@ mod tests {
     }
 
     #[test]
+    fn extra_args_may_not_add_an_rc_listener() {
+        // The composed argv carries `--rc-no-auth`, which is safe only because the socket
+        // is unreachable to anyone else. `--rc-addr` appends listeners rather than
+        // replacing them, so one here would put an unauthenticated `core/command` and
+        // `config/dump` on the network. This is the boundary, so it is checked in every
+        // form the flag can take.
+        for bad in [
+            vec!["--rc-addr".to_string(), "0.0.0.0:5572".to_string()],
+            vec!["--rc-addr=0.0.0.0:5572".to_string()],
+            vec!["--rc".to_string()],
+            vec!["--rc-no-auth".to_string()],
+            vec!["--rc-user=admin".to_string()],
+            vec!["--rc-web-gui".to_string()],
+        ] {
+            let mut c = Config::default();
+            let mut m = a_mount("backup");
+            m.extra_args = bad.clone();
+            c.mounts.push(m);
+            let e = c
+                .validate()
+                .expect_err(&format!("{bad:?} must be rejected"))
+                .to_string();
+            assert!(e.contains("rc flags"), "{bad:?} gave {e}");
+        }
+
+        // Flags that merely start with the same letters are not rc flags.
+        for ok in [
+            vec!["--rclone-is-not-a-flag".to_string()],
+            vec!["--read-only".to_string()],
+            vec!["--vfs-cache-mode".to_string(), "full".to_string()],
+        ] {
+            let mut c = Config::default();
+            let mut m = a_mount("backup");
+            m.extra_args = ok.clone();
+            c.mounts.push(m);
+            c.validate()
+                .unwrap_or_else(|e| panic!("{ok:?} should be allowed: {e}"));
+        }
+    }
+
+    #[test]
     fn unit_names_are_prefixed_and_survive_valid_characters() {
         assert_eq!(a_mount("backup").unit_name(), "rvt-mount-backup.service");
         // Validation permits these, so they must pass through unchanged — otherwise two

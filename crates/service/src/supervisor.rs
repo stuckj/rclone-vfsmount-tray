@@ -26,6 +26,12 @@ const READY_TIMEOUT: Duration = Duration::from_secs(45);
 const ENOTCONN: i32 = 107;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long to wait on a filesystem call that resolves through a mount point.
+///
+/// Generous relative to a local `stat`, short relative to a poll tick: the point is only
+/// to stop a wedged mount holding the executor, not to diagnose it.
+const FS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Starts rclone mounts as transient systemd units.
 pub struct SystemdSupervisor<M: UnitManager> {
     config: Arc<Config>,
@@ -79,8 +85,36 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     ///
     /// Falls back to the configured path when it cannot be resolved, which is the normal
     /// case before the directory exists.
-    fn resolved_point(m: &Mount) -> PathBuf {
-        std::fs::canonicalize(&m.mount_point).unwrap_or_else(|_| m.mount_point.clone())
+    async fn resolved_point(m: &Mount) -> PathBuf {
+        let raw = m.mount_point.clone();
+        let fallback = raw.clone();
+        Self::off_thread(move || std::fs::canonicalize(&raw).ok())
+            .await
+            .flatten()
+            .unwrap_or(fallback)
+    }
+
+    /// Run a filesystem call off the async executor, and give up on it if it hangs.
+    ///
+    /// Every `stat` here resolves *through* a FUSE mount point. When rclone is gone the
+    /// kernel answers `ENOTCONN`, but when it is alive and not answering — a dropped
+    /// network, a VFS deadlock — the call blocks uninterruptibly, which is the familiar
+    /// "`df` hangs" symptom. On the executor that consumes a worker per wedged mount and
+    /// eventually stops the service answering D-Bus at all, so one bad remote would take
+    /// down every other mount: exactly the failure the per-mount process model exists to
+    /// avoid.
+    ///
+    /// `None` means it did not answer in time. The blocking-pool thread is still stuck —
+    /// nothing can un-stick a blocking `stat` — but the executor is not.
+    async fn off_thread<T, F>(f: F) -> Option<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        match tokio::time::timeout(FS_PROBE_TIMEOUT, tokio::task::spawn_blocking(f)).await {
+            Ok(Ok(v)) => Some(v),
+            _ => None,
+        }
     }
 
     /// Whether a mount point is present but no longer served.
@@ -88,11 +122,17 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// When a FUSE daemon dies without unmounting, the kernel keeps the mountinfo entry
     /// and every operation on it fails with `ENOTCONN`. It is indistinguishable from a
     /// healthy mount by path alone, so it has to be probed.
-    fn is_stale(path: &Path) -> bool {
-        match std::fs::metadata(path) {
+    async fn is_stale(path: &Path) -> bool {
+        let p = path.to_path_buf();
+        // A probe that never answers is a mount that is not serving, which is what the
+        // caller wants to know — but it is not the *stale* case, which is specifically a
+        // dead daemon. Reporting false leaves it as `Mounted`, and the next poll retries.
+        Self::off_thread(move || match std::fs::metadata(&p) {
             Err(e) => e.raw_os_error() == Some(ENOTCONN),
             Ok(_) => false,
-        }
+        })
+        .await
+        .unwrap_or(false)
     }
 
     fn live_mounts(&self) -> Vec<MountEntry> {
@@ -106,14 +146,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// The kernel says whether anything is mounted there; the unit says whether it is
     /// ours. Both are needed — mounted with no unit of ours is precisely a foreign mount.
     async fn resolve(&self, m: &Mount) -> Result<MountState, SupervisorError> {
-        let point = Self::resolved_point(m);
+        let point = Self::resolved_point(m).await;
         let live = mountinfo::is_mounted_at(&self.live_mounts(), &point);
 
         // A mount point left behind by a dead rclone is still "mounted" as far as the
         // kernel is concerned. Calling it Foreign would be doubly wrong: it is ours, and
         // it would be neither startable (something is already there) nor stoppable
         // (foreign mounts refuse to unmount without force).
-        if live && Self::is_stale(&point) {
+        if live && Self::is_stale(&point).await {
             return Ok(MountState::Failed {
                 reason: format!(
                     "{} is mounted but not responding — the rclone serving it exited \
@@ -132,7 +172,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             (true, UnitStatus::Deactivating) => MountState::Unmounting,
             // Ours, and it died with the kernel entry still there. Still ours.
             (true, UnitStatus::Failed) => MountState::Failed {
-                reason: self.units.recent_output(&m.unit_name()).await,
+                reason: self.failure_reason(m).await,
             },
             // Mounted with no unit of ours at all: somebody else started it.
             (true, UnitStatus::Inactive) => MountState::Foreign,
@@ -143,7 +183,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             (false, UnitStatus::Active | UnitStatus::Activating) => MountState::Mounting,
             (false, UnitStatus::Deactivating) => MountState::Unmounting,
             (false, UnitStatus::Failed) => MountState::Failed {
-                reason: self.units.recent_output(&m.unit_name()).await,
+                reason: self.failure_reason(m).await,
             },
             (false, UnitStatus::Inactive) => MountState::Unmounted,
         })
@@ -156,7 +196,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     async fn await_ready(&self, m: &Mount) -> Result<(), SupervisorError> {
         let deadline = std::time::Instant::now() + self.ready_timeout;
         loop {
-            if mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m)) {
+            if mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m).await) {
                 return Ok(());
             }
             // A unit that has already failed will never become ready; waiting out the
@@ -282,10 +322,34 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         }
     }
 
+    /// Wait for the unit to stop occupying its name.
+    ///
+    /// `StopUnit` only enqueues a job, and rclone can hold `TimeoutStopUSec` flushing its
+    /// write-back cache, so the name stays taken well after the mount point is released.
+    async fn await_unit_gone(&self, m: &Mount, timeout: Duration) -> Result<(), SupervisorError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match self.units.status(&m.unit_name()).await? {
+                UnitStatus::Inactive | UnitStatus::Failed => return Ok(()),
+                _ if std::time::Instant::now() >= deadline => {
+                    return Err(SupervisorError::Supervision {
+                        context: format!(
+                            "{} is still shutting down after {}s",
+                            m.unit_name(),
+                            timeout.as_secs()
+                        ),
+                        source: None,
+                    })
+                }
+                _ => tokio::time::sleep(POLL_INTERVAL).await,
+            }
+        }
+    }
+
     async fn await_gone(&self, m: &Mount, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if !mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m)) {
+            if !mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m).await) {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -301,12 +365,12 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
         Box::pin(async move {
             let m = self.mount_config(name)?;
 
-            let point = Self::resolved_point(m);
+            let point = Self::resolved_point(m).await;
             if mountinfo::is_mounted_at(&self.live_mounts(), &point) {
                 // A mount point the kernel still lists but nothing is serving. Left
                 // alone it blocks every future attempt, since rclone cannot mount over
                 // it — so clear it rather than reporting success onto a dead mount.
-                if Self::is_stale(&point) {
+                if Self::is_stale(&point).await {
                     Self::fusermount(&point, false).await?;
                 } else {
                     // Already serving, however it got there. This is the path taken
@@ -318,18 +382,33 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             Self::prepare_mount_point(&m.mount_point)?;
             self.prepare_runtime_dir()?;
 
+            let unit = self.units.status(&m.unit_name()).await?;
+
+            // A unit already running under this name means a mount is on its way up —
+            // a second click during the readiness window, or two clients. Starting again
+            // would fail with systemd's "unit already exists", which is both useless to
+            // the user and wrong: the right answer is to wait for the one in flight.
+            if matches!(unit, UnitStatus::Active | UnitStatus::Activating) {
+                return self.await_ready(m).await;
+            }
+            // Still shutting down. Starting now loses the race against systemd freeing
+            // the name, so wait for it rather than reporting a failure the user cannot
+            // act on. This is the ordinary remount gesture.
+            if unit == UnitStatus::Deactivating {
+                self.await_unit_gone(m, Duration::from_secs(35)).await?;
+            }
+
             // rclone binds its rc socket with a bare listen and will not replace a stale
             // one, so a socket left by a killed rclone makes every subsequent start fail
-            // with "address already in use".
+            // with "address already in use". A killed rclone is exactly the case, since Go
+            // unlinks the socket only on a clean close.
             //
-            // Only when no unit of ours is running. Unlinking a socket a live rclone is
-            // serving on strands that mount at T4 for the rest of the process's life: the
-            // path is gone, so nothing can reach its rc API again.
-            if self.units.status(&m.unit_name()).await? == UnitStatus::Inactive {
-                let socket = self.socket_path(&m.name);
-                if socket.exists() {
-                    let _ = std::fs::remove_file(&socket);
-                }
+            // Safe unconditionally here: the branches above return or wait, so by this
+            // point no process of ours holds that path. Unlinking a socket a *live* rclone
+            // is serving would strand that mount at T4 for the life of the process.
+            let socket = self.socket_path(&m.name);
+            if socket.exists() {
+                let _ = std::fs::remove_file(&socket);
             }
 
             // A previous failure leaves the unit loaded, and StartTransientUnit refuses a
@@ -363,7 +442,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
     ) -> BoxFuture<'a, Result<(), SupervisorError>> {
         Box::pin(async move {
             let m = self.mount_config(name)?;
-            let point = Self::resolved_point(m);
+            let point = Self::resolved_point(m).await;
             let live = mountinfo::is_mounted_at(&self.live_mounts(), &point);
             let unit = self.units.status(&m.unit_name()).await?;
             // Anything but Inactive means a unit of ours exists — running, restarting, or
@@ -392,10 +471,12 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 if !live {
                     // Nothing was mounted; stopping the unit is the whole job. This is the
                     // path for a unit that was restart-looping without ever serving.
-                    return Ok(());
+                    return self.await_unit_gone(m, Duration::from_secs(35)).await;
                 }
                 if self.await_gone(m, Duration::from_secs(30)).await {
-                    return Ok(());
+                    // The mount point is released, but the name is not free until systemd
+                    // finishes the job — and a remount immediately after would collide.
+                    return self.await_unit_gone(m, Duration::from_secs(35)).await;
                 }
             }
 
@@ -441,12 +522,10 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // Canonicalised, exactly as `resolve` compares them. Matching the raw path
             // here would list a mount under a symlinked directory twice — once as itself
             // and once, from the kernel's resolved path, as somebody else's.
-            let configured: Vec<PathBuf> = self
-                .config
-                .mounts
-                .iter()
-                .map(Self::resolved_point)
-                .collect();
+            let mut configured: Vec<PathBuf> = Vec::with_capacity(self.config.mounts.len());
+            for m in &self.config.mounts {
+                configured.push(Self::resolved_point(m).await);
+            }
             for e in live.iter().filter(|e| e.is_rclone()) {
                 if configured.contains(&e.mount_point) {
                     continue;
@@ -583,6 +662,9 @@ mod tests {
         status: UnitStatus,
     ) -> SystemdSupervisor<FakeUnits> {
         let mp = mount_point(tag);
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("rvt-run-{}-{tag}", std::process::id())),
+        );
         let mp_str = mp.to_string_lossy().into_owned();
         let mut live: Vec<&str> = Vec::new();
         if mounted {
@@ -596,7 +678,7 @@ mod tests {
             config_with_backup(mp.clone()),
             PathBuf::from("/usr/bin/rclone"),
             units,
-            std::env::temp_dir().join("rvt-run"),
+            std::env::temp_dir().join(format!("rvt-run-{}-{tag}", std::process::id())),
         )
         .with_test_overrides(
             fixture(tag, &mountinfo_with(&live)),
@@ -787,6 +869,112 @@ mod tests {
         // mount point answers. Reporting that as Unmounted inverts the two states.
         let s = supervisor("comingup", false, &[], UnitStatus::Active);
         assert_eq!(s.state("backup").await.unwrap(), MountState::Mounting);
+    }
+
+    #[tokio::test]
+    async fn force_actually_attempts_to_release_a_foreign_mount() {
+        // Without force this is refused. With it, the release must genuinely be attempted
+        // — it fails here because the fixture is not a real filesystem, but "we did not
+        // try" and "we tried and could not" are different answers.
+        let s = supervisor("force", true, &[], UnitStatus::Inactive);
+        let e = s
+            .unmount("backup", true)
+            .await
+            .expect_err("there is no real filesystem to release");
+        assert!(
+            !matches!(e, SupervisorError::NotManaged(_)),
+            "force must bypass the refusal, got {e:?}"
+        );
+        let msg = e.to_string();
+        assert!(
+            !msg.contains("still mounted after"),
+            "that message means the release was never attempted: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_socket_is_cleared_when_the_unit_died() {
+        // The only state in which a stale socket can exist. rclone binds with a bare
+        // listen and dies on EADDRINUSE, so leaving it makes the mount unstartable.
+        let s = supervisor("staleock", false, &[], UnitStatus::Failed);
+        std::fs::create_dir_all(&s.runtime_dir).unwrap();
+        let sock = s.socket_path("backup");
+        std::fs::write(&sock, b"").unwrap();
+
+        let _ = s.mount("backup").await;
+        assert!(
+            !sock.exists(),
+            "a socket left by a dead rclone must be removed before restarting it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_mount_while_one_is_coming_up_does_not_error() {
+        // `StartTransientUnit` refuses a name that is already taken, and its error is a
+        // raw D-Bus string. A second click during the 45s readiness window must wait for
+        // the mount in flight instead.
+        let s = supervisor("double", false, &[], UnitStatus::Activating);
+        std::fs::create_dir_all(&s.runtime_dir).unwrap();
+        let sock = s.socket_path("backup");
+        std::fs::write(&sock, b"").unwrap();
+
+        let e = s
+            .mount("backup")
+            .await
+            .expect_err("nothing ever mounts here");
+        assert!(
+            !matches!(e, SupervisorError::Supervision { .. }),
+            "a unit already coming up must not surface as an init-system error: {e:?}"
+        );
+        assert!(
+            s.units.started.lock().unwrap().is_empty(),
+            "it must not try to start a second unit under the same name"
+        );
+        // The socket of the rclone coming up must survive: unlinking it would strand that
+        // mount at T4 for the life of the process, with nothing able to reach its rc API.
+        assert!(
+            sock.exists(),
+            "a live rclone's socket must not be unlinked by a second mount attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_mount_point_is_matched_against_the_resolved_path() {
+        // The kernel records resolved paths. Comparing the configured one would report a
+        // working mount as down, then fail to unmount it either.
+        let real = std::env::temp_dir().join(format!("rvt-real-{}", std::process::id()));
+        let link = std::env::temp_dir().join(format!("rvt-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&link);
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut c = Config::default();
+        c.mounts.push(Mount {
+            mount_point: link.clone(),
+            ..config_with_backup(real.clone()).mounts[0].clone()
+        });
+        let units = FakeUnits::default();
+        *units.status.lock().unwrap() = UnitStatus::Active;
+        let s = SystemdSupervisor::new(
+            Arc::new(c),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            std::env::temp_dir().join(format!("rvt-run-link-{}", std::process::id())),
+        )
+        .with_test_overrides(
+            fixture("symlink", &mountinfo_with(&[&real.to_string_lossy()])),
+            Duration::from_millis(300),
+        );
+
+        assert_eq!(
+            s.state("backup").await.unwrap(),
+            MountState::Mounted,
+            "the mount is up at the resolved path and must be recognised"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&real);
     }
 
     #[tokio::test]

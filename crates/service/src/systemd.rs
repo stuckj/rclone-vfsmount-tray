@@ -154,9 +154,17 @@ pub mod dbus {
                     ("ExecStart", Value::from(exec_start)),
                     ("Type", Value::from("exec")),
                     ("UMask", Value::from(spec.umask)),
-                    // Restart the mount if rclone dies, but give up rather than loop:
-                    // a remote that rejects the credentials fails identically forever.
+                    // Restart the mount if rclone dies, but give up rather than loop: a
+                    // remote that rejects the credentials fails identically forever.
+                    //
+                    // The limit has to be set explicitly. systemd's defaults are a burst
+                    // of 5 within 10s, and restarts spaced 5s apart never put five starts
+                    // in a 10s window — so the unit would retry for the whole login
+                    // session and never reach `failed`, which is the state that carries
+                    // rclone's reason to the user.
                     ("Restart", Value::from("on-failure")),
+                    ("StartLimitIntervalUSec", Value::from(60_000_000_u64)),
+                    ("StartLimitBurst", Value::from(3_u32)),
                     // These take systemd's *D-Bus property* names, which are not the
                     // unit-file directive names: there is no `RestartSec` or
                     // `TimeoutStopSec` property — `systemd-run` renames those client-side
@@ -302,6 +310,52 @@ mod tests {
 
         units.stop(&name).await.expect("stop must succeed");
         let _ = units.reset_failed(&name).await;
+    }
+
+    /// The restart policy must actually give up.
+    ///
+    /// Testing only a unit that starts cleanly says nothing about the failure path, which
+    /// is the path that has to produce `Failed` for rclone's reason to reach the user.
+    #[tokio::test]
+    async fn a_unit_that_keeps_failing_reaches_failed_rather_than_looping() {
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+
+        let name = format!("rvt-failtest-{}.service", std::process::id());
+        let _ = units.reset_failed(&name).await;
+        let spec = UnitSpec {
+            name: name.clone(),
+            description: "rclone-vfsmount-tray failure self test".into(),
+            executable: PathBuf::from("/bin/false"),
+            args: vec![],
+            umask: 0o022,
+        };
+        if units.start_transient(&spec).await.is_err() {
+            eprintln!("skipped: no systemd user instance");
+            return;
+        }
+
+        // Three starts at 5s apart inside a 60s window, so it should be spent well
+        // before this deadline; a policy that never gives up runs out the clock.
+        let mut last = UnitStatus::Inactive;
+        for _ in 0..90 {
+            last = units.status(&name).await.unwrap_or(UnitStatus::Inactive);
+            if last == UnitStatus::Failed {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let _ = units.stop(&name).await;
+        let _ = units.reset_failed(&name).await;
+
+        assert_eq!(
+            last,
+            UnitStatus::Failed,
+            "the unit must stop retrying and settle in failed, or MountState::Failed is \
+             unreachable and rclone's error never reaches the user"
+        );
     }
 
     #[tokio::test]

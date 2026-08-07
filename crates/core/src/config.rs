@@ -292,9 +292,11 @@ impl Mount {
         // not configurable — a mount without it can only ever be scanned on disk.
         //
         // `--rc-no-auth` is safe *only* because the socket is unreachable by anyone but
-        // its owner: rc access is equivalent to shell access as this user. rclone creates
-        // the socket 0775 regardless of what we ask for, so the unit sets `UMask=0077` to
-        // bring it down to 0700. Changing that umask reopens the hole.
+        // its owner: rc access is equivalent to shell access as this user. rclone does no
+        // chmod when binding, so the socket gets `0777 & ~umask`. What keeps it private is
+        // the 0700 directory it lives in, not its own mode — the unit's umask cannot be
+        // used for this, because rclone applies the same umask to every file it creates
+        // inside the mount. See DESIGN.md.
         a.push("--rc".into());
         a.push("--rc-addr".into());
         a.push(format!("unix://{}", rc_socket.display()));

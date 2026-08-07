@@ -64,8 +64,16 @@ pub fn read() -> std::io::Result<Vec<MountEntry>> {
 
 /// Read and parse a specific mountinfo file. Separate from [`read`] so tests can supply
 /// a fixture without a live `/proc`.
+///
+/// Decoded lossily on purpose. The kernel escapes only space, tab, newline and backslash,
+/// so any other byte — including invalid UTF-8 — is written raw, and a mount point
+/// containing one is enough to make `read_to_string` fail for the *whole file*. That
+/// would report every mount on the machine as absent, from a directory any user can
+/// create. Lossy decoding mangles only the offending entry, which is the behaviour
+/// [`parse`] already promises for a line it cannot read.
 pub fn read_from(path: &Path) -> std::io::Result<Vec<MountEntry>> {
-    Ok(parse(&std::fs::read_to_string(path)?))
+    let raw = std::fs::read(path)?;
+    Ok(parse(&String::from_utf8_lossy(&raw)))
 }
 
 /// Every live rclone mount.
@@ -214,6 +222,33 @@ mod tests {
         // A literal backslash that is not a three-digit escape survives untouched.
         let lit = parse("1 2 0:1 / /mnt/a\\b rw - fuse.rclone backup: rw");
         assert_eq!(lit[0].mount_point, Path::new("/mnt/a\\b"));
+    }
+
+    #[test]
+    fn a_non_utf8_byte_elsewhere_does_not_hide_every_mount() {
+        // The kernel writes such bytes raw, and any user can create a directory
+        // containing one and mount something there. Reading the file strictly would make
+        // every mount on the machine invisible.
+        let dir = std::env::temp_dir().join(format!("rvt-mi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mountinfo");
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(REAL.as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(b"200 28 0:99 / /tmp/");
+        bytes.push(0xFF);
+        bytes.extend_from_slice(b"bad rw shared:9 - fuse.sshfs u@h:/x rw\n");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let got = read_from(&path).expect("an unreadable byte must not fail the read");
+        assert_eq!(
+            got.iter().filter(|e| e.is_rclone()).count(),
+            2,
+            "both rclone mounts must still be visible: {got:?}"
+        );
+        assert!(is_mounted_at(&got, Path::new("/home/user/mnt/backup")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

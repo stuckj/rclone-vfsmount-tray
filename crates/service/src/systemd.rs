@@ -195,10 +195,19 @@ pub mod dbus {
         fn stop<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>> {
             Box::pin(async move {
                 let mgr = self.manager().await?;
-                mgr.stop_unit(unit, "replace")
-                    .await
-                    .map_err(|e| supervision(&format!("stopping unit {unit}"), e))?;
-                Ok(())
+                match mgr.stop_unit(unit, "replace").await {
+                    Ok(_) => Ok(()),
+                    // It stopped on its own between the status read and here — rclone
+                    // exited, or somebody ran `fusermount -u` — and systemd collected it.
+                    // The caller asked for it to be stopped, and it is.
+                    Err(zbus::Error::MethodError(name, msg, _))
+                        if name.as_str().ends_with(".NoSuchUnit")
+                            || msg.as_deref().is_some_and(|m| m.contains("not loaded")) =>
+                    {
+                        Ok(())
+                    }
+                    Err(e) => Err(supervision(&format!("stopping unit {unit}"), e)),
+                }
             })
         }
 

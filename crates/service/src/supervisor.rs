@@ -51,6 +51,14 @@ pub struct SystemdSupervisor<M: UnitManager> {
     /// be tested at all.
     #[cfg(test)]
     stale_paths: std::collections::HashSet<PathBuf>,
+    /// One lock per mount name.
+    ///
+    /// The tray and the GTK window are both clients by design, and `mount` yields at
+    /// several await points between reading the unit status and starting the unit — so
+    /// two callers can both see `Inactive` and both start, and the loser gets systemd's
+    /// raw "unit already exists". Worse, an unmount still in its `fusermount` escalation
+    /// can tear down a mount a concurrent `mount` has just brought up.
+    locks: tokio::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl<M: UnitManager> SystemdSupervisor<M> {
@@ -66,6 +74,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             unit_gone_timeout: Duration::from_secs(35),
             #[cfg(test)]
             stale_paths: std::collections::HashSet::new(),
+            locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -88,6 +97,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// The rc socket for a mount.
     pub fn socket_path(&self, name: &str) -> PathBuf {
         self.runtime_dir.join(format!("{name}.sock"))
+    }
+
+    /// The lock guarding operations on one mount.
+    async fn lock_for(&self, name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.locks.lock().await;
+        map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     fn mount_config(&self, name: &str) -> Result<&Mount, SupervisorError> {
@@ -162,8 +179,20 @@ impl<M: UnitManager> SystemdSupervisor<M> {
 
     fn live_mounts(&self) -> Vec<MountEntry> {
         // A mountinfo that cannot be read means no evidence of any mount, not an error:
-        // reporting everything as down is honest, and the next poll recovers.
-        mountinfo::read_from(&self.mountinfo_path).unwrap_or_default()
+        // reporting everything as down is honest, and the next poll recovers. But it
+        // makes every mount invisible and disables the guard against mounting over
+        // somebody else's filesystem, so it must never happen quietly.
+        match mountinfo::read_from(&self.mountinfo_path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::warn!(
+                    path = %self.mountinfo_path.display(),
+                    error = %e,
+                    "could not read mountinfo; every mount will report as absent this poll"
+                );
+                Vec::new()
+            }
+        }
     }
 
     /// Resolve one mount's state from the kernel plus systemd.
@@ -389,6 +418,8 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
     fn mount<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>> {
         Box::pin(async move {
             let m = self.mount_config(name)?;
+            let lock = self.lock_for(name).await;
+            let _guard = lock.lock().await;
 
             let point = Self::resolved_point(m).await;
             if mountinfo::is_mounted_at(&self.live_mounts(), &point) {
@@ -397,18 +428,29 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 // it — so clear it rather than reporting success onto a dead mount.
                 if self.is_stale(&point).await {
                     Self::fusermount(&point, false).await?;
-                } else if self.units.status(&m.unit_name()).await? != UnitStatus::Inactive {
-                    // Already serving, and it is ours. This is the path taken after a
-                    // service restart, when every mount is already up.
-                    return Ok(());
                 } else {
-                    // Something else is mounted there. Reporting success would tell the
-                    // user their configured cache mode, read-only flag and rc socket were
-                    // applied, when what is serving is a process we did not start.
-                    return Err(SupervisorError::NotManaged(format!(
-                        "{name}: {} is already mounted by something we did not start",
-                        point.display()
-                    )));
+                    match self.units.status(&m.unit_name()).await? {
+                        // Already serving, and it is ours. This is the path taken after a
+                        // service restart, when every mount is already up.
+                        UnitStatus::Active | UnitStatus::Activating => return Ok(()),
+                        // Still mounted, but the unit is going away — rclone's own
+                        // unmount can fail with EBUSY and hold the point for the whole
+                        // stop timeout. Reporting success here would leave the user with
+                        // no mount and no unit once systemd finishes.
+                        UnitStatus::Deactivating => {
+                            self.await_unit_gone(m, self.unit_gone_timeout).await?;
+                        }
+                        UnitStatus::Failed => {}
+                        UnitStatus::Inactive => {
+                            // Something else is mounted there. Reporting success would tell the
+                            // user their configured cache mode, read-only flag and rc socket were
+                            // applied, when what is serving is a process we did not start.
+                            return Err(SupervisorError::NotManaged(format!(
+                                "{name}: {} is already mounted by something we did not start",
+                                point.display()
+                            )));
+                        }
+                    }
                 }
             }
 
@@ -475,6 +517,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
     ) -> BoxFuture<'a, Result<(), SupervisorError>> {
         Box::pin(async move {
             let m = self.mount_config(name)?;
+            let lock = self.lock_for(name).await;
+            let _guard = lock.lock().await;
+
             let point = Self::resolved_point(m).await;
             let live = mountinfo::is_mounted_at(&self.live_mounts(), &point);
             let unit = self.units.status(&m.unit_name()).await?;
@@ -532,7 +577,11 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 .iter()
                 .find(|e| e.is_rclone() && e.mount_point == point);
             if let Some(e) = entry {
-                if e.source != m.fs_spec() {
+                // `force` is the caller having shown the user what this is and been told
+                // to proceed, so it overrides the mismatch as well as the ownership
+                // refusal — otherwise "unmount anyway" on a foreign mount of a different
+                // remote, which is the case #18 is about, cannot work at all.
+                if !force && e.source != m.fs_spec() {
                     return Err(SupervisorError::NotManaged(format!(
                         "{name}: {} is serving {}, not {} — refusing to unmount something \
                      this mount does not own",
@@ -544,7 +593,10 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             }
             Self::fusermount(&point, false).await?;
             if self.await_gone(m, Duration::from_secs(10)).await {
-                return Ok(());
+                // Reaching here means the stop timed out, which is what leaves the unit
+                // `failed`. Without this the mount the user just successfully unmounted
+                // reports as failed on the next poll.
+                return self.units.reset_failed(&m.unit_name()).await;
             }
             Err(SupervisorError::Busy {
                 path: format!(
@@ -1135,6 +1187,75 @@ mod tests {
             }
             other => panic!("expected a refusal naming the mismatch, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn mounting_over_somebody_elses_mount_is_refused() {
+        // The property this PR leads with. Silently taking over another process's mount
+        // is what makes a tray applet get uninstalled.
+        let s = supervisor("takeover", true, &[], UnitStatus::Inactive);
+        match s.mount("backup").await {
+            Err(SupervisorError::NotManaged(why)) => {
+                assert!(why.contains("did not start"), "{why}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(
+            s.units.started.lock().unwrap().is_empty(),
+            "no unit may be started onto an occupied mount point"
+        );
+    }
+
+    #[tokio::test]
+    async fn mounting_does_not_report_success_onto_a_mount_being_torn_down() {
+        // rclone's own unmount can fail with EBUSY and hold the point for the whole stop
+        // timeout. Reporting success there leaves the user with no mount and no unit once
+        // systemd finishes, and no indication anything went wrong.
+        let s = supervisor("teardown", true, &[], UnitStatus::Deactivating);
+        let e = s
+            .mount("backup")
+            .await
+            .expect_err("the fake never leaves Deactivating");
+        match e {
+            SupervisorError::Supervision { context, .. } => assert!(
+                context.contains("still shutting down"),
+                "it must wait for the teardown, not claim success: {context}"
+            ),
+            other => panic!("expected a wait, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn force_overrides_a_source_mismatch_as_well_as_the_refusal() {
+        // "Unmount anyway" on a foreign mount of a *different* remote is exactly the case
+        // #18 is about. Refusing it after the user confirmed reads as a contradiction.
+        let mp = mount_point("forcemismatch");
+        let mut c = Config::default();
+        c.mounts.push(Mount {
+            remote: "somethingelse".into(),
+            ..config_with_backup(mp.clone()).mounts[0].clone()
+        });
+        let units = FakeUnits::default();
+        *units.status.lock().unwrap() = UnitStatus::Inactive;
+        let s = SystemdSupervisor::new(
+            Arc::new(c),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            std::env::temp_dir().join(format!("rvt-run-fm-{}", std::process::id())),
+        )
+        .with_test_overrides(
+            fixture("forcemismatch", &mountinfo_with(&[&mp.to_string_lossy()])),
+            Duration::from_millis(300),
+        );
+
+        let e = s
+            .unmount("backup", true)
+            .await
+            .expect_err("no real filesystem to release");
+        assert!(
+            !matches!(e, SupervisorError::NotManaged(_)),
+            "force must override the source mismatch too, got {e:?}"
+        );
     }
 
     #[tokio::test]

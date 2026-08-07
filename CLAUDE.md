@@ -82,9 +82,17 @@ naming the constraint over narrating the discovery.
 **10-20% of lines is normal, as a guide rather than a limit.** Above that, re-read the
 comments against the rules above and check each one is still about the code: the usual
 cause of a high ratio is explaining consequences and justifying decisions inline, both of
-which belong in DESIGN.md. Some files legitimately sit higher — `mountinfo.rs` documents a
-kernel format nothing in the code implies — so the number is a prompt to look, never a
-reason to cut a comment that is doing real work or to pad toward a figure.
+which belong in DESIGN.md.
+
+Two kinds of file legitimately sit higher. One documents an external format or behaviour
+nothing in the code implies — `mountinfo.rs` and the kernel's mountinfo layout. The other
+is a public API surface, where rustdoc on every item is expected and the bodies are often
+one-liners: `capabilities.rs` is 84 lines of code to 56 of rustdoc because eight public
+predicates each have to say what distinction they encode. In both cases the ratio is high
+because the code is dense, not because the prose is.
+
+So the number is a prompt to look, never a reason to cut a comment that is doing real work
+or to pad toward a figure.
 
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.

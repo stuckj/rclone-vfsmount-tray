@@ -1,12 +1,9 @@
 //! Which rc commands a particular rclone actually has, and what may honestly be shown
 //! as a result.
 //!
-//! Detected with `rc/list`, which enumerates the commands a build registers, rather than
-//! inferred from a version number. A version is a guess about a build; `rc/list` is the
-//! build's own answer, and it reflects how rclone was compiled and flagged.
-//!
-//! Resolution is per-connection, not global: one mount may be reachable over rc while
-//! another was started by someone else and can only be scanned on disk.
+//! Detected with `rc/list` rather than inferred from a version number: it reflects how
+//! rclone was actually compiled and flagged. Per-connection, not global — one mount may
+//! be reachable over rc while another can only be scanned on disk. See DESIGN.md.
 
 use crate::models::RcList;
 use crate::rc::{RcClient, RcError};
@@ -14,9 +11,8 @@ use std::collections::BTreeSet;
 
 /// How much can be said about pending uploads, given what this rclone will tell us.
 ///
-/// Ordering is by how much detail the tier supports, not by preference: `T4` is a
-/// first-class tier, and the only one that works when rclone is unreachable or has
-/// crashed, because the rc endpoints only know a running process's in-memory queue.
+/// Ordered by detail, not preference: `T4` is first-class, and the only tier that works
+/// when rclone is unreachable or has crashed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     /// `core/stats` — per-file progress and real ETAs.
@@ -35,33 +31,25 @@ impl Tier {
     /// Whether this tier can report what is outstanding well enough to answer "is it safe
     /// to unmount".
     ///
-    /// Only `vfs/queue` and the disk scan can. `core/stats` shows transfers that have
-    /// *started*, and it lags `vfs/queue` by `--vfs-write-back` — a file written seconds
-    /// ago is dirty on disk and absent from `transferring[]`, so a total taken from it
-    /// reads zero while gigabytes are still queued. That is wrong in the direction that
-    /// makes an unmount look safe when it is not. T3 gives counts without bytes.
-    ///
-    /// A build that resolves to T1 or T3 is not stuck: `vfs/queue` may still be present,
-    /// and the disk scan always is. See [`Capabilities::rc_can_answer_outstanding`].
+    /// Only `vfs/queue` and the disk scan can: `core/stats` lags `vfs/queue` by
+    /// `--vfs-write-back`, so a total taken from it reads zero while gigabytes are still
+    /// queued, and T3 gives counts without bytes. A T1 or T3 build is not stuck — see
+    /// [`Capabilities::rc_can_answer_outstanding`]. DESIGN.md has the measurements.
     pub fn meets_the_bar(self) -> bool {
         matches!(self, Tier::T2 | Tier::T4)
     }
 
     /// Whether per-file percentages are honest at this tier.
     ///
-    /// Only T1 carries per-file byte progress. Showing a percentage anywhere else means
-    /// inventing one, and a progress bar that actually means "we have no idea" is worse
-    /// than no bar.
+    /// Only T1 carries per-file byte progress; a percentage anywhere else is invented.
     pub fn has_per_file_progress(self) -> bool {
         self == Tier::T1
     }
 
     /// Whether this tier can mark a *particular file* as uploading rather than queued.
     ///
-    /// T4 cannot: `Dirty` stays true until the upload completes, so queued and uploading
-    /// are indistinguishable on disk. Neither can T3 — `vfs/stats` reports
-    /// `uploadsInProgress`/`uploadsQueued` as aggregate counts and never names a file, so
-    /// there is nothing there to mark.
+    /// T4 cannot: `Dirty` stays true until the upload completes. Neither can T3, whose
+    /// counts never name a file.
     pub fn has_in_flight_flag(self) -> bool {
         matches!(self, Tier::T1 | Tier::T2)
     }
@@ -71,8 +59,7 @@ impl Tier {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capabilities {
     commands: BTreeSet<String>,
-    /// Set when the commands are empty because rclone could not be asked, rather than
-    /// because it genuinely registers none.
+    /// Set when the commands are empty because rclone could not be asked.
     degraded: Option<String>,
 }
 
@@ -91,14 +78,9 @@ impl Capabilities {
 
     /// Ask an rclone what it supports.
     ///
-    /// An unreachable socket is not an error here: it resolves to no commands, which
-    /// resolves to [`Tier::T4`], which is exactly right — the on-disk scan is what works
-    /// when rclone is not answering.
-    ///
-    /// The reason is kept rather than discarded. "rclone is not running" and "rclone is
-    /// running and I refuse to talk to its socket" both degrade to T4, but only the second
-    /// is a misconfiguration the user can fix, and it is permanent until they do. Without
-    /// the reason nothing above this can tell them the difference.
+    /// An unreachable socket resolves to no commands and so to [`Tier::T4`], which is
+    /// what the on-disk scan is for. The reason is kept: "not running" and "running but
+    /// refused" both land on T4, and only the second is a misconfiguration to report.
     pub async fn probe(client: &RcClient) -> Result<Self, RcError> {
         match client
             .call::<RcList>("rc/list", serde_json::json!({}))
@@ -129,14 +111,9 @@ impl Capabilities {
 
     /// Whether **rc** can say what is outstanding, i.e. whether `vfs/queue` is available.
     ///
-    /// Deliberately not "can the question be answered at all": the on-disk scan answers it
-    /// with no rc whatsoever, so that version would be true unconditionally and tell a
-    /// caller nothing. Phrased this way it is also monotonic — learning more about an
-    /// rclone can only ever turn it from false to true. The earlier phrasing made a build
-    /// with `vfs/stats` look *less* capable than one with no rc at all, which inverts
-    /// DESIGN.md: `vfs/stats` is what hands the cache paths to the scanner.
-    ///
-    /// A `false` here means fall to the scan, not that the answer is unavailable.
+    /// Not "can the question be answered at all" — the disk scan always can, so that
+    /// would be true unconditionally. Phrased this way it is monotonic: more capabilities
+    /// can only turn it from false to true. `false` means fall to the scan.
     pub fn rc_can_answer_outstanding(&self) -> bool {
         self.has("vfs/queue")
     }
@@ -164,12 +141,9 @@ impl Capabilities {
 
     /// Whether a `core/stats` transfer can be attributed to a specific mount exactly.
     ///
-    /// A write-back upload is identified by `group == global_stats` **and** `srcFs`
-    /// matching that mount's cache path. `vfs/stats` reports that path exactly for a
-    /// given VFS; without it the path has to be composed from `rclone config paths`,
-    /// which gives the cache root rather than this mount's directory. The group alone is
-    /// not enough — VFS cache *downloads* share it, so filtering on it counts a file
-    /// being downloaded as a pending upload.
+    /// Identifying a write-back upload needs `srcFs` matched against that mount's exact
+    /// cache path, which only `vfs/stats` gives. The group alone is not enough: cache
+    /// downloads share it. See DESIGN.md.
     pub fn can_attribute_exactly(&self) -> bool {
         self.has("vfs/stats")
     }

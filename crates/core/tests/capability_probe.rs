@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 /// Serves one canned response, then keeps accepting so nothing blocks on connect.
-async fn serve(tag: &str, body: &'static str) -> (PathBuf, PathBuf, tokio::task::JoinHandle<()>) {
+async fn serve(tag: &str, body: &str) -> (PathBuf, PathBuf, tokio::task::JoinHandle<()>) {
     serve_status(tag, 200, "OK", body).await
 }
 
@@ -21,7 +21,7 @@ async fn serve_status(
     tag: &str,
     code: u16,
     reason: &str,
-    body: &'static str,
+    body: &str,
 ) -> (PathBuf, PathBuf, tokio::task::JoinHandle<()>) {
     let dir = std::env::temp_dir().join(format!("rvt-probe-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -33,15 +33,16 @@ async fn serve_status(
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-    let response: &'static str = Box::leak(
-        format!(
-            "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
-        .into_boxed_str(),
-    );
+    // Shared rather than leaked: `'static` is only needed to move it into the spawned
+    // tasks, and an `Arc` gives that without deliberately leaking in a suite that
+    // elsewhere asserts on file-descriptor counts.
+    let response = std::sync::Arc::new(format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
     let handle = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
+            let response = response.clone();
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 let mut buf = vec![0u8; 8192];
@@ -54,15 +55,12 @@ async fn serve_status(
     (dir, socket, handle)
 }
 
-fn captured_rc_list() -> &'static str {
-    Box::leak(
-        std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/rc-list-v1.75.0.json"
-        ))
-        .expect("testdata/rc-list-v1.75.0.json")
-        .into_boxed_str(),
-    )
+fn captured_rc_list() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/rc-list-v1.75.0.json"
+    ))
+    .expect("testdata/rc-list-v1.75.0.json")
 }
 
 #[tokio::test]
@@ -70,7 +68,7 @@ async fn probing_a_real_rclone_reads_its_command_paths() {
     // The whole path, against the captured payload: if the wrong field were read, every
     // `has()` would answer false and every mount would resolve to T4 while looking as
     // though rclone had simply said so.
-    let (dir, socket, server) = serve("ok", captured_rc_list()).await;
+    let (dir, socket, server) = serve("ok", &captured_rc_list()).await;
 
     let caps = Capabilities::probe(&RcClient::new(&socket))
         .await
@@ -114,7 +112,7 @@ async fn a_socket_we_refuse_says_so_rather_than_looking_like_an_idle_rclone() {
     // rclone binds its socket 0777 & ~umask, so this is the shape of a real
     // misconfiguration — and it is permanent until the user fixes it. Both cases resolve
     // to T4, so the reason is the only thing that can tell them apart.
-    let (dir, socket, server) = serve("insecure", captured_rc_list()).await;
+    let (dir, socket, server) = serve("insecure", &captured_rc_list()).await;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o777)).unwrap();
 
     let caps = Capabilities::probe(&RcClient::new(&socket))

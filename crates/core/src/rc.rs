@@ -2,11 +2,9 @@
 //!
 //! # Why never TCP
 //!
-//! rc access is equivalent to shell access as the rclone user: `core/command` re-executes
-//! the rclone binary, and `config/dump` returns every backend credential. Authentication
-//! is all-or-nothing, with no per-endpoint scoping. A TCP bind would expose that to
-//! anything that can reach the port, so this client speaks only to a UNIX socket and
-//! refuses one whose permissions do not make it private.
+//! rc access is equivalent to shell access as the rclone user — `core/command` re-execs
+//! the binary, `config/dump` returns every credential, and auth is all-or-nothing. So this
+//! client speaks only to a UNIX socket, and refuses one that is not private.
 
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
@@ -14,9 +12,8 @@ use std::time::Duration;
 
 /// How long a whole rc call may take, retries included.
 ///
-/// rc calls are local and answer in milliseconds. A long budget here does not rescue a
-/// wedged rclone; it only holds up whatever asked. It is a budget for the *call*, not for
-/// each attempt, so retrying cannot multiply how long a caller is blocked.
+/// A budget for the *call*, not for each attempt, so retrying cannot multiply how long a
+/// caller is blocked.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Attempts per call, including the first.
@@ -25,9 +22,8 @@ const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 
 /// Cap on a response body.
 ///
-/// rc responses are untrusted input: an rclone that streams a runaway body would
-/// otherwise be able to allocate until this process is OOM-killed. The largest real
-/// response is a `vfs/list` of a big directory, orders of magnitude below this.
+/// rc responses are untrusted input; without a cap a runaway body allocates until this
+/// process is OOM-killed. The largest real response is far below this.
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// Why an rc call failed.
@@ -43,9 +39,8 @@ pub enum RcError {
 
     /// The socket exists but is not safe to use.
     ///
-    /// Connecting to a UNIX socket needs write permission, so a group- or world-writable
-    /// socket hands rc access — and therefore shell access as this user — to anyone who
-    /// qualifies.
+    /// Connecting needs only write permission, so a group- or world-writable socket hands
+    /// rc access to anyone who qualifies.
     #[error("rc socket {path} is not private: {reason}. Refusing to connect.")]
     InsecureSocket { path: PathBuf, reason: String },
 
@@ -102,17 +97,10 @@ impl RcError {
     /// Whether this means "no usable rc here", so the caller should drop to the on-disk
     /// tier rather than report a failure.
     ///
-    /// An insecure socket counts: we will not use it, so as far as everything above is
-    /// concerned there is no rc. It is reported separately so the user can be told why.
-    ///
-    /// So do a timeout and a transport fault. An rclone wedged in FUSE accepts the
-    /// connection and never answers, and one that is restarting accepts and closes — both
-    /// are exactly the "rclone process is unreachable" case the on-disk tier exists to
-    /// serve, and surfacing them as faults would show the user an error instead of the
-    /// data a disk scan could still give them.
-    ///
-    /// `Failed` and `Decode` are deliberately excluded: rclone answered, so the fault is
-    /// real and silently degrading would hide it.
+    /// An insecure socket counts — we will not use it, so there is no rc — as do a
+    /// timeout and a transport fault: a wedged rclone accepts and never answers, and a
+    /// restarting one accepts and closes. `Failed` and `Decode` are excluded, because
+    /// rclone answered and degrading silently would hide a real fault.
     pub fn is_unreachable(&self) -> bool {
         matches!(
             self,
@@ -189,9 +177,8 @@ impl RcClient {
 
     /// Where this user's rc sockets live: `$XDG_RUNTIME_DIR/rclone-vfsmount-tray`.
     ///
-    /// That directory is per-user and mode 0700, which is what actually excludes other
-    /// users — the socket's own mode is checked too, but a directory nobody else can
-    /// traverse is the control that does not depend on rclone cooperating.
+    /// Per-user and mode 0700, which is the control that does not depend on rclone
+    /// cooperating.
     pub fn socket_dir() -> Option<PathBuf> {
         std::env::var_os("XDG_RUNTIME_DIR")
             .filter(|v| !v.is_empty())
@@ -209,17 +196,15 @@ impl RcClient {
 
     /// Check the socket is present, is a socket, is ours, and is private.
     ///
-    /// Called before every connect rather than once at startup: the socket is recreated
-    /// each time rclone restarts, and a check that ran against a previous incarnation
-    /// says nothing about the current one.
+    /// Before every connect, not once at startup: the socket is recreated each time
+    /// rclone restarts.
     pub fn verify(&self) -> Result<(), RcError> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-            // `symlink_metadata` so a symlink is judged on its own account. Following it
-            // would mean approving whatever it happens to point at right now, and the
-            // link can be repointed between here and the connect.
+            // `symlink_metadata`: following the link would approve whatever it points at
+            // right now, and it can be repointed before the connect.
             let md = std::fs::symlink_metadata(&self.socket).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     RcError::NotListening {
@@ -244,10 +229,9 @@ impl RcClient {
                 });
             }
 
-            // A private socket in a directory others can write to is not private: they
-            // cannot alter it, but they can unlink it and put their own there. Only the
-            // immediate parent is checked, and only its mode — the peer-credential check
-            // after connecting is what makes the path as a whole trustworthy.
+            // A private socket in a directory others can write to is not private: they can
+            // unlink it and put their own there. Only the immediate parent's mode is
+            // checked; `peer_cred` after connecting is what secures the path as a whole.
             if let Some(dir) = self.socket.parent() {
                 match std::fs::metadata(dir) {
                     Ok(d) if d.mode() & 0o022 != 0 => {
@@ -262,10 +246,15 @@ impl RcClient {
                         });
                     }
                     Ok(_) => {}
+                    // Not a connect failure: nothing has been connected to. We simply
+                    // cannot establish that the socket is private, so we refuse.
                     Err(e) => {
-                        return Err(RcError::Connect {
-                            path: dir.to_path_buf(),
-                            source: e,
+                        return Err(RcError::InsecureSocket {
+                            path: self.socket.clone(),
+                            reason: format!(
+                                "its directory {} could not be inspected: {e}",
+                                dir.display()
+                            ),
                         })
                     }
                 }
@@ -317,9 +306,8 @@ impl RcClient {
         command: &str,
         params: serde_json::Value,
     ) -> Result<Vec<u8>, RcError> {
-        // One budget for the whole call. Putting the timeout inside the loop would let a
-        // wedged rclone block the caller for `timeout * max_attempts` while every error
-        // message still quoted `timeout`.
+        // One budget for the whole call: per-attempt would block the caller for
+        // `timeout * max_attempts` while every error still quoted `timeout`.
         let deadline = tokio::time::Instant::now() + self.timeout;
         let expired = || RcError::Timeout {
             command: command.to_string(),
@@ -338,10 +326,8 @@ impl RcClient {
                 // The budget is gone by construction, so there is nothing to retry into.
                 Err(_) => return Err(expired()),
                 Ok(Err(e)) => {
-                    // An absent or unsafe socket will be just as absent or unsafe next
-                    // time, and rclone rejecting the call is an answer. Only a transport
-                    // fault — a connection closed mid-response by an rclone that is
-                    // restarting — is worth another go.
+                    // An absent or unsafe socket stays that way, and a rejection is an
+                    // answer. Only a transport fault is worth another go.
                     if !matches!(e, RcError::Transport { .. }) || attempt >= self.max_attempts {
                         return Err(e);
                     }
@@ -363,11 +349,13 @@ impl RcClient {
 
         self.verify()?;
 
-        // Built before connecting: a malformed command is a permanent programming error,
-        // and constructing it first keeps it out of the retryable transport class and
-        // avoids opening a connection only to throw it away.
+        // Built before connecting: a malformed command is a permanent error, so it must
+        // not land in the retryable transport class.
+        // Infallible for a `Value`; `expect` rather than a fallback because the only
+        // fallback available is an empty body, which would send a different request than
+        // the caller asked for and say nothing about it.
         let body = http_body_util::Full::new(hyper::body::Bytes::from(
-            serde_json::to_vec(params).unwrap_or_else(|_| b"{}".to_vec()),
+            serde_json::to_vec(params).expect("a serde_json::Value always serialises"),
         ));
         // The Host header is required by HTTP/1.1 and ignored by rclone; the authority is
         // meaningless over a UNIX socket, so any valid value does.
@@ -399,9 +387,8 @@ impl RcClient {
                 }
             })?;
 
-        // Who is actually on the other end, rather than what a filename looked like a
-        // moment ago. `verify()` can only ever describe a path, and the path can be
-        // replaced between the check and the connect; this cannot be raced.
+        // Who is actually on the other end. `verify()` can only describe a path, and the
+        // path can be replaced between the check and the connect; this cannot be raced.
         #[cfg(unix)]
         {
             let peer = stream.peer_cred().map_err(|source| RcError::Connect {
@@ -422,8 +409,7 @@ impl RcClient {
             source: e,
         };
 
-        // One connection per call. rc calls are infrequent and a pool would add failure
-        // modes — a stale pooled connection to an rclone that has since restarted — for
+        // One connection per call: a pool would add a stale-connection failure mode for
         // no measurable gain.
         let (mut sender, conn) =
             hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))

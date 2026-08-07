@@ -268,8 +268,11 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// `Type=exec` reports active seconds before the mount point answers.
     async fn await_ready(&self, m: &Mount) -> Result<(), SupervisorError> {
         let deadline = std::time::Instant::now() + self.ready_timeout;
+        // Resolved once: the path cannot change under us during the wait, and doing it
+        // per poll puts a blocking `canonicalize` on the pool every 250ms.
+        let point = Self::resolved_point(m).await;
         loop {
-            if mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m).await) {
+            if mountinfo::is_mounted_at(&self.live_mounts(), &point) {
                 return Ok(());
             }
             // A unit that has already failed will never become ready; waiting out the
@@ -661,7 +664,19 @@ pub async fn prepare_for_start(
         let _ = std::fs::remove_file(&socket);
     }
 
-    let point = std::fs::canonicalize(&m.mount_point).unwrap_or_else(|_| m.mount_point.clone());
+    // Bounded, because systemd's start job is blocked on this: a `stat` through a wedged
+    // FUSE mount never returns, and a process in uninterruptible sleep cannot be killed at
+    // `TimeoutStartSec` either. A probe that does not answer is treated as *not* stale, so
+    // the fallback is to leave the mount alone rather than to release something live.
+    let raw = m.mount_point.clone();
+    let fallback = raw.clone();
+    let point = SystemdSupervisor::<crate::systemd::dbus::SystemdUnits>::off_thread(move || {
+        std::fs::canonicalize(&raw).ok()
+    })
+    .await
+    .flatten()
+    .unwrap_or(fallback);
+
     let live = match mountinfo::read_from(mountinfo_path) {
         Ok(entries) => entries,
         Err(e) => {
@@ -672,7 +687,12 @@ pub async fn prepare_for_start(
             Vec::new()
         }
     };
-    let stale = matches!(std::fs::metadata(&point), Err(e) if e.raw_os_error() == Some(ENOTCONN));
+    let probe = point.clone();
+    let stale = SystemdSupervisor::<crate::systemd::dbus::SystemdUnits>::off_thread(
+        move || matches!(std::fs::metadata(&probe), Err(e) if e.raw_os_error() == Some(ENOTCONN)),
+    )
+    .await
+    .unwrap_or(false);
     if mountinfo::is_mounted_at(&live, &point) && stale {
         SystemdSupervisor::<crate::systemd::dbus::SystemdUnits>::fusermount(&point, false).await?;
     }

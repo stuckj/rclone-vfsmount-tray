@@ -8,7 +8,7 @@
 mod supervisor;
 mod systemd;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -30,6 +30,23 @@ struct Args {
     /// systemd during development.
     #[arg(long)]
     foreground: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Clear what a hard-killed rclone left behind, so its unit can start.
+    ///
+    /// Run from each mount unit's `ExecStartPre`, so it also runs on systemd's automatic
+    /// restarts — which is the point: rclone will not rebind over its own leftover
+    /// socket, so without this a killed mount could never come back on its own.
+    #[command(hide = true)]
+    PrepareMount {
+        #[arg(long)]
+        name: String,
+    },
 }
 
 /// Where rc sockets go. `XDG_RUNTIME_DIR` is per-user and mode 0700, which is what keeps
@@ -63,13 +80,25 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .init();
 
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
-
     let config_path = match &args.config {
         Some(p) => p.clone(),
         None => rvt_core::Config::default_path()?,
     };
     let config = std::sync::Arc::new(rvt_core::Config::load(&config_path)?);
+
+    if let Some(Command::PrepareMount { name }) = &args.command {
+        // Runs while systemd waits on it, so it must not ask systemd anything.
+        supervisor::prepare_for_start(
+            &config,
+            &runtime_dir()?,
+            std::path::Path::new("/proc/self/mountinfo"),
+            name,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
     let rclone = rvt_core::Rclone::discover(config.global.rclone_path.as_deref())?;
     tracing::info!(path = %rclone.path().display(), version = %rclone.version(), "found rclone");
 

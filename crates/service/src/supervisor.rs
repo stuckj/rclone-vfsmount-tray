@@ -500,6 +500,20 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 ),
                 executable: self.rclone.clone(),
                 args: m.mount_args(&self.socket_path(&m.name)),
+                // This binary, re-invoked to clear a stale socket or mount point. It runs
+                // on systemd's automatic restarts too, which is the whole point: without
+                // it a killed rclone can never be restarted, because it will not rebind
+                // over its own leftover socket.
+                pre_start: std::env::current_exe().ok().map(|exe| {
+                    (
+                        exe,
+                        vec![
+                            "prepare-mount".to_string(),
+                            "--name".to_string(),
+                            m.name.clone(),
+                        ],
+                    )
+                }),
                 // Ordinary, because rclone applies this to every file it creates inside
                 // the mount. A mount with `allow_other` set so another service account
                 // can read it would get 0600 files and fail with EACCES on all of them.
@@ -644,6 +658,45 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             Ok(out)
         })
     }
+}
+
+/// Clear what a hard-killed rclone leaves behind, so a start can succeed.
+///
+/// Invoked from `ExecStartPre`, which means it runs on systemd's *automatic* restarts as
+/// well as on an explicit mount. Without it the restart policy cannot recover any crash
+/// that leaves a socket or mount point behind — rclone binds its rc socket with a bare
+/// listen and will not replace a stale one, so every restart dies on `EADDRINUSE`.
+///
+/// Talks to nothing. It runs while systemd is waiting for it, so asking systemd anything
+/// here would be a deadlock, and it needs no unit state to do its job.
+///
+/// Deliberately narrower than [`MountSupervisor::mount`]: it releases a mount point only
+/// when that point is *stale*. A live mount at the configured path belongs to somebody
+/// else, and unmounting it would be exactly the take-over this service refuses to do.
+pub async fn prepare_for_start(
+    config: &Config,
+    runtime_dir: &Path,
+    mountinfo_path: &Path,
+    name: &str,
+) -> Result<(), SupervisorError> {
+    let m = config
+        .mounts
+        .iter()
+        .find(|m| m.name == name)
+        .ok_or_else(|| SupervisorError::UnknownMount(name.to_string()))?;
+
+    let socket = runtime_dir.join(format!("{name}.sock"));
+    if socket.exists() {
+        let _ = std::fs::remove_file(&socket);
+    }
+
+    let point = std::fs::canonicalize(&m.mount_point).unwrap_or_else(|_| m.mount_point.clone());
+    let live = mountinfo::read_from(mountinfo_path).unwrap_or_default();
+    let stale = matches!(std::fs::metadata(&point), Err(e) if e.raw_os_error() == Some(ENOTCONN));
+    if mountinfo::is_mounted_at(&live, &point) && stale {
+        SystemdSupervisor::<crate::systemd::dbus::SystemdUnits>::fusermount(&point, false).await?;
+    }
+    Ok(())
 }
 
 /// A name for a mount we did not configure.

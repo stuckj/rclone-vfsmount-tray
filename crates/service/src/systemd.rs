@@ -16,6 +16,11 @@ pub struct UnitSpec {
     pub description: String,
     pub executable: PathBuf,
     pub args: Vec<String>,
+    /// Run before the main process, on every start including systemd's own restarts.
+    ///
+    /// Failure is ignored: this only clears leftovers, and refusing to start because the
+    /// cleanup could not run would turn a recoverable state into a permanent one.
+    pub pre_start: Option<(PathBuf, Vec<String>)>,
     /// The unit's umask, which rclone applies to every file and directory it creates
     /// inside the mount as well as to its own files: `--umask` defaults to the process
     /// umask, and rclone masks its 0777/0666 defaults with it.
@@ -149,7 +154,7 @@ pub mod dbus {
                 argv.extend(spec.args.iter().cloned());
                 let exec_start = vec![(exec.clone(), argv, false)];
 
-                let properties: Vec<(&str, Value<'_>)> = vec![
+                let mut properties: Vec<(&str, Value<'_>)> = vec![
                     ("Description", Value::from(spec.description.clone())),
                     ("ExecStart", Value::from(exec_start)),
                     ("Type", Value::from("exec")),
@@ -182,6 +187,14 @@ pub mod dbus {
                     // failure that has to be reported, leaving the mount looking merely
                     // absent.
                 ];
+
+                if let Some((bin, args)) = &spec.pre_start {
+                    let exe = bin.to_string_lossy().into_owned();
+                    let mut argv = vec![exe.clone()];
+                    argv.extend(args.iter().cloned());
+                    // The trailing `true` is `ignore_errors`.
+                    properties.push(("ExecStartPre", Value::from(vec![(exe, argv, true)])));
+                }
 
                 // "fail" rather than "replace": if something already holds this unit
                 // name we want to hear about it, not silently displace it.
@@ -304,6 +317,7 @@ mod tests {
             description: "rclone-vfsmount-tray self test".into(),
             executable: PathBuf::from("/bin/sleep"),
             args: vec!["30".into()],
+            pre_start: None,
             umask: 0o077,
         };
 
@@ -351,6 +365,7 @@ mod tests {
             description: "rclone-vfsmount-tray failure self test".into(),
             executable: PathBuf::from("/bin/false"),
             args: vec![],
+            pre_start: None,
             umask: 0o022,
         };
         if units.start_transient(&spec).await.is_err() {
@@ -377,6 +392,60 @@ mod tests {
             "the unit must stop retrying and settle in failed, or MountState::Failed is \
              unreachable and rclone's error never reaches the user"
         );
+    }
+
+    #[tokio::test]
+    async fn exec_start_pre_is_accepted_and_actually_runs() {
+        // The recovery step that makes systemd's *automatic* restarts able to succeed.
+        // `StartTransientUnit` rejects the whole call on an unrecognised property, and a
+        // pre-start that silently never ran would leave the restart policy just as broken
+        // as having none — so both halves need checking against a real manager.
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+
+        let marker = std::env::temp_dir().join(format!("rvt-pre-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        std::fs::write(&marker, b"x").unwrap();
+
+        let name = format!("rvt-pretest-{}.service", std::process::id());
+        let spec = UnitSpec {
+            name: name.clone(),
+            description: "pre-start self test".into(),
+            executable: PathBuf::from("/bin/sleep"),
+            args: vec!["5".into()],
+            pre_start: Some((
+                PathBuf::from("/bin/rm"),
+                vec!["-f".into(), marker.to_string_lossy().into_owned()],
+            )),
+            umask: 0o022,
+        };
+
+        let started = units.start_transient(&spec).await;
+        if let Err(e) = &started {
+            let msg = e.to_string();
+            if msg.contains("ServiceUnknown") || msg.contains("not supported") {
+                eprintln!("skipped: no systemd user instance");
+                return;
+            }
+        }
+        started.expect("systemd must accept ExecStartPre");
+
+        for _ in 0..40 {
+            if !marker.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !marker.exists(),
+            "ExecStartPre was accepted but never ran, so nothing clears a stale socket"
+        );
+
+        let _ = units.stop(&name).await;
+        let _ = units.reset_failed(&name).await;
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]

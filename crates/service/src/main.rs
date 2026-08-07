@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
     version,
     about = "Service that owns rclone VFS mounts and serves their state over D-Bus"
 )]
-struct Args {
+pub struct Args {
     /// Path to the configuration file. Defaults to
     /// `$XDG_CONFIG_HOME/rclone-vfsmount-tray/config.toml`.
     #[arg(long, value_name = "PATH")]
@@ -39,9 +39,8 @@ struct Args {
 enum Command {
     /// Clear what a hard-killed rclone left behind, so its unit can start.
     ///
-    /// Run from each mount unit's `ExecStartPre`, so it also runs on systemd's automatic
-    /// restarts — which is the point: rclone will not rebind over its own leftover
-    /// socket, so without this a killed mount could never come back on its own.
+    /// Run from each mount unit's `ExecStartPre`. See DESIGN.md, "Delegated restart needs
+    /// a pre-start hook to work at all".
     #[command(hide = true)]
     PrepareMount {
         #[arg(long)]
@@ -108,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
         rclone.path().to_path_buf(),
         units,
         runtime_dir()?,
+        config_path.clone(),
     );
 
     // Reconcile before doing anything else. The service may have restarted while its

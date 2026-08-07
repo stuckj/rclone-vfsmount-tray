@@ -41,6 +41,13 @@ pub struct SystemdSupervisor<M: UnitManager> {
     mountinfo_path: PathBuf,
     /// Where rc sockets live — `$XDG_RUNTIME_DIR/rclone-vfsmount-tray`.
     runtime_dir: PathBuf,
+    /// The config this service was loaded from, passed to the pre-start hook.
+    ///
+    /// The hook runs from the systemd user manager's environment, which is not this
+    /// process's: a transient unit does not inherit the caller's `XDG_CONFIG_HOME`, and
+    /// `--config` is not visible to it either. Left to re-derive its own path it would
+    /// silently read a different file — or none — and clear nothing.
+    config_path: PathBuf,
     ready_timeout: Duration,
     /// How long to wait for a mount point to be released after stopping its unit.
     gone_timeout: Duration,
@@ -62,13 +69,20 @@ pub struct SystemdSupervisor<M: UnitManager> {
 }
 
 impl<M: UnitManager> SystemdSupervisor<M> {
-    pub fn new(config: Arc<Config>, rclone: PathBuf, units: M, runtime_dir: PathBuf) -> Self {
+    pub fn new(
+        config: Arc<Config>,
+        rclone: PathBuf,
+        units: M,
+        runtime_dir: PathBuf,
+        config_path: PathBuf,
+    ) -> Self {
         Self {
             config,
             rclone,
             units,
             mountinfo_path: PathBuf::from("/proc/self/mountinfo"),
             runtime_dir,
+            config_path,
             ready_timeout: READY_TIMEOUT,
             gone_timeout: Duration::from_secs(30),
             unit_gone_timeout: Duration::from_secs(35),
@@ -97,6 +111,43 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// The rc socket for a mount.
     pub fn socket_path(&self, name: &str) -> PathBuf {
         self.runtime_dir.join(format!("{name}.sock"))
+    }
+
+    /// The `ExecStartPre` that clears leftovers before rclone is exec'd.
+    ///
+    /// `None` when this binary cannot be located, which is not fatal — the mount still
+    /// starts, it just will not recover from a hard kill on its own. That is worth a
+    /// warning rather than silence: `/proc/self/exe` reads `<path> (deleted)` once the
+    /// file has been replaced, which a package upgrade does, and a unit recorded then
+    /// outlives the upgrade for as long as its mount does.
+    fn pre_start_hook(&self, name: &str) -> Option<(PathBuf, Vec<String>)> {
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, mount = name,
+                    "cannot locate this binary; the mount will start but systemd will not \
+                     be able to restart it after a hard kill");
+                return None;
+            }
+        };
+        // A replaced binary leaves a path that can never be exec'd again.
+        if !exe.is_file() || exe.to_string_lossy().ends_with(" (deleted)") {
+            tracing::warn!(path = %exe.display(), mount = name,
+                "this binary is no longer at the path it was started from — probably an \
+                 upgrade; the mount will start but will not auto-recover from a hard kill");
+            return None;
+        }
+        Some((
+            exe,
+            vec![
+                // Before the subcommand: `--config` is not a global argument.
+                "--config".to_string(),
+                self.config_path.to_string_lossy().into_owned(),
+                "prepare-mount".to_string(),
+                "--name".to_string(),
+                name.to_string(),
+            ],
+        ))
     }
 
     /// The lock guarding operations on one mount.
@@ -500,20 +551,8 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 ),
                 executable: self.rclone.clone(),
                 args: m.mount_args(&self.socket_path(&m.name)),
-                // This binary, re-invoked to clear a stale socket or mount point. It runs
-                // on systemd's automatic restarts too, which is the whole point: without
-                // it a killed rclone can never be restarted, because it will not rebind
-                // over its own leftover socket.
-                pre_start: std::env::current_exe().ok().map(|exe| {
-                    (
-                        exe,
-                        vec![
-                            "prepare-mount".to_string(),
-                            "--name".to_string(),
-                            m.name.clone(),
-                        ],
-                    )
-                }),
+                // This binary, re-invoked to clear a stale socket or mount point.
+                pre_start: self.pre_start_hook(&m.name),
                 // Ordinary, because rclone applies this to every file it creates inside
                 // the mount. A mount with `allow_other` set so another service account
                 // can read it would get 0600 files and fail with EACCES on all of them.
@@ -662,17 +701,11 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
 /// Clear what a hard-killed rclone leaves behind, so a start can succeed.
 ///
-/// Invoked from `ExecStartPre`, which means it runs on systemd's *automatic* restarts as
-/// well as on an explicit mount. Without it the restart policy cannot recover any crash
-/// that leaves a socket or mount point behind — rclone binds its rc socket with a bare
-/// listen and will not replace a stale one, so every restart dies on `EADDRINUSE`.
-///
-/// Talks to nothing. It runs while systemd is waiting for it, so asking systemd anything
-/// here would be a deadlock, and it needs no unit state to do its job.
-///
-/// Deliberately narrower than [`MountSupervisor::mount`]: it releases a mount point only
-/// when that point is *stale*. A live mount at the configured path belongs to somebody
-/// else, and unmounting it would be exactly the take-over this service refuses to do.
+/// Runs from `ExecStartPre`, so it covers systemd's automatic restarts and not only an
+/// explicit mount. Talks to nothing — systemd is waiting on it, so asking systemd anything
+/// here would deadlock — and releases a mount point only when that point is *stale*, since
+/// a live one there is somebody else's. See DESIGN.md, "Delegated restart needs a
+/// pre-start hook to work at all".
 pub async fn prepare_for_start(
     config: &Config,
     runtime_dir: &Path,
@@ -691,7 +724,16 @@ pub async fn prepare_for_start(
     }
 
     let point = std::fs::canonicalize(&m.mount_point).unwrap_or_else(|_| m.mount_point.clone());
-    let live = mountinfo::read_from(mountinfo_path).unwrap_or_default();
+    let live = match mountinfo::read_from(mountinfo_path) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Declining to clear a stale point means the start that follows will fail on
+            // an occupied path, so the reason has to be recoverable from the journal.
+            tracing::warn!(path = %mountinfo_path.display(), error = %e,
+                "could not read mountinfo; not clearing any stale mount point");
+            Vec::new()
+        }
+    };
     let stale = matches!(std::fs::metadata(&point), Err(e) if e.raw_os_error() == Some(ENOTCONN));
     if mountinfo::is_mounted_at(&live, &point) && stale {
         SystemdSupervisor::<crate::systemd::dbus::SystemdUnits>::fusermount(&point, false).await?;
@@ -841,6 +883,7 @@ mod tests {
             PathBuf::from("/usr/bin/rclone"),
             units,
             std::env::temp_dir().join(format!("rvt-run-{}-{tag}", std::process::id())),
+            PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
             fixture(tag, &mountinfo_with(&live)),
@@ -1123,6 +1166,7 @@ mod tests {
             PathBuf::from("/usr/bin/rclone"),
             units,
             std::env::temp_dir().join(format!("rvt-run-link-{}", std::process::id())),
+            PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
             fixture("symlink", &mountinfo_with(&[&real.to_string_lossy()])),
@@ -1227,6 +1271,7 @@ mod tests {
             PathBuf::from("/usr/bin/rclone"),
             units,
             std::env::temp_dir().join(format!("rvt-run-mm-{}", std::process::id())),
+            PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
             // mountinfo says backup:pictures is what is actually there.
@@ -1295,6 +1340,7 @@ mod tests {
             PathBuf::from("/usr/bin/rclone"),
             units,
             std::env::temp_dir().join(format!("rvt-run-fm-{}", std::process::id())),
+            PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
             fixture("forcemismatch", &mountinfo_with(&[&mp.to_string_lossy()])),
@@ -1309,6 +1355,109 @@ mod tests {
             !matches!(e, SupervisorError::NotManaged(_)),
             "force must override the source mismatch too, got {e:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_started_unit_carries_a_recovery_hook_the_binary_understands() {
+        // Without it a killed rclone can never be restarted by systemd: it will not
+        // rebind over its own leftover socket. The argv is checked against the binary's
+        // own parser, because a hook systemd runs and the binary rejects is a no-op that
+        // nothing else would notice.
+        let s = supervisor("hook", false, &[], UnitStatus::Inactive);
+        let _ = s.mount("backup").await;
+
+        let started = s.units.started.lock().unwrap();
+        let spec = started.first().expect("a unit should have been started");
+        let (bin, args) = spec
+            .pre_start
+            .as_ref()
+            .expect("every mount unit needs the recovery hook");
+        assert!(bin.is_file(), "the hook must point at a binary that exists");
+        assert_eq!(
+            args,
+            &[
+                "--config",
+                "/nonexistent/config.toml",
+                "prepare-mount",
+                "--name",
+                "backup"
+            ],
+            "the hook must be told which config the service actually loaded, and \
+             `--config` is not a global argument so it has to precede the subcommand"
+        );
+
+        // The binary's parser must accept exactly this.
+        let mut argv = vec![bin.to_string_lossy().into_owned()];
+        argv.extend(args.iter().cloned());
+        <crate::Args as clap::Parser>::try_parse_from(&argv)
+            .expect("the binary must accept the argv its own units record");
+    }
+
+    #[tokio::test]
+    async fn the_recovery_hook_clears_a_stale_socket() {
+        let dir = std::env::temp_dir().join(format!("rvt-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp = mount_point("hookstale");
+        let sock = dir.join("backup.sock");
+        std::fs::write(&sock, b"").unwrap();
+
+        let cfg = config_with_backup(mp.clone());
+        prepare_for_start(
+            &cfg,
+            &dir,
+            &fixture("hooksock", &mountinfo_with(&[])),
+            "backup",
+        )
+        .await
+        .unwrap();
+        assert!(
+            !sock.exists(),
+            "rclone dies on EADDRINUSE rather than replacing its own leftover socket"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_recovery_hook_leaves_a_live_mount_alone() {
+        // The guard that keeps this from being a take-over. The hook runs without the
+        // ownership checks `mount()` applies, so it must only ever clear a mount point
+        // that is dead — a live one at the configured path is somebody else's.
+        let dir = std::env::temp_dir().join(format!("rvt-hooklive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp = mount_point("hooklive");
+
+        let cfg = config_with_backup(mp.clone());
+        let mi = fixture("hooklive", &mountinfo_with(&[&mp.to_string_lossy()]));
+        prepare_for_start(&cfg, &dir, &mi, "backup").await.unwrap();
+
+        // `mp` is a real directory, so it is not stale; the hook must not have touched
+        // it. If it had run fusermount the call would have errored rather than returned.
+        assert!(
+            mp.is_dir(),
+            "a live mount point must be left exactly as it was"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_recovery_hook_names_a_mount_it_does_not_know() {
+        let dir = std::env::temp_dir().join(format!("rvt-hookunk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = config_with_backup(mount_point("hookunk"));
+        match prepare_for_start(
+            &cfg,
+            &dir,
+            &fixture("hookunk", &mountinfo_with(&[])),
+            "nope",
+        )
+        .await
+        {
+            Err(SupervisorError::UnknownMount(n)) => assert_eq!(n, "nope"),
+            other => panic!("expected UnknownMount, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

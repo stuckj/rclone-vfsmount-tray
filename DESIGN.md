@@ -159,6 +159,30 @@ What we get: mounts survive service restart, crash and upgrade; systemd handles 
 backoff and rate-limiting so we do not reimplement it; and one wedged remote cannot take the
 others with it.
 
+### Delegated restart needs a pre-start hook to work at all
+
+rclone binds its rc socket with a bare `net.Listen` and will not replace a stale one, and Go
+unlinks a UNIX socket only on a clean close. So a hard-killed rclone — the OOM killer, or
+systemd's own SIGKILL after `TimeoutStopSec` — leaves both a socket and a stale mount point
+behind, and every automatic restart dies on `EADDRINUSE` before it can mount anything. The
+restart policy would then work only in the cases where it cannot help (a failure before the
+socket is bound, such as bad credentials, which fails identically forever) and fail in the one
+case it exists for.
+
+Each mount unit therefore carries an `ExecStartPre` that re-invokes the service binary to
+clear those leftovers, so the cleanup runs on systemd's restarts and not only on an explicit
+mount. Two constraints shape it:
+
+- **It talks to nothing.** systemd is blocked waiting on it, so asking systemd anything there
+  would deadlock.
+- **It clears a mount point only when that point is stale.** It runs without the ownership
+  checks an explicit mount applies, so releasing a *live* mount there would be exactly the
+  take-over this service refuses to do.
+
+It is passed the config path the service was loaded from. A transient unit does not inherit
+the caller's environment, so a hook left to re-derive its own path would silently read a
+different file, or none.
+
 The cost is a dependency on systemd for supervision. Acceptable — the service is already a
 systemd user unit, and the target is Linux desktops.
 

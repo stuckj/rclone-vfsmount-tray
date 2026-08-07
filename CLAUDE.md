@@ -69,14 +69,37 @@ reasoning. Code comments state the rule and point there.
 
 ## Conventions
 
-Comments are restrained — roughly 10-20% of lines. Explain what would otherwise be
-re-derived, never what the code already says.
+Comments describe the code, not the project's history. Explain what a reader would
+otherwise re-derive — a non-obvious ordering constraint, an external behaviour depended
+on, an alternative that looks right and is not.
+
+Two things never belong in a comment: general best-practice advice, and development
+history. What broke while building it, which review caught it, what an earlier design
+assumed, how often a test flaked — all of that goes in the commit message, the PR, or
+the issue, where it is permanent and searchable and out of the reader's way. Prefer
+naming the constraint over narrating the discovery.
+
+**10-20% of lines is normal, as a guide rather than a limit.** Above that, re-read the
+comments against the rules above and check each one is still about the code: the usual
+cause of a high ratio is explaining consequences and justifying decisions inline, both of
+which belong in DESIGN.md.
+
+Two kinds of file legitimately sit higher. One documents an external format or behaviour
+nothing in the code implies — `mountinfo.rs` and the kernel's mountinfo layout. The other
+is a public API surface, where rustdoc on every item is expected and the bodies are often
+one-liners: `capabilities.rs` is 84 lines of code to 56 of rustdoc because eight public
+predicates each have to say what distinction they encode. In both cases the ratio is high
+because the code is dense, not because the prose is.
+
+So the number is a prompt to look, never a reason to cut a comment that is doing real work
+or to pad toward a figure.
 
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.
 
-Verified rclone behaviour is v1.75.0 (issue #9). The version floor of 1.60 is a sanity
-check, not a compatibility claim — feature availability is detected with `rc/list`.
+Verified rclone behaviour is v1.75.0 (issue #9). The version floor of 1.61 is the oldest
+rclone on which `--rc-addr unix://` works at all; feature availability above that is
+detected with `rc/list`, not inferred from a version.
 
 Commit messages explain why. When a change corrects an earlier decision, say what was
 wrong with it.
@@ -87,7 +110,7 @@ wrong with it.
 cargo fmt --all
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p rvt-core
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
 ```
 
 All blocking in CI. Read clippy's output rather than its exit status — a failure has been

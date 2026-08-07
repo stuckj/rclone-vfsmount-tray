@@ -200,6 +200,11 @@ pub struct Mount {
     #[serde(default)]
     pub gid: Option<u32>,
     /// Octal, as a string, so `0022` survives a round trip.
+    ///
+    /// Passed to rclone's `--umask` verbatim. Older rclone registers that flag as an
+    /// integer and parses it base-10, so `"0022"` is read as decimal 22 there rather than
+    /// octal — see #69. Leaving this unset avoids the question entirely and is what the
+    /// example config does.
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -221,7 +226,90 @@ impl Mount {
             format!("{}:{}", self.remote, self.path.trim_start_matches('/'))
         }
     }
+
+    /// The systemd unit name for this mount.
+    ///
+    /// [`Config::validate`] already restricts names to the characters a unit name
+    /// accepts, so for any config that passed validation this substitution changes
+    /// nothing. It is here for `Mount` values built directly, which skip that path.
+    pub fn unit_name(&self) -> String {
+        let slug: String = self
+            .name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("{UNIT_PREFIX}{slug}.service")
+    }
+
+    /// The rclone argv for this mount, excluding the binary itself.
+    ///
+    /// Order matters only for `extra_args`, which comes last so a user can override any
+    /// flag composed here — rclone takes the last occurrence of a repeated flag.
+    pub fn mount_args(&self, rc_socket: &Path) -> Vec<String> {
+        let mut a: Vec<String> = vec![
+            "mount".into(),
+            self.fs_spec(),
+            self.mount_point.to_string_lossy().into_owned(),
+        ];
+
+        a.push("--vfs-cache-mode".into());
+        a.push(self.cache_mode.as_str().into());
+        if let Some(size) = &self.cache_max_size {
+            a.push("--vfs-cache-max-size".into());
+            a.push(size.clone());
+        }
+        if let Some(age) = &self.cache_max_age {
+            a.push("--vfs-cache-max-age".into());
+            a.push(age.clone());
+        }
+
+        if self.read_only {
+            a.push("--read-only".into());
+        }
+        if self.allow_other {
+            a.push("--allow-other".into());
+        }
+        if let Some(uid) = self.uid {
+            a.push("--uid".into());
+            a.push(uid.to_string());
+        }
+        if let Some(gid) = self.gid {
+            a.push("--gid".into());
+            a.push(gid.to_string());
+        }
+        if let Some(umask) = &self.umask {
+            a.push("--umask".into());
+            a.push(umask.clone());
+        }
+
+        // The rc socket is what every tier above T4 talks to, so it is not optional and
+        // not configurable — a mount without it can only ever be scanned on disk.
+        //
+        // `--rc-no-auth` is safe *only* because the socket is unreachable by anyone but
+        // its owner: rc access is equivalent to shell access as this user. rclone does no
+        // chmod when binding, so the socket gets `0777 & ~umask`. What keeps it private is
+        // the 0700 directory it lives in, not its own mode — the unit's umask cannot be
+        // used for this, because rclone applies the same umask to every file it creates
+        // inside the mount. See DESIGN.md.
+        a.push("--rc".into());
+        a.push("--rc-addr".into());
+        a.push(format!("unix://{}", rc_socket.display()));
+        a.push("--rc-no-auth".into());
+
+        a.extend(self.extra_args.iter().cloned());
+        a
+    }
 }
+
+/// Prefix for every unit this service starts. Also how [`crate::supervisor`] tells its
+/// own units apart from any other rclone mount on the system.
+pub const UNIT_PREFIX: &str = "rvt-mount-";
 
 /// Why a config file cannot be used.
 #[derive(Debug, thiserror::Error)]
@@ -415,6 +503,23 @@ impl Config {
             }
             if !names.insert(n.to_string()) {
                 return Err(ConfigError::Invalid(format!("duplicate mount name {n:?}")));
+            }
+            // `--rc-addr` is a repeatable flag: rclone appends listeners rather than
+            // replacing them, so an extra one here does not override the UNIX socket, it
+            // adds a second endpoint beside it. Since the composed argv already carries
+            // `--rc-no-auth` — safe only because the socket is unreachable to anyone else
+            // — an added TCP listener would serve `core/command` and `config/dump`
+            // unauthenticated to the network. rc access is shell access as this user.
+            if let Some(bad) = m.extra_args.iter().find(|a| {
+                a.strip_prefix("--rc")
+                    .is_some_and(|r| r.is_empty() || r.starts_with('-') || r.starts_with('='))
+            }) {
+                return Err(ConfigError::Invalid(format!(
+                    "mount {n:?}: extra_args may not set rc flags ({bad:?}). The rc endpoint \
+                     is configured for you as a private UNIX socket; adding another listener \
+                     would expose an unauthenticated rc API, which is equivalent to shell \
+                     access as this user."
+                )));
             }
             // The colon case first, so it keeps its more specific advice.
             if m.remote.contains(':') {
@@ -777,5 +882,146 @@ mod tests {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
+    }
+
+    fn a_mount(name: &str) -> Mount {
+        Mount {
+            name: name.into(),
+            remote: "backup".into(),
+            path: "pictures".into(),
+            mount_point: PathBuf::from("/home/user/mnt/backup"),
+            cache_mode: CacheMode::Writes,
+            cache_max_size: None,
+            cache_max_age: None,
+            auto_mount: true,
+            read_only: false,
+            allow_other: false,
+            uid: None,
+            gid: None,
+            umask: None,
+            extra_args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mount_args_carry_the_fs_spec_the_point_and_the_rc_socket() {
+        let a = a_mount("backup").mount_args(Path::new("/run/user/1000/rvt/backup.sock"));
+        assert_eq!(a[0], "mount");
+        assert_eq!(a[1], "backup:pictures");
+        assert_eq!(a[2], "/home/user/mnt/backup");
+        // Every tier above T4 needs this socket, so it is never omitted.
+        let joined = a.join(" ");
+        assert!(
+            joined.contains("--rc-addr unix:///run/user/1000/rvt/backup.sock"),
+            "{joined}"
+        );
+        assert!(joined.contains("--vfs-cache-mode writes"), "{joined}");
+    }
+
+    #[test]
+    fn extra_args_come_last_so_they_win() {
+        // rclone takes the last occurrence of a repeated flag, which is what makes
+        // extra_args an escape hatch rather than a suggestion.
+        let mut m = a_mount("backup");
+        m.extra_args = vec!["--vfs-cache-mode".into(), "full".into()];
+        let a = m.mount_args(Path::new("/run/s.sock"));
+        let first = a.iter().position(|x| x == "--vfs-cache-mode").unwrap();
+        let last = a.iter().rposition(|x| x == "--vfs-cache-mode").unwrap();
+        assert!(
+            last > first,
+            "the override must come after the composed flag"
+        );
+        assert_eq!(a[last + 1], "full");
+    }
+
+    #[test]
+    fn optional_flags_appear_only_when_set() {
+        let plain = a_mount("backup").mount_args(Path::new("/run/s.sock"));
+        for absent in ["--read-only", "--allow-other", "--uid", "--umask"] {
+            assert!(
+                !plain.contains(&absent.to_string()),
+                "{absent} should be absent"
+            );
+        }
+
+        let mut m = a_mount("backup");
+        m.read_only = true;
+        m.allow_other = true;
+        m.uid = Some(1000);
+        m.gid = Some(1000);
+        m.umask = Some("0022".into());
+        m.cache_max_size = Some("10G".into());
+        m.cache_max_age = Some("24h".into());
+        let full = m.mount_args(Path::new("/run/s.sock")).join(" ");
+        for present in [
+            "--read-only",
+            "--allow-other",
+            "--uid 1000",
+            "--gid 1000",
+            "--umask 0022",
+            "--vfs-cache-max-size 10G",
+            "--vfs-cache-max-age 24h",
+        ] {
+            assert!(full.contains(present), "{present} missing from: {full}");
+        }
+    }
+
+    #[test]
+    fn a_root_mount_keeps_the_bare_colon() {
+        let mut m = a_mount("backup");
+        m.path = String::new();
+        assert_eq!(m.mount_args(Path::new("/run/s.sock"))[1], "backup:");
+    }
+
+    #[test]
+    fn extra_args_may_not_add_an_rc_listener() {
+        // The composed argv carries `--rc-no-auth`, which is safe only because the socket
+        // is unreachable to anyone else. `--rc-addr` appends listeners rather than
+        // replacing them, so one here would put an unauthenticated `core/command` and
+        // `config/dump` on the network. This is the boundary, so it is checked in every
+        // form the flag can take.
+        for bad in [
+            vec!["--rc-addr".to_string(), "0.0.0.0:5572".to_string()],
+            vec!["--rc-addr=0.0.0.0:5572".to_string()],
+            vec!["--rc".to_string()],
+            vec!["--rc-no-auth".to_string()],
+            vec!["--rc-user=admin".to_string()],
+            vec!["--rc-web-gui".to_string()],
+        ] {
+            let mut c = Config::default();
+            let mut m = a_mount("backup");
+            m.extra_args = bad.clone();
+            c.mounts.push(m);
+            let e = c
+                .validate()
+                .expect_err(&format!("{bad:?} must be rejected"))
+                .to_string();
+            assert!(e.contains("rc flags"), "{bad:?} gave {e}");
+        }
+
+        // Flags that merely start with the same letters are not rc flags.
+        for ok in [
+            vec!["--rclone-is-not-a-flag".to_string()],
+            vec!["--read-only".to_string()],
+            vec!["--vfs-cache-mode".to_string(), "full".to_string()],
+        ] {
+            let mut c = Config::default();
+            let mut m = a_mount("backup");
+            m.extra_args = ok.clone();
+            c.mounts.push(m);
+            c.validate()
+                .unwrap_or_else(|e| panic!("{ok:?} should be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn unit_names_are_prefixed_and_survive_valid_characters() {
+        assert_eq!(a_mount("backup").unit_name(), "rvt-mount-backup.service");
+        // Validation permits these, so they must pass through unchanged — otherwise two
+        // distinct configured mounts could land on one unit.
+        assert_eq!(
+            a_mount("my.mount_1-a").unit_name(),
+            "rvt-mount-my.mount_1-a.service"
+        );
     }
 }

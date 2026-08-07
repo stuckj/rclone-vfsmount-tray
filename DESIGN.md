@@ -159,6 +159,30 @@ What we get: mounts survive service restart, crash and upgrade; systemd handles 
 backoff and rate-limiting so we do not reimplement it; and one wedged remote cannot take the
 others with it.
 
+### Delegated restart needs a pre-start hook to work at all
+
+rclone binds its rc socket with a bare `net.Listen` and will not replace a stale one, and Go
+unlinks a UNIX socket only on a clean close. So a hard-killed rclone — the OOM killer, or
+systemd's own SIGKILL after `TimeoutStopSec` — leaves both a socket and a stale mount point
+behind, and every automatic restart dies on `EADDRINUSE` before it can mount anything. The
+restart policy would then work only in the cases where it cannot help (a failure before the
+socket is bound, such as bad credentials, which fails identically forever) and fail in the one
+case it exists for.
+
+Each mount unit therefore carries an `ExecStartPre` that re-invokes the service binary to
+clear those leftovers, so the cleanup runs on systemd's restarts and not only on an explicit
+mount. Two constraints shape it:
+
+- **It talks to nothing.** systemd is blocked waiting on it, so asking systemd anything there
+  would deadlock.
+- **It clears a mount point only when that point is stale.** It runs without the ownership
+  checks an explicit mount applies, so releasing a *live* mount there would be exactly the
+  take-over this service refuses to do.
+
+It is passed the config path the service was loaded from. A transient unit does not inherit
+the caller's environment, so a hook left to re-derive its own path would silently read a
+different file, or none.
+
 The cost is a dependency on systemd for supervision. Acceptable — the service is already a
 systemd user unit, and the target is Linux desktops.
 
@@ -292,11 +316,16 @@ What the socket controls is exposure to **other** users on the machine:
   directory mode, not the socket's own mode, is what actually excludes other users.
 - Given the above, the socket's permissions are **defence in depth, not the primary control**.
   rclone performs no `chmod` or umask handling when binding (`net.Listen` only), so the socket
-  gets `0777 & ~umask` — `0755` under the common umask `022`. Setting **`UMask=0077` on the
-  systemd unit** makes it `0700` from the moment it exists. That matters only if the socket
-  ever lands outside `$XDG_RUNTIME_DIR` (an override, an unusual distribution), which is
-  precisely when you want to have already been careful. Prefer it over a post-bind `chmod`,
-  which leaves a window in which rclone is already accepting connections.
+  gets `0777 & ~umask` — `0755` under the common umask `022`.
+
+  **The unit's umask is not the lever to use for this.** rclone's `--umask` defaults to the
+  process umask, and it masks its own `0777`/`0666` defaults with it, so a `UMask=0077` on the
+  unit also makes every file and directory *inside the mount* `0600`/`0700`. A mount shared with
+  another service account via `allow_other` would then fail with `EACCES` on every file. The
+  directory mode is what excludes other users, and the service creates
+  `$XDG_RUNTIME_DIR/rclone-vfsmount-tray` `0700` explicitly rather than relying on the socket's
+  own mode. The rc client additionally refuses a socket whose mode or parent directory would let
+  anyone else reach it, and checks the peer's uid after connecting.
 - Because the socket is the boundary, rclone is run with `--rc-no-auth`: an rc password stored
   in a config file readable by the same user adds a step, not a boundary, and would need to be
   passed on a command line or through the environment.
@@ -343,7 +372,7 @@ the expected cache root.
 
 ```
 rclone (per mount, systemd user unit)
-   │  rc over UNIX socket (UMask=0077 on the unit)
+   │  rc over UNIX socket (in a 0700 directory)
    ▼
 rclone-vfsmount-trayd ──── poller ──► TransferState (carries its own fidelity tier)
    │                                        │

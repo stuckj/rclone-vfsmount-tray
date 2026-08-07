@@ -171,9 +171,13 @@ pub trait MountSupervisor: Send + Sync {
 
     /// Tear down a mount.
     ///
-    /// Must refuse with [`SupervisorError::PendingUploads`] when the write-back
-    /// cache still holds unuploaded data, unless `force` is set. `force` is always
-    /// an explicit caller decision — never a default, and never inferred.
+    /// When the write-back cache still holds unuploaded data, returns
+    /// [`SupervisorError::PendingUploads`] carrying the summary rather than unmounting.
+    /// That is a warning channel, not a veto: nothing is lost by unmounting, since the
+    /// cache is on disk and uploads resume on remount (#19). The caller shows the user
+    /// what is outstanding and, if they choose to proceed, calls again with `force`.
+    ///
+    /// `force` is always an explicit caller decision — never a default, never inferred.
     fn unmount<'a>(
         &'a self,
         name: &'a str,

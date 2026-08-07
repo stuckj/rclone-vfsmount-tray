@@ -229,23 +229,34 @@ impl RcClient {
                 });
             }
 
-            // A private socket in a directory others can write to is not private: they can
-            // unlink it and put their own there. Only the immediate parent's mode is
-            // checked; `peer_cred` after connecting is what secures the path as a whole.
+            // What matters is whether anyone else can *reach* the socket, which the
+            // directory decides: a directory with no group or other bits cannot be
+            // traversed, so the mode of the socket inside it is unreachable either way.
+            // See DESIGN.md — the directory is the control, the socket's own mode is
+            // defence in depth.
+            //
+            // This is not academic. rclone does no chmod when binding, so under the
+            // ordinary umask its socket is 0755, and the mount unit deliberately keeps an
+            // ordinary umask because rclone applies the same one to every file inside the
+            // mount. Demanding 0600 of the socket itself would refuse every socket the
+            // service creates.
+            let mut dir_is_private = false;
             if let Some(dir) = self.socket.parent() {
                 match std::fs::metadata(dir) {
-                    Ok(d) if d.mode() & 0o022 != 0 => {
-                        return Err(RcError::InsecureSocket {
-                            path: self.socket.clone(),
-                            reason: format!(
-                                "its directory {} is mode {:04o} and writable by others, \
-                                 so the socket can be replaced",
-                                dir.display(),
-                                d.mode() & 0o777
-                            ),
-                        });
+                    Ok(d) => {
+                        if d.mode() & 0o022 != 0 {
+                            return Err(RcError::InsecureSocket {
+                                path: self.socket.clone(),
+                                reason: format!(
+                                    "its directory {} is mode {:04o} and writable by \
+                                     others, so the socket can be replaced",
+                                    dir.display(),
+                                    d.mode() & 0o777
+                                ),
+                            });
+                        }
+                        dir_is_private = d.mode() & 0o077 == 0 && d.uid() == current_uid();
                     }
-                    Ok(_) => {}
                     // Not a connect failure: nothing has been connected to. We simply
                     // cannot establish that the socket is private, so we refuse.
                     Err(e) => {
@@ -265,11 +276,18 @@ impl RcClient {
             // ship. A real condition, not a defensive one. Group and other must have
             // nothing at all: write permission alone is enough to connect, and connecting
             // is all an attacker needs.
+            // Only when the directory does not already exclude everyone else. Connecting
+            // needs write permission, so a loose socket in a traversable directory hands
+            // rc access — and therefore shell access as this user — to anyone who
+            // qualifies.
             let mode = md.mode() & 0o777;
-            if mode & 0o077 != 0 {
+            if mode & 0o077 != 0 && !dir_is_private {
                 return Err(RcError::InsecureSocket {
                     path: self.socket.clone(),
-                    reason: format!("mode {mode:04o} allows access beyond its owner"),
+                    reason: format!(
+                        "mode {mode:04o} allows access beyond its owner, and its \
+                         directory does not exclude other users either"
+                    ),
                 });
             }
 
@@ -879,6 +897,7 @@ mod tests {
         // moving the check after the request would still return the right error.
         let (dir, socket, connects, server) =
             slow_failing_server("unconnected", Duration::from_millis(10)).await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o775)).unwrap();
 
         let e = RcClient::new(&socket)
@@ -925,6 +944,39 @@ mod tests {
 
         server.handle.abort();
         let _ = std::fs::remove_dir_all(&server.dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_loose_socket_inside_a_private_directory_is_accepted() {
+        // This is what the service actually produces. rclone does no chmod when binding,
+        // so its socket is 0755 under an ordinary umask, and the mount unit keeps an
+        // ordinary umask deliberately — rclone applies the same one to every file inside
+        // the mount. A 0700 directory cannot be traversed, so nobody else can reach the
+        // socket whatever its own mode says. Refusing it would reject every socket this
+        // project creates, on a default install.
+        let dir = std::env::temp_dir().join(format!("rvt-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("rc.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        RcClient::new(&path)
+            .verify()
+            .expect("a 0755 socket in a 0700 directory is unreachable by anyone else");
+
+        // Open the directory and the same socket must now be refused.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(
+                RcClient::new(&path).verify(),
+                Err(RcError::InsecureSocket { .. })
+            ),
+            "with a traversable directory the socket's own mode is what decides"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1043,7 +1095,9 @@ mod tests {
     async fn an_insecure_socket_is_refused_before_anything_is_sent() {
         let server =
             FakeRc::serving("insecure", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await;
-        // rclone's own default, which is exactly what this check exists to catch.
+        // A traversable directory, so the socket's own mode is what decides; inside a
+        // 0700 directory a loose socket is unreachable and is accepted.
+        std::fs::set_permissions(&server.dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&server.socket, std::fs::Permissions::from_mode(0o775)).unwrap();
 
         let e = server
@@ -1077,6 +1131,10 @@ mod tests {
         let path = dir.join("perms.sock");
         let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
 
+        // A traversable directory, so the socket's own mode is what decides. Inside a
+        // 0700 directory a loose socket is unreachable and is accepted — that case has
+        // its own test below.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         // rclone's own default. Connecting needs only write permission, so this hands rc
         // access to the user's group — and rc access is shell access.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o775)).unwrap();

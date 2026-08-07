@@ -45,7 +45,10 @@ impl MountPoller {
 
     /// How long to wait before polling again.
     pub fn interval(state: &TransferState) -> Duration {
-        if state.is_idle() {
+        // A mount we cannot observe gets the slow cadence, not the fast one: `is_idle()`
+        // is false for it, but re-deriving "still cannot see it" every second is a busy
+        // loop over a fact that cannot change until the mount is restarted.
+        if state.is_idle() || !state.outstanding_known {
             IDLE
         } else {
             ACTIVE
@@ -58,6 +61,27 @@ impl MountPoller {
     /// on-disk tier exists for, so it degrades rather than erroring and says why. A real
     /// fault from a live rclone is returned.
     pub async fn poll(&mut self) -> Result<TransferState, RcError> {
+        // Capabilities are latched at connect, and an rclone that was down then leaves
+        // them empty — after which nothing here would issue another rc call, so the mount
+        // would report as unobservable for the life of the service even once rclone came
+        // back. Re-probing while they are empty is what lets a mount that starts after
+        // the service, or restarts after a crash, recover.
+        if self.caps.is_empty() {
+            if let Ok(caps) = Capabilities::probe(&self.client).await {
+                self.caps = caps;
+            }
+        }
+        if self.caps.is_empty() {
+            // Say what actually happened. `probe` kept the reason; inventing one about
+            // the rclone build sends the user to look in the wrong place entirely.
+            return Ok(TransferState::unmonitored(
+                &self.name,
+                self.caps
+                    .degraded_reason()
+                    .unwrap_or("rclone reported no rc commands"),
+            ));
+        }
+
         // `vfs/stats` first: it carries the cache paths and the two actionable flags, and
         // it is the only source for either.
         let cache = match self.fetch_stats().await {
@@ -198,36 +222,7 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-            let handle = tokio::spawn(async move {
-                use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                while let Ok((mut stream, _)) = listener.accept().await {
-                    let routes = routes.clone();
-                    tokio::spawn(async move {
-                        let mut buf = vec![0u8; 8192];
-                        let n = stream.read(&mut buf).await.unwrap_or(0);
-                        let req = String::from_utf8_lossy(&buf[..n]).into_owned();
-                        let body = routes
-                            .iter()
-                            .find(|(path, _)| req.starts_with(&format!("POST /{path} ")))
-                            .map(|(_, b)| b.clone());
-                        let resp = match body {
-                            Some(b) => format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}",
-                                b.len()
-                            ),
-                            None => {
-                                let b = "command not found";
-                                format!(
-                                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n{b}",
-                                    b.len()
-                                )
-                            }
-                        };
-                        let _ = stream.write_all(resp.as_bytes()).await;
-                        let _ = stream.flush().await;
-                    });
-                }
-            });
+            let handle = tokio::spawn(async move { serve_routes(listener, routes).await });
             Self {
                 dir,
                 socket,
@@ -237,6 +232,35 @@ mod tests {
 
         fn client(&self) -> RcClient {
             RcClient::new(&self.socket)
+        }
+    }
+
+    /// Answer each request from a fixed routing table; 404 for anything unlisted.
+    async fn serve_routes(listener: tokio::net::UnixListener, routes: Vec<(&'static str, String)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let body = routes
+                    .iter()
+                    .find(|(path, _)| req.starts_with(&format!("POST /{path} ")))
+                    .map(|(_, b)| b.clone());
+                let resp = match body {
+                    Some(b) => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}",
+                        b.len()
+                    ),
+                    None => {
+                        let b = "command not found";
+                        format!("HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n{b}", b.len())
+                    }
+                };
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
         }
     }
 
@@ -599,9 +623,52 @@ mod tests {
         assert!(why.contains("vfs-cache-mode off"), "{why}");
         assert_eq!(
             MountPoller::interval(&s),
-            ACTIVE,
-            "it must not drop to the idle cadence on a mount it cannot see"
+            IDLE,
+            "re-deriving 'still cannot see it' every second is a busy loop over a fact \
+             that cannot change until the mount is restarted"
         );
+    }
+
+    #[tokio::test]
+    async fn a_mount_that_starts_after_the_service_recovers() {
+        // Capabilities are latched at connect. If rclone was not up then, the set is
+        // empty — and with an empty set the poller issues no rc calls at all, so without
+        // re-probing the mount reports as unobservable for the life of the service even
+        // after rclone comes back. The service starting before its mount units, or a
+        // mount unit restarting after a crash, both land here.
+        let dir = std::env::temp_dir().join(format!("rvt-late-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("rc.sock");
+
+        // Nothing listening yet.
+        let mut p = MountPoller::connect("backup", RcClient::new(&socket))
+            .await
+            .expect("an absent rclone is not a fault");
+        let before = p.poll().await.unwrap();
+        assert!(!before.outstanding_known, "nothing to see yet");
+
+        // rclone comes up on the same socket.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let routes: Vec<(&'static str, String)> = vec![
+            ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+            ("vfs/queue", fixture("vfs-queue-uploading.json")),
+            ("vfs/stats", fixture("vfs-stats-upload-in-progress.json")),
+        ];
+        let server = tokio::spawn(async move { serve_routes(listener, routes).await });
+
+        let after = p.poll().await.expect("the mount is back");
+        assert!(
+            after.outstanding_known,
+            "the poller must re-probe rather than stay blind for the session"
+        );
+        assert_eq!(after.fidelity, Tier::T2);
+        assert!(after.pending.files > 0);
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

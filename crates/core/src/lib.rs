@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod models;
+pub mod mountinfo;
 pub mod rclone;
 pub mod supervisor;
 

@@ -14,6 +14,20 @@ const ACTIVE: Duration = Duration::from_secs(1);
 /// Poll interval while the queue is empty. An idle mount should cost nothing.
 const IDLE: Duration = Duration::from_secs(15);
 
+/// What `vfs/stats` was able to say about this mount's write-back cache.
+///
+/// [`Self::NotAsked`] and [`Self::Absent`] both yield no `DiskCache`, and collapsing them
+/// into one `Option` makes "this rclone does not offer `vfs/stats`" indistinguishable from
+/// "this mount has no cache" — which are a missing endpoint and a missing cache, and call
+/// for opposite handling.
+enum CacheProbe {
+    /// This rclone does not register `vfs/stats`, so the cache was never asked about.
+    NotAsked,
+    /// Asked, and this mount has no write-back cache.
+    Absent,
+    Present(DiskCache),
+}
+
 /// Polls one mount.
 pub struct MountPoller {
     name: String,
@@ -101,31 +115,48 @@ impl MountPoller {
             }
             // No `vfs/queue` on this build: counts are all there is over rc.
             Err(RcError::Failed { status: 404, .. }) => match &cache {
-                Some(c) => TransferState::from_stats(&self.name, c),
-                None => {
+                CacheProbe::Present(c) => TransferState::from_stats(&self.name, c),
+                CacheProbe::Absent => {
                     return Ok(TransferState::unmonitored(
                         &self.name,
                         "this rclone registers no vfs/queue and this mount has no \
                          write-back cache, so nothing outstanding can be observed",
                     ))
                 }
+                CacheProbe::NotAsked => {
+                    return Ok(TransferState::unmonitored(
+                        &self.name,
+                        "this rclone registers neither vfs/queue nor vfs/stats, so \
+                         nothing outstanding can be observed over rc",
+                    ))
+                }
             },
             Err(e) => return Err(e),
         };
 
-        // No disk cache means no write-back queue to observe: this mount's cache mode is
-        // `off`, so writes stream straight to the remote where nothing can see them.
-        // DESIGN.md: say the mount is unmonitored rather than imply it is idle. rclone
-        // answers `vfs/queue` with `{}` here rather than an error, so without this the
-        // state would read as a confident, non-degraded zero.
-        let Some(cache) = cache else {
-            return Ok(TransferState::unmonitored(
-                &self.name,
-                "this mount has no write-back cache (--vfs-cache-mode off), so writes \
-                 stream straight to the remote and nothing outstanding can be observed",
-            ));
-        };
-        state = state.with_cache_health(&cache);
+        match &cache {
+            CacheProbe::Present(c) => state = state.with_cache_health(c),
+            // rclone answers `vfs/queue` with `{}` for a cacheless mount rather than an
+            // error, so the queue-derived state above is an empty one. Reporting it as-is
+            // would be a confident, non-degraded zero for a mount whose writes stream
+            // straight to the remote where nothing can see them.
+            CacheProbe::Absent => {
+                return Ok(TransferState::unmonitored(
+                    &self.name,
+                    "this mount has no write-back cache (--vfs-cache-mode off), so writes \
+                     stream straight to the remote and nothing outstanding can be observed",
+                ))
+            }
+            // The queue answered, so what is outstanding is known; only the two health
+            // flags and the cache path are missing. Downgrading to unmonitored here would
+            // discard a working answer over an enrichment that never arrived.
+            CacheProbe::NotAsked => {
+                state = state.degraded(
+                    "this rclone registers no vfs/stats, so cache errors and a full cache \
+                     cannot be reported",
+                )
+            }
+        }
 
         // Per-file progress, where the build has `core/stats` and the transfers can be
         // attributed to this mount. Without the cache path a transfer cannot be told from
@@ -169,18 +200,18 @@ impl MountPoller {
         TransferState::unmonitored(&self.name, e.to_string())
     }
 
-    async fn fetch_stats(&mut self) -> Result<Option<DiskCache>, RcError> {
+    async fn fetch_stats(&mut self) -> Result<CacheProbe, RcError> {
         if !self.caps.has("vfs/stats") {
-            return Ok(None);
+            return Ok(CacheProbe::NotAsked);
         }
         let stats: VfsStats = self.client.call("vfs/stats", empty()).await?;
-        let cache = stats.disk_cache;
-        if let Some(c) = &cache {
-            if !c.path.is_empty() {
-                self.cache_path = Some(c.path.clone());
-            }
+        let Some(cache) = stats.disk_cache else {
+            return Ok(CacheProbe::Absent);
+        };
+        if !cache.path.is_empty() {
+            self.cache_path = Some(cache.path.clone());
         }
-        Ok(cache)
+        Ok(CacheProbe::Present(cache))
     }
 
     async fn fetch_queue(&self) -> Result<VfsQueue, RcError> {
@@ -205,16 +236,43 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
-    /// Answers a fixed body per rc command path, so a poll can be driven end to end.
+    /// The rc bodies to answer with, shared so a test can change one between polls.
+    type Routes = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>;
+
+    fn routes(rs: Vec<(&'static str, String)>) -> Routes {
+        std::sync::Arc::new(std::sync::Mutex::new(rs))
+    }
+
+    /// Answers a body per rc command path, so a poll can be driven end to end.
     struct FakeRc {
         dir: PathBuf,
         socket: PathBuf,
+        routes: Routes,
         handle: tokio::task::JoinHandle<()>,
     }
 
     impl FakeRc {
+        /// Replace one route's body. Anything a poll derives by differencing two polls is
+        /// invisible to a server that answers identically every time.
+        fn set(&self, path: &str, body: String) {
+            let mut rs = self.routes.lock().unwrap();
+            for r in rs.iter_mut() {
+                if r.0 == path {
+                    r.1 = body;
+                    return;
+                }
+            }
+            panic!("no such route: {path}");
+        }
+
         async fn new(tag: &str, routes: Vec<(&'static str, String)>) -> Self {
-            let dir = std::env::temp_dir().join(format!("rvt-poll-{}-{tag}", std::process::id()));
+            // The sequence number, not the tag, is what keeps two concurrent tests apart:
+            // `new` opens by removing the directory, so a tag used twice has one test
+            // deleting the other's live socket.
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir =
+                std::env::temp_dir().join(format!("rvt-poll-{}-{tag}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -222,10 +280,13 @@ mod tests {
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-            let handle = tokio::spawn(async move { serve_routes(listener, routes).await });
+            let routes = self::routes(routes);
+            let served = routes.clone();
+            let handle = tokio::spawn(async move { serve_routes(listener, served).await });
             Self {
                 dir,
                 socket,
+                routes,
                 handle,
             }
         }
@@ -235,8 +296,8 @@ mod tests {
         }
     }
 
-    /// Answer each request from a fixed routing table; 404 for anything unlisted.
-    async fn serve_routes(listener: tokio::net::UnixListener, routes: Vec<(&'static str, String)>) {
+    /// Answer each request from the routing table; 404 for anything unlisted.
+    async fn serve_routes(listener: tokio::net::UnixListener, routes: Routes) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         while let Ok((mut stream, _)) = listener.accept().await {
             let routes = routes.clone();
@@ -245,6 +306,8 @@ mod tests {
                 let n = stream.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).into_owned();
                 let body = routes
+                    .lock()
+                    .unwrap()
                     .iter()
                     .find(|(path, _)| req.starts_with(&format!("POST /{path} ")))
                     .map(|(_, b)| b.clone());
@@ -302,10 +365,20 @@ mod tests {
         let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
         let s = p.poll().await.expect("a live rclone is not an error");
 
-        assert_eq!(s.fidelity, Tier::T2);
+        assert_eq!(s.fidelity, Some(Tier::T2));
         assert!(s.pending.known_bytes > 0, "the queue carries a byte total");
         assert_eq!(s.uploading, Some(1));
         assert!(s.degraded_reason.is_none());
+    }
+
+    /// A cache in trouble. Every capture in `testdata/` is healthy, so the two states the
+    /// user has to act on cannot be served from one.
+    fn unhealthy_stats() -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
+        v["diskCache"]["outOfSpace"] = serde_json::json!(true);
+        v["diskCache"]["erroredFiles"] = serde_json::json!(3);
+        v.to_string()
     }
 
     #[tokio::test]
@@ -315,7 +388,7 @@ mod tests {
             vec![
                 ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
                 ("vfs/queue", fixture("vfs-queue-uploading.json")),
-                ("vfs/stats", fixture("vfs-stats-upload-in-progress.json")),
+                ("vfs/stats", unhealthy_stats()),
             ],
         )
         .await;
@@ -323,9 +396,53 @@ mod tests {
         let s = p.poll().await.unwrap();
 
         // `erroredFiles` and `outOfSpace` are only in vfs/stats, and the byte total is
-        // only in vfs/queue. Both have to survive the merge.
-        assert!(s.pending.known_bytes > 0);
-        assert!(!s.out_of_space, "the capture is not out of space");
+        // only in vfs/queue. Both have to survive the merge. The flags are asserted true
+        // here because both default to false: a healthy capture would pass this test
+        // whether or not the merge happened at all.
+        assert!(s.pending.known_bytes > 0, "the queue total survived");
+        assert!(
+            s.out_of_space,
+            "the cache is full and the user must be told"
+        );
+        assert_eq!(s.errored_files, 3);
+    }
+
+    #[tokio::test]
+    async fn a_build_without_vfs_stats_keeps_the_queue_answer() {
+        let fake = FakeRc::new(
+            "nostats",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue"])),
+                ("vfs/queue", fixture("vfs-queue-two-items.json")),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let s = p.poll().await.expect("a missing command is not a fault");
+
+        // Not asking `vfs/stats` yields no cache, exactly as a cacheless mount does. Only
+        // the second is grounds for reporting the mount unobservable; treating them alike
+        // throws away a queue that answered in full.
+        assert!(
+            s.outstanding_known,
+            "the queue answered, so what is outstanding is known"
+        );
+        assert_eq!(s.fidelity, Some(Tier::T2));
+        assert_eq!(s.pending.files, 2);
+        assert_eq!(s.pending.known_bytes, 393_216);
+        assert!(
+            s.degraded_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("vfs/stats")),
+            "the missing health flags are still worth saying, got {:?}",
+            s.degraded_reason
+        );
+        assert!(
+            !s.degraded_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("cache-mode")),
+            "the cache mode is not what is wrong here"
+        );
     }
 
     #[tokio::test]
@@ -341,7 +458,7 @@ mod tests {
         let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
         let s = p.poll().await.expect("a missing command is not a fault");
 
-        assert_eq!(s.fidelity, Tier::T3);
+        assert_eq!(s.fidelity, Some(Tier::T3));
         assert_eq!(
             s.pending.known_bytes, 0,
             "there is no honest byte total without the queue"
@@ -362,7 +479,15 @@ mod tests {
         assert_eq!(p.tier(), Tier::T4);
 
         let s = p.poll().await.expect("an absent rclone is not a fault");
-        assert_eq!(s.fidelity, Tier::T4);
+        assert!(!s.outstanding_known);
+        // The capability tier is T4 — a disk scan could still answer. What produced *this*
+        // state is nothing, and `Tier::T4.meets_the_bar()` is true, so naming any tier here
+        // would tell a caller these figures are good enough to unmount on.
+        assert_eq!(s.fidelity, None);
+        assert!(
+            !s.fidelity.is_some_and(Tier::meets_the_bar),
+            "an unobserved mount must never claim it meets the bar"
+        );
         assert!(
             s.degraded_reason.is_some(),
             "the UI has to be able to say why it lost precision"
@@ -410,12 +535,16 @@ mod tests {
             return;
         };
 
-        let dir = std::env::temp_dir().join(format!("rvt-live-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // Both cleanups run on unwind. Every assertion below is between the spawn and the
+        // teardown, so a failing one would otherwise leave an rclone holding a listener
+        // and an rc socket for as long as the machine stays up.
+        let dir = TempDir(std::env::temp_dir().join(format!("rvt-live-{}", std::process::id())));
+        let dir = &dir.0;
+        let _ = std::fs::remove_dir_all(dir);
         let (src, cache) = (dir.join("src"), dir.join("cache"));
         std::fs::create_dir_all(&src).unwrap();
         std::fs::create_dir_all(&cache).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.join("rc.sock");
 
         // A long write-back delay keeps the file in the queue for the whole test rather
@@ -440,6 +569,7 @@ mod tests {
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .expect("rclone should start");
 
@@ -526,7 +656,15 @@ mod tests {
         assert!(!state.out_of_space && state.errored_files == 0);
 
         let _ = child.kill().await;
-        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Removes its directory however the test leaves the stack.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Read rclone's log until it announces the port it bound.
@@ -630,6 +768,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_rate_tracks_bytes_in_flight_not_departures_from_the_queue() {
+        // One 128MB file. It stays in the queue for the whole upload, so the queue's byte
+        // total does not move until the moment it finishes — a rate differenced from that
+        // total reads 0 B/s for minutes and then spikes to 128MB in one interval. What
+        // does move is `core/stats` progress, which is why the rate is differenced from
+        // the queue total *minus* bytes already sent.
+        let progressed = |bytes: u64| {
+            let mut v: serde_json::Value =
+                serde_json::from_str(&fixture("core-stats-vfs-upload-midflight.json")).unwrap();
+            v["transferring"][0]["bytes"] = serde_json::json!(bytes);
+            v.to_string()
+        };
+        let fake = FakeRc::new(
+            "rate",
+            vec![
+                (
+                    "rc/list",
+                    rc_list(&["rc/list", "vfs/queue", "vfs/stats", "core/stats"]),
+                ),
+                ("vfs/queue", fixture("vfs-queue-uploading.json")),
+                ("vfs/stats", fixture("vfs-stats-upload-in-progress.json")),
+                ("core/stats", progressed(20_000_000)),
+            ],
+        )
+        .await;
+
+        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let first = p.poll().await.unwrap();
+        assert!(first.has_progress, "core/stats reached the state");
+        assert_eq!(
+            first.rate_bytes_per_sec, None,
+            "one sample is not a rate yet"
+        );
+
+        // The queue is unchanged; only the bytes sent have grown.
+        fake.set("core/stats", progressed(60_000_000));
+        let second = p.poll().await.unwrap();
+        assert_eq!(second.pending.known_bytes, first.pending.known_bytes);
+        assert!(
+            second.rate_bytes_per_sec.is_some_and(|r| r > 0),
+            "40MB moved between polls, got {:?}",
+            second.rate_bytes_per_sec
+        );
+    }
+
+    #[tokio::test]
     async fn a_mount_that_starts_after_the_service_recovers() {
         // Capabilities are latched at connect. If rclone was not up then, the set is
         // empty — and with an empty set the poller issues no rc calls at all, so without
@@ -652,19 +836,19 @@ mod tests {
         // rclone comes up on the same socket.
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let routes: Vec<(&'static str, String)> = vec![
+        let rs = routes(vec![
             ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
             ("vfs/queue", fixture("vfs-queue-uploading.json")),
             ("vfs/stats", fixture("vfs-stats-upload-in-progress.json")),
-        ];
-        let server = tokio::spawn(async move { serve_routes(listener, routes).await });
+        ]);
+        let server = tokio::spawn(async move { serve_routes(listener, rs).await });
 
         let after = p.poll().await.expect("the mount is back");
         assert!(
             after.outstanding_known,
             "the poller must re-probe rather than stay blind for the session"
         );
-        assert_eq!(after.fidelity, Tier::T2);
+        assert_eq!(after.fidelity, Some(Tier::T2));
         assert!(after.pending.files > 0);
 
         server.abort();

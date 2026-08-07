@@ -1,0 +1,13 @@
+{
+  "queue": [
+    {
+      "delay": 64,
+      "expiry": 51.166126329,
+      "id": 2,
+      "name": "willfail.bin",
+      "size": 14,
+      "tries": 5,
+      "uploading": false
+    }
+  ]
+}

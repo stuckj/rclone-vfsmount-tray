@@ -392,6 +392,31 @@ fn a_multi_item_queue_carries_a_distinct_entry_per_file() {
     );
 }
 
+/// A file rclone has failed to upload several times, captured from a live rclone v1.75.0
+/// writing to a remote whose permissions were removed mid-run.
+///
+/// `tries` counts attempts from the moment each one starts, not failures: the healthy
+/// capture in `vfs-queue-uploading.json` also reports 1. Only a value above 1 is evidence
+/// of failure, and this is the fixture that pins the difference.
+#[test]
+fn a_retrying_upload_is_told_apart_from_a_healthy_one_by_tries_alone() {
+    let failing: VfsQueue = vfs_queue("vfs-queue-retrying.json");
+    let healthy: VfsQueue = vfs_queue("vfs-queue-uploading.json");
+
+    assert_eq!(healthy.queue[0].tries, 1, "a first attempt, going fine");
+    assert!(
+        failing.queue[0].tries > 1,
+        "captured after repeated failure"
+    );
+    // Neither is uploading-vs-not: the failing one is between retries, backing off, and
+    // the flag alone would read as "merely queued".
+    assert!(!failing.queue[0].uploading);
+    assert!(
+        failing.queue[0].delay > healthy.queue[0].delay,
+        "backing off"
+    );
+}
+
 #[test]
 fn core_stats_mid_upload_has_real_progress() {
     let s: CoreStats = core_stats("core-stats-vfs-upload-midflight.json", true);
@@ -512,6 +537,7 @@ const PINNED_FIXTURES: &[&str] = &[
     "rc-list-v1.75.0.json",
     "vfs-list.json",
     "vfs-queue-queued-not-uploading.json",
+    "vfs-queue-retrying.json",
     "vfs-queue-two-items.json",
     "vfs-queue-uploading.json",
     "vfs-stats-idle.json",

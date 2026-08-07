@@ -21,9 +21,11 @@ pub struct TransferFile {
     pub size: Option<u64>,
     /// Whether this file is uploading right now, as opposed to merely queued.
     pub in_flight: Option<bool>,
-    /// Failed upload attempts. Climbing values mean repeated failure, not just slowness.
+    /// Upload attempts, counted from the moment each one starts. A healthy upload reports
+    /// 1 while it is in flight, so only a value above 1 means an attempt has failed.
     pub tries: Option<u64>,
-    /// Bytes already sent for this file. Only ever `Some` at T1.
+    /// Bytes already sent for this file. Supplied by `core/stats` alone, and only for the
+    /// files it is currently transferring; see [`TransferState::has_progress`].
     pub bytes_sent: Option<u64>,
 }
 
@@ -41,7 +43,10 @@ pub struct TransferState {
     /// progress is an enrichment on top, reported by [`Self::has_progress`], and folding
     /// the two together would label a `vfs/queue` total with a tier that cannot answer
     /// what the total is for.
-    pub fidelity: Tier,
+    ///
+    /// `None` when no source produced a total. Naming a tier there would let a caller ask
+    /// [`Tier::meets_the_bar`] and be told yes about figures nothing stands behind.
+    pub fidelity: Option<Tier>,
     /// Whether the figures below reflect reality at all.
     ///
     /// False when rclone could not be reached, and when the mount has no write-back cache
@@ -54,7 +59,9 @@ pub struct TransferState {
     pub pending: Pending,
     /// Uploads in flight. `None` where the tier cannot distinguish queued from uploading.
     pub uploading: Option<u64>,
-    /// Files whose upload has failed. Actionable.
+    /// `vfs/stats`'s errored-file count. Not the whole picture: a file rclone is still
+    /// retrying leaves this at zero however many attempts have failed, and only
+    /// [`TransferFile::tries`] above 1 reveals it.
     pub errored_files: u64,
     /// The cache is full. Actionable, and silently breaks uploads.
     pub out_of_space: bool,
@@ -67,7 +74,7 @@ pub struct TransferState {
 }
 
 impl TransferState {
-    fn empty(mount: &str, fidelity: Tier) -> Self {
+    fn empty(mount: &str, fidelity: Option<Tier>) -> Self {
         Self {
             mount: mount.to_string(),
             fidelity,
@@ -86,7 +93,7 @@ impl TransferState {
     /// From `vfs/queue` — the minimum bar. Per-file sizes and an in-flight flag, no
     /// per-file byte progress.
     pub fn from_queue(mount: &str, queue: &VfsQueue) -> Self {
-        let mut s = Self::empty(mount, Tier::T2);
+        let mut s = Self::empty(mount, Some(Tier::T2));
         s.pending = queue.pending();
         s.uploading = Some(queue.queue.iter().filter(|i| i.uploading).count() as u64);
         s.files = queue
@@ -110,7 +117,7 @@ impl TransferState {
     /// there is no honest total to report here. Use it to enrich a queue-derived state,
     /// or as the signal that the cache is full.
     pub fn from_stats(mount: &str, cache: &DiskCache) -> Self {
-        let mut s = Self::empty(mount, Tier::T3);
+        let mut s = Self::empty(mount, Some(Tier::T3));
         s.uploading = Some(cache.uploads_in_progress);
         s.errored_files = cache.errored_files;
         s.out_of_space = cache.out_of_space;
@@ -124,7 +131,7 @@ impl TransferState {
     /// From the on-disk cache scan. Sizes and a total, but `Dirty` stays true until an
     /// upload completes, so queued and uploading are indistinguishable.
     pub fn from_scan(mount: &str, files: Vec<(String, u64)>) -> Self {
-        let mut s = Self::empty(mount, Tier::T4);
+        let mut s = Self::empty(mount, Some(Tier::T4));
         s.pending = Pending::new(files.len() as u64, files.iter().map(|(_, b)| b).sum(), 0);
         s.files = files
             .into_iter()
@@ -149,7 +156,7 @@ impl TransferState {
     /// where an interrupted write really is lost, and the one where reporting "idle" is
     /// most harmful.
     pub fn unmonitored(mount: &str, reason: impl Into<String>) -> Self {
-        let mut s = Self::empty(mount, Tier::T4);
+        let mut s = Self::empty(mount, None);
         s.outstanding_known = false;
         s.degraded_reason = Some(reason.into());
         s
@@ -161,7 +168,7 @@ impl TransferState {
     /// `--vfs-write-back`, so a file written seconds ago is in the queue and absent here.
     /// Only files present in both gain progress; the join key is the name.
     pub fn with_progress(mut self, transferring: &[Transfer]) -> Self {
-        if self.fidelity != Tier::T2 {
+        if self.fidelity != Some(Tier::T2) {
             return self;
         }
         let mut any = false;
@@ -213,7 +220,7 @@ impl TransferState {
     /// Whether the outstanding *byte* total means anything. `vfs/stats` reports counts
     /// with no sizes, so a rate derived from its total would be a confident zero.
     pub fn has_byte_total(&self) -> bool {
-        self.outstanding_known && self.fidelity != Tier::T3
+        self.outstanding_known && self.fidelity.is_some_and(|t| t != Tier::T3)
     }
 
     /// Bytes still to send, discounting what is already on the wire.
@@ -222,7 +229,15 @@ impl TransferState {
     /// whole upload of a large file — the total only moves when a file *leaves* the
     /// queue — and then spikes to the file's entire size in one interval.
     pub fn remaining_bytes(&self) -> u64 {
-        let sent: u64 = self.files.iter().filter_map(|f| f.bytes_sent).sum();
+        // Only files of known size, because only those contributed to `known_bytes`.
+        // Subtracting an unknown-size file's progress from a total it was never in
+        // understates the remainder, and at small totals floors it to a false zero.
+        let sent: u64 = self
+            .files
+            .iter()
+            .filter(|f| f.size.is_some())
+            .filter_map(|f| f.bytes_sent)
+            .sum();
         self.pending.known_bytes.saturating_sub(sent)
     }
 }
@@ -309,7 +324,7 @@ mod tests {
     #[test]
     fn a_queue_gives_sizes_and_an_in_flight_flag_but_no_progress() {
         let s = TransferState::from_queue("backup", &queue_fixture("vfs-queue-uploading.json"));
-        assert_eq!(s.fidelity, Tier::T2);
+        assert_eq!(s.fidelity, Some(Tier::T2));
         assert!(!s.files.is_empty());
         assert!(s.files.iter().all(|f| f.in_flight.is_some()));
         assert!(
@@ -333,7 +348,7 @@ mod tests {
             "backup",
             &stats_fixture("vfs-stats-upload-in-progress.json"),
         );
-        assert_eq!(s.fidelity, Tier::T3);
+        assert_eq!(s.fidelity, Some(Tier::T3));
         assert!(
             s.files.is_empty(),
             "`vfs/stats` never names a file, so there is nothing to list"
@@ -351,7 +366,7 @@ mod tests {
             "backup",
             vec![("a.bin".into(), 1024), ("b.bin".into(), 2048)],
         );
-        assert_eq!(s.fidelity, Tier::T4);
+        assert_eq!(s.fidelity, Some(Tier::T4));
         assert_eq!(s.pending.known_bytes, 3072);
         assert!(
             s.files.iter().all(|f| f.in_flight.is_none()),
@@ -418,8 +433,12 @@ mod tests {
             ..Default::default()
         }]);
 
-        assert_eq!(lifted.fidelity, Tier::T2, "the queue produced the total");
-        assert!(lifted.fidelity.meets_the_bar());
+        assert_eq!(
+            lifted.fidelity,
+            Some(Tier::T2),
+            "the queue produced the total"
+        );
+        assert!(lifted.fidelity.is_some_and(Tier::meets_the_bar));
         assert_eq!(lifted.pending.known_bytes, bytes);
         assert!(lifted.has_progress);
     }
@@ -435,6 +454,35 @@ mod tests {
     }
 
     #[test]
+    fn progress_on_an_unsized_file_does_not_eat_into_the_known_total() {
+        // rclone reports `-1` for a size it does not know, so that file contributes
+        // nothing to `known_bytes`. Subtracting its progress from a total it was never
+        // part of understates the remainder — here to 300 rather than 600 — and a rate
+        // differenced from that reads as throughput nobody achieved.
+        let q: VfsQueue = serde_json::from_str(
+            r#"{"queue":[{"name":"sized.bin","size":1000,"uploading":true},
+                         {"name":"unsized.bin","size":-1,"uploading":true}]}"#,
+        )
+        .unwrap();
+        let s = TransferState::from_queue("backup", &q);
+        assert_eq!(s.pending.known_bytes, 1000, "only the sized file counts");
+
+        let lifted = s.with_progress(&[
+            Transfer {
+                name: "sized.bin".into(),
+                bytes: 400,
+                ..Default::default()
+            },
+            Transfer {
+                name: "unsized.bin".into(),
+                bytes: 300,
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(lifted.remaining_bytes(), 600);
+    }
+
+    #[test]
     fn progress_does_not_promote_a_disk_scan() {
         // T4 has no queue behind it, so `transferring[]` cannot be joined to it and the
         // result would be a T1 claim over data that cannot support one.
@@ -445,7 +493,7 @@ mod tests {
             bytes: 5,
             ..Default::default()
         }]);
-        assert_eq!(lifted.fidelity, Tier::T4);
+        assert_eq!(lifted.fidelity, Some(Tier::T4));
         assert!(lifted.files.iter().all(|f| f.bytes_sent.is_none()));
     }
 
@@ -501,7 +549,7 @@ mod tests {
             merged.pending.known_bytes, bytes,
             "`vfs/stats` has no byte total, so folding it in must not lose the queue's"
         );
-        assert_eq!(merged.fidelity, Tier::T2);
+        assert_eq!(merged.fidelity, Some(Tier::T2));
     }
 
     #[test]

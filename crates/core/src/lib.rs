@@ -12,6 +12,7 @@ pub mod mountinfo;
 pub mod rc;
 pub mod rclone;
 pub mod supervisor;
+pub mod transfer;
 
 pub use capabilities::{Capabilities, Tier};
 pub use config::{CacheMode, Config, ConfigError, Mount};
@@ -21,6 +22,7 @@ pub use rclone::{Rclone, RcloneError};
 pub use supervisor::{
     BoxFuture, Cause, DiscoveredMount, MountState, MountSupervisor, SupervisorError,
 };
+pub use transfer::{RateEstimator, TransferFile, TransferState};
 
 /// Resolve a log filter: explicit flag, else `RUST_LOG`, else `info`.
 ///

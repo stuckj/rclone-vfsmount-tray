@@ -8,8 +8,8 @@
 //! Resolution is per-connection, not global: one mount may be reachable over rc while
 //! another was started by someone else and can only be scanned on disk.
 
+use crate::models::RcList;
 use crate::rc::{RcClient, RcError};
-use serde::Deserialize;
 use std::collections::BTreeSet;
 
 /// How much can be said about pending uploads, given what this rclone will tell us.
@@ -62,18 +62,6 @@ impl Tier {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capabilities {
     commands: BTreeSet<String>,
-}
-
-/// `rc/list`'s response shape.
-#[derive(Debug, Deserialize)]
-struct RcList {
-    commands: Vec<RcListEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RcListEntry {
-    #[serde(rename = "Path")]
-    path: String,
 }
 
 impl Capabilities {
@@ -237,18 +225,22 @@ mod tests {
     }
 
     #[test]
-    fn rc_list_json_is_parsed_into_capabilities() {
-        // The real shape: a `commands` array of objects with a `Path` field.
-        let payload = serde_json::json!({
-            "commands": [
-                {"Path": "core/stats", "Title": "Returns stats"},
-                {"Path": "vfs/queue", "Title": "Returns the upload queue"}
-            ]
-        });
-        let list: RcList = serde_json::from_value(payload).unwrap();
+    fn the_captured_rc_list_resolves_to_the_top_tier() {
+        // The real payload from a live rclone, not a hand-written stand-in. This is the
+        // same type `tests/fixtures.rs` pins against the capture, so a wire-format change
+        // fails there rather than silently degrading every mount to T4 at runtime.
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/rc-list-v1.75.0.json"
+        ))
+        .expect("testdata/rc-list-v1.75.0.json");
+        let list: RcList = serde_json::from_str(&raw).expect("the capture should parse");
         let c = Capabilities::from_paths(list.commands.into_iter().map(|e| e.path));
-        assert!(c.has("core/stats") && c.has("vfs/queue"));
-        assert!(!c.has("vfs/stats"));
+
+        assert!(c.has("core/stats"), "the capture registers core/stats");
+        assert!(c.has("vfs/queue") && c.has("vfs/stats"));
         assert_eq!(c.tier(), Tier::T1);
+        assert!(c.can_attribute_exactly());
+        assert!(c.can_force_upload());
     }
 }

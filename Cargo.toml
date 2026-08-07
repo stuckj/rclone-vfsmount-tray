@@ -43,6 +43,9 @@ zbus = "5"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# Already in the tree via tokio; declared directly so `getuid` does not need a
+# hand-written FFI signature in the security-critical path.
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

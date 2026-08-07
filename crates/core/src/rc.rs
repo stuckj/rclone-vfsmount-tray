@@ -12,15 +12,23 @@ use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// How long one rc call may take before it is abandoned.
+/// How long a whole rc call may take, retries included.
 ///
-/// rc calls are local and answer in milliseconds. A long timeout here does not rescue a
-/// wedged rclone; it only holds up whatever asked.
+/// rc calls are local and answer in milliseconds. A long budget here does not rescue a
+/// wedged rclone; it only holds up whatever asked. It is a budget for the *call*, not for
+/// each attempt, so retrying cannot multiply how long a caller is blocked.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Attempts per call, including the first.
 const MAX_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
+
+/// Cap on a response body.
+///
+/// rc responses are untrusted input: an rclone that streams a runaway body would
+/// otherwise be able to allocate until this process is OOM-killed. The largest real
+/// response is a `vfs/list` of a big directory, orders of magnitude below this.
+const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// Why an rc call failed.
 ///
@@ -48,8 +56,8 @@ pub enum RcError {
         source: std::io::Error,
     },
 
-    #[error("rc call {command} timed out after {}s", CALL_TIMEOUT.as_secs())]
-    Timeout { command: String },
+    #[error("rc call {command} timed out after {after:.1?}")]
+    Timeout { command: String, after: Duration },
 
     /// rclone answered, but not with success.
     #[error("rc call {command} failed ({status}): {body}")]
@@ -67,6 +75,15 @@ pub enum RcError {
         source: serde_json::Error,
     },
 
+    /// The request could not be built. A programming error, not a transport fault, so it
+    /// is never retried.
+    #[error("rc command {command} is not a valid request path: {source}")]
+    InvalidCommand {
+        command: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[error("rc call {command} failed: {source}")]
     Transport {
         command: String,
@@ -81,10 +98,23 @@ impl RcError {
     ///
     /// An insecure socket counts: we will not use it, so as far as everything above is
     /// concerned there is no rc. It is reported separately so the user can be told why.
+    ///
+    /// So do a timeout and a transport fault. An rclone wedged in FUSE accepts the
+    /// connection and never answers, and one that is restarting accepts and closes — both
+    /// are exactly the "rclone process is unreachable" case the on-disk tier exists to
+    /// serve, and surfacing them as faults would show the user an error instead of the
+    /// data a disk scan could still give them.
+    ///
+    /// `Failed` and `Decode` are deliberately excluded: rclone answered, so the fault is
+    /// real and silently degrading would hide it.
     pub fn is_unreachable(&self) -> bool {
         matches!(
             self,
-            RcError::NotListening { .. } | RcError::InsecureSocket { .. } | RcError::Connect { .. }
+            RcError::NotListening { .. }
+                | RcError::InsecureSocket { .. }
+                | RcError::Connect { .. }
+                | RcError::Timeout { .. }
+                | RcError::Transport { .. }
         )
     }
 }
@@ -93,13 +123,40 @@ impl RcError {
 #[derive(Debug, Clone)]
 pub struct RcClient {
     socket: PathBuf,
+    timeout: Duration,
+    max_attempts: u32,
 }
 
 impl RcClient {
     pub fn new(socket: impl Into<PathBuf>) -> Self {
         Self {
             socket: socket.into(),
+            timeout: CALL_TIMEOUT,
+            max_attempts: MAX_ATTEMPTS,
         }
+    }
+
+    /// Override the whole-call budget and attempt count.
+    pub fn with_limits(mut self, timeout: Duration, max_attempts: u32) -> Self {
+        self.timeout = timeout;
+        self.max_attempts = max_attempts.max(1);
+        self
+    }
+
+    /// Where this user's rc sockets live: `$XDG_RUNTIME_DIR/rclone-vfsmount-tray`.
+    ///
+    /// That directory is per-user and mode 0700, which is what actually excludes other
+    /// users — the socket's own mode is checked too, but a directory nobody else can
+    /// traverse is the control that does not depend on rclone cooperating.
+    pub fn socket_dir() -> Option<PathBuf> {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .map(|v| PathBuf::from(v).join("rclone-vfsmount-tray"))
+    }
+
+    /// The conventional socket path for a named mount.
+    pub fn socket_path_for(name: &str) -> Option<PathBuf> {
+        Some(Self::socket_dir()?.join(format!("{name}.sock")))
     }
 
     pub fn socket(&self) -> &Path {
@@ -116,7 +173,10 @@ impl RcClient {
         {
             use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
-            let md = std::fs::metadata(&self.socket).map_err(|e| {
+            // `symlink_metadata` so a symlink is judged on its own account. Following it
+            // would mean approving whatever it happens to point at right now, and the
+            // link can be repointed between here and the connect.
+            let md = std::fs::symlink_metadata(&self.socket).map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     RcError::NotListening {
                         path: self.socket.clone(),
@@ -132,8 +192,38 @@ impl RcClient {
             if !md.file_type().is_socket() {
                 return Err(RcError::InsecureSocket {
                     path: self.socket.clone(),
-                    reason: "not a socket".into(),
+                    reason: if md.file_type().is_symlink() {
+                        "a symlink, not a socket".into()
+                    } else {
+                        "not a socket".into()
+                    },
                 });
+            }
+
+            // A private socket in a directory others can write to is not private: they
+            // cannot alter it, but they can unlink it and put their own there. This is
+            // the check that makes the whole path trustworthy rather than just its leaf.
+            if let Some(dir) = self.socket.parent() {
+                match std::fs::metadata(dir) {
+                    Ok(d) if d.mode() & 0o022 != 0 => {
+                        return Err(RcError::InsecureSocket {
+                            path: self.socket.clone(),
+                            reason: format!(
+                                "its directory {} is mode {:04o} and writable by others, \
+                                 so the socket can be replaced",
+                                dir.display(),
+                                d.mode() & 0o777
+                            ),
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        return Err(RcError::Connect {
+                            path: dir.to_path_buf(),
+                            source: e,
+                        })
+                    }
+                }
             }
 
             // rclone creates the socket 0775 whatever it is asked for, so this is a real
@@ -148,7 +238,7 @@ impl RcClient {
                 });
             }
 
-            let uid = unsafe { libc_getuid() };
+            let uid = current_uid();
             if md.uid() != uid {
                 return Err(RcError::InsecureSocket {
                     path: self.socket.clone(),
@@ -181,29 +271,41 @@ impl RcClient {
         command: &str,
         params: serde_json::Value,
     ) -> Result<Vec<u8>, RcError> {
+        // One budget for the whole call. Putting the timeout inside the loop would let a
+        // wedged rclone block the caller for `timeout * max_attempts` while every error
+        // message still quoted `timeout`.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let expired = || RcError::Timeout {
+            command: command.to_string(),
+            after: self.timeout,
+        };
+
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match tokio::time::timeout(CALL_TIMEOUT, self.attempt(command, &params)).await {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(expired());
+            }
+            match tokio::time::timeout(left, self.attempt(command, &params)).await {
                 Ok(Ok(body)) => return Ok(body),
+                // The budget is gone by construction, so there is nothing to retry into.
+                Err(_) => return Err(expired()),
                 Ok(Err(e)) => {
-                    // A socket that is absent or unsafe will be just as absent or unsafe
-                    // on the next attempt, and rclone rejecting the call is an answer.
-                    // Only transport faults are worth retrying.
-                    let retryable = matches!(e, RcError::Transport { .. });
-                    if !retryable || attempt >= MAX_ATTEMPTS {
+                    // An absent or unsafe socket will be just as absent or unsafe next
+                    // time, and rclone rejecting the call is an answer. Only a transport
+                    // fault — a connection closed mid-response by an rclone that is
+                    // restarting — is worth another go.
+                    if !matches!(e, RcError::Transport { .. }) || attempt >= self.max_attempts {
                         return Err(e);
                     }
                 }
-                Err(_) => {
-                    if attempt >= MAX_ATTEMPTS {
-                        return Err(RcError::Timeout {
-                            command: command.to_string(),
-                        });
-                    }
-                }
             }
-            tokio::time::sleep(RETRY_BASE_DELAY * 2u32.pow(attempt - 1)).await;
+            let backoff = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+            if backoff >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                return Err(expired());
+            }
+            tokio::time::sleep(backoff).await;
         }
     }
 
@@ -211,6 +313,25 @@ impl RcClient {
         use http_body_util::BodyExt;
 
         self.verify()?;
+
+        // Built before connecting: a malformed command is a permanent programming error,
+        // and constructing it first keeps it out of the retryable transport class and
+        // avoids opening a connection only to throw it away.
+        let body = http_body_util::Full::new(hyper::body::Bytes::from(
+            serde_json::to_vec(params).unwrap_or_else(|_| b"{}".to_vec()),
+        ));
+        // The Host header is required by HTTP/1.1 and ignored by rclone; the authority is
+        // meaningless over a UNIX socket, so any valid value does.
+        let req = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("/{command}"))
+            .header(hyper::header::HOST, "localhost")
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .map_err(|e| RcError::InvalidCommand {
+                command: command.to_string(),
+                source: Box::new(e),
+            })?;
 
         let stream = tokio::net::UnixStream::connect(&self.socket)
             .await
@@ -228,6 +349,24 @@ impl RcClient {
                     }
                 }
             })?;
+
+        // Who is actually on the other end, rather than what a filename looked like a
+        // moment ago. `verify()` can only ever describe a path, and the path can be
+        // replaced between the check and the connect; this cannot be raced.
+        #[cfg(unix)]
+        {
+            let peer = stream.peer_cred().map_err(|source| RcError::Connect {
+                path: self.socket.clone(),
+                source,
+            })?;
+            let me = current_uid();
+            if peer.uid() != me {
+                return Err(RcError::InsecureSocket {
+                    path: self.socket.clone(),
+                    reason: format!("served by uid {}, not {me}", peer.uid()),
+                });
+            }
+        }
 
         let transport = |e: Box<dyn std::error::Error + Send + Sync>| RcError::Transport {
             command: command.to_string(),
@@ -247,28 +386,15 @@ impl RcClient {
             let _ = conn.await;
         });
 
-        // The Host header is required by HTTP/1.1 and ignored by rclone; the authority is
-        // meaningless over a UNIX socket, so any valid value does.
-        let req = hyper::Request::builder()
-            .method(hyper::Method::POST)
-            .uri(format!("/{command}"))
-            .header(hyper::header::HOST, "localhost")
-            .header(hyper::header::CONTENT_TYPE, "application/json")
-            .body(http_body_util::Full::new(hyper::body::Bytes::from(
-                serde_json::to_vec(params).unwrap_or_else(|_| b"{}".to_vec()),
-            )))
-            .map_err(|e| transport(Box::new(e)))?;
-
         let resp = sender
             .send_request(req)
             .await
             .map_err(|e| transport(Box::new(e)))?;
         let status = resp.status();
-        let body = resp
-            .into_body()
+        let body = http_body_util::Limited::new(resp.into_body(), MAX_BODY)
             .collect()
             .await
-            .map_err(|e| transport(Box::new(e)))?
+            .map_err(transport)?
             .to_bytes();
 
         if !status.is_success() {
@@ -284,21 +410,18 @@ impl RcClient {
     }
 }
 
-/// `getuid` without pulling in the `libc` crate for one call.
-///
-/// `rvt-core` links no system libraries by policy, and `libc` would be the first crack in
-/// that. This is the only foreign function the crate needs.
+/// This process's real user id.
 #[cfg(unix)]
-unsafe fn libc_getuid() -> u32 {
-    extern "C" {
-        fn getuid() -> u32;
-    }
-    getuid()
+fn current_uid() -> u32 {
+    // Always succeeds; POSIX defines no error for it.
+    unsafe { libc::getuid() }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     /// A stand-in rc server: accepts one connection, reads the request, and replies with
     /// exactly the bytes given. Raw HTTP rather than a server library, because the point
@@ -314,11 +437,12 @@ mod tests {
     #[cfg(unix)]
     impl FakeRc {
         async fn serving(tag: &str, response: &'static str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
-
             let dir = std::env::temp_dir().join(format!("rvt-fakerc-{}-{tag}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
+            // 0700, as `socket_dir()` demands in production: the directory is what keeps
+            // the socket unreachable, and `verify()` refuses one others can write to.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             let socket = dir.join("rc.sock");
 
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -453,11 +577,202 @@ mod tests {
         let _ = server.request().await;
     }
 
+    /// Accepts repeatedly. The first `fail_first` connections are closed without a
+    /// reply — what an rclone that is restarting does — and the rest are answered.
+    #[cfg(unix)]
+    async fn flaky_server(
+        tag: &str,
+        fail_first: usize,
+        response: &'static str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = std::env::temp_dir().join(format!("rvt-flaky-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("rc.sock");
+
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let connects = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = connects.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < fail_first {
+                    // Close mid-conversation: hyper reports an incomplete message, which
+                    // is the transport fault worth retrying.
+                    drop(stream);
+                    continue;
+                }
+                let mut buf = vec![0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        (dir, socket, connects)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_transport_fault_is_retried_until_it_succeeds() {
+        use std::sync::atomic::Ordering;
+
+        let (dir, socket, connects) = flaky_server(
+            "retry",
+            2,
+            "HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\n{\"version\":\"v1.75.0\"}",
+        )
+        .await;
+
+        let got: Version = RcClient::new(&socket)
+            .with_limits(Duration::from_secs(5), 3)
+            .call("core/version", serde_json::json!({}))
+            .await
+            .expect("the third attempt should succeed");
+        assert_eq!(got.version, "v1.75.0");
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            3,
+            "two failures then a success"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retries_stop_at_the_attempt_limit() {
+        use std::sync::atomic::Ordering;
+
+        // Always fails, so the limit is what ends it rather than success.
+        let (dir, socket, connects) = flaky_server("exhaust", usize::MAX, "").await;
+
+        let e = RcClient::new(&socket)
+            .with_limits(Duration::from_secs(5), 3)
+            .call::<Version>("core/version", serde_json::json!({}))
+            .await
+            .expect_err("every attempt fails");
+        assert!(matches!(e, RcError::Transport { .. }), "{e:?}");
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            3,
+            "exactly max_attempts connections, no more"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rclone_answering_with_an_error_is_not_retried() {
+        use std::sync::atomic::Ordering;
+
+        // A 404 is an answer, not a fault to try again — retrying would triple the load
+        // and the latency for a result that cannot change.
+        let (dir, socket, connects) = flaky_server(
+            "noretry",
+            0,
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nnope!",
+        )
+        .await;
+
+        let e = RcClient::new(&socket)
+            .with_limits(Duration::from_secs(5), 3)
+            .call::<Version>("vfs/nope", serde_json::json!({}))
+            .await
+            .expect_err("a 404 is an error");
+        assert!(matches!(e, RcError::Failed { status: 404, .. }), "{e:?}");
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "answered once, not retried"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_timeout_bounds_the_whole_call_not_each_attempt() {
+        // A peer that accepts and never answers. With a per-attempt timeout this would
+        // block for timeout * max_attempts while still reporting the single-attempt
+        // figure, so a wedged rclone would hold the caller far longer than advertised.
+        let dir = std::env::temp_dir().join(format!("rvt-wedged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("rc.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let held = tokio::spawn(async move {
+            let mut keep = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                keep.push(s);
+            }
+        });
+
+        let budget = Duration::from_millis(400);
+        let started = std::time::Instant::now();
+        let e = RcClient::new(&socket)
+            .with_limits(budget, 3)
+            .call::<Version>("core/version", serde_json::json!({}))
+            .await
+            .expect_err("a peer that never answers must time out");
+        let elapsed = started.elapsed();
+
+        match e {
+            RcError::Timeout { after, .. } => assert_eq!(after, budget, "reports the budget"),
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert!(
+            elapsed < budget * 2,
+            "the call took {elapsed:?}, which is more than the {budget:?} budget — the \
+             timeout is being applied per attempt rather than to the call"
+        );
+
+        held.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_socket_in_a_group_writable_directory_is_refused() {
+        // The socket's own mode is not enough: anyone who can write to the directory can
+        // unlink it and put their own socket at the same path.
+        let dir = std::env::temp_dir().join(format!("rvt-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("rc.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        match RcClient::new(&socket).verify() {
+            Err(RcError::InsecureSocket { reason, .. }) => {
+                assert!(reason.contains("directory"), "{reason}");
+            }
+            other => panic!("a group-writable directory must be refused, got {other:?}"),
+        }
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        RcClient::new(&socket)
+            .verify()
+            .expect("0700 directory with a 0600 socket is fine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn an_insecure_socket_is_refused_before_anything_is_sent() {
-        use std::os::unix::fs::PermissionsExt;
-
         let server =
             FakeRc::serving("insecure", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await;
         // rclone's own default, which is exactly what this check exists to catch.
@@ -488,10 +803,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_group_accessible_socket_is_refused() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = std::env::temp_dir().join(format!("rvt-rc-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("perms.sock");
         let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
 
@@ -522,9 +836,9 @@ mod tests {
     fn a_regular_file_is_not_a_socket() {
         let dir = std::env::temp_dir().join(format!("rvt-rc-file-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("not.sock");
         std::fs::write(&path, b"").unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         match RcClient::new(&path).verify() {
@@ -543,14 +857,20 @@ mod tests {
             path: PathBuf::from("/x")
         }
         .is_unreachable());
+        // rclone answered, so these are real faults and must not be silently degraded.
         assert!(!RcError::Failed {
             command: "vfs/queue".into(),
             status: 500,
             body: "boom".into()
         }
         .is_unreachable());
-        assert!(!RcError::Timeout {
-            command: "core/stats".into()
+
+        // A wedged rclone accepts the connection and never answers. That is the same
+        // "process unreachable" situation the on-disk tier exists for, so it must not
+        // surface as a fault with no data behind it.
+        assert!(RcError::Timeout {
+            command: "core/stats".into(),
+            after: Duration::from_secs(10)
         }
         .is_unreachable());
     }

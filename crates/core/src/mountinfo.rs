@@ -1,17 +1,14 @@
 //! Which rclone mounts are live right now, read from `/proc/self/mountinfo`.
 //!
-//! This is the only mount check that works for mounts we did not start: it needs no rc
-//! socket, no cooperation from rclone, and no record of our own. A mount that survived a
-//! service restart and a mount somebody made by hand look identical here, which is what
-//! makes reconciliation possible.
+//! The only mount check that works for mounts we did not start: no rc socket, no
+//! cooperation from rclone, no record of our own.
 
 use std::path::{Path, PathBuf};
 
 /// Filesystem types a rclone FUSE mount can appear under.
 ///
-/// rclone sets the `rclone` subtype, which the kernel renders as `fuse.rclone`; both the
-/// `mount` and `mount2` implementations do. A mount made with an explicit `-o subtype`
-/// override lands on bare `fuse`, and is matched on its source instead.
+/// rclone sets the `rclone` subtype, rendered `fuse.rclone`. An explicit `-o subtype`
+/// override lands on bare `fuse`, matched on its source instead.
 const RCLONE_FSTYPE: &str = "fuse.rclone";
 const BARE_FUSE_FSTYPES: &[&str] = &["fuse"];
 
@@ -29,10 +26,8 @@ pub struct MountEntry {
 impl MountEntry {
     /// Whether this looks like an rclone mount.
     ///
-    /// Two shapes count: the `fuse.rclone` subtype, and a bare FUSE mount whose source
-    /// is a remote spec. The second test requires a colon, since that is what separates
-    /// a remote name from a path and is the only structural marker a bare FUSE mount
-    /// carries. A leading `/` rules out a local path that merely contains a colon.
+    /// Either the `fuse.rclone` subtype, or a bare FUSE mount whose source is
+    /// remote-shaped — a colon, and no leading `/` to rule out a local path.
     pub fn is_rclone(&self) -> bool {
         if self.fstype == RCLONE_FSTYPE {
             return true;
@@ -50,8 +45,7 @@ impl MountEntry {
 
 /// Parse the contents of a `mountinfo` file.
 ///
-/// Unparsable lines are skipped rather than failing the whole read: this file is a
-/// live kernel interface, and one unexpected line must not blind us to every other
+/// Unparsable lines are skipped: one unexpected line must not blind us to every other
 /// mount on the system.
 pub fn parse(contents: &str) -> Vec<MountEntry> {
     contents.lines().filter_map(parse_line).collect()
@@ -65,12 +59,9 @@ pub fn read() -> std::io::Result<Vec<MountEntry>> {
 /// Read and parse a specific mountinfo file. Separate from [`read`] so tests can supply
 /// a fixture without a live `/proc`.
 ///
-/// Decoded lossily on purpose. The kernel escapes only space, tab, newline and backslash,
-/// so any other byte — including invalid UTF-8 — is written raw, and a mount point
-/// containing one is enough to make `read_to_string` fail for the *whole file*. That
-/// would report every mount on the machine as absent, from a directory any user can
-/// create. Lossy decoding mangles only the offending entry, which is the behaviour
-/// [`parse`] already promises for a line it cannot read.
+/// Decoded lossily on purpose: the kernel escapes only space, tab, newline and backslash,
+/// so any other byte is written raw and one of them would make `read_to_string` fail for
+/// the whole file — reporting every mount on the machine as absent.
 pub fn read_from(path: &Path) -> std::io::Result<Vec<MountEntry>> {
     let raw = std::fs::read(path)?;
     Ok(parse(&String::from_utf8_lossy(&raw)))
@@ -90,9 +81,8 @@ pub fn is_mounted_at(entries: &[MountEntry], path: &Path) -> bool {
 
 /// Parse one mountinfo line.
 ///
-/// The format is fixed up to field 7, then carries a variable number of optional fields
-/// terminated by a lone `-`. Everything after that separator is positional again, so the
-/// separator has to be located before the tail can be indexed:
+/// Fixed up to field 7, then a variable number of optional fields terminated by a lone
+/// `-`; the tail is positional again, so the separator must be located first:
 ///
 /// ```text
 /// 36 35 98:0 / /mnt rw,noatime shared:1 - fuse.rclone backup: rw,user_id=1000
@@ -117,11 +107,9 @@ fn parse_line(line: &str) -> Option<MountEntry> {
     })
 }
 
-/// Decode the octal escapes the kernel writes for characters that would otherwise break
-/// the space-separated format: space, tab, newline and backslash.
-///
-/// A mount point containing a space is written `/mnt/my\040drive`. Without this, such a
-/// path never compares equal to the configured one and the mount reads as down.
+/// Decode the octal escapes the kernel writes for space, tab, newline and backslash.
+/// Without it a mount point containing a space never compares equal to the configured
+/// one, and the mount reads as down.
 fn unescape(s: &str) -> String {
     if !s.contains('\\') {
         return s.to_string();

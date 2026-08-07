@@ -80,7 +80,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config_path = match &args.config {
-        Some(p) => p.clone(),
+        // Absolutised: this path is baked into every mount unit's `ExecStartPre`, and
+        // systemd runs that with the user manager's working directory, not this one.
+        Some(p) => std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()),
         None => rvt_core::Config::default_path()?,
     };
     let config = std::sync::Arc::new(rvt_core::Config::load(&config_path)?);

@@ -79,9 +79,12 @@ assumed, how often a test flaked — all of that goes in the commit message, the
 the issue, where it is permanent and searchable and out of the reader's way. Prefer
 naming the constraint over narrating the discovery.
 
-There is no target ratio. When something is genuinely subtle, explain it at length; that
-is rare but real. Do not pad toward a percentage, and do not cut a comment that is doing
-real work to hit one.
+**10-20% of lines is normal, as a guide rather than a limit.** Above that, re-read the
+comments against the rules above and check each one is still about the code: the usual
+cause of a high ratio is explaining consequences and justifying decisions inline, both of
+which belong in DESIGN.md. Some files legitimately sit higher — `mountinfo.rs` documents a
+kernel format nothing in the code implies — so the number is a prompt to look, never a
+reason to cut a comment that is doing real work or to pad toward a figure.
 
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.

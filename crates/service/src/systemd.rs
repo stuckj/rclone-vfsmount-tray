@@ -21,12 +21,9 @@ pub struct UnitSpec {
     /// Failure is ignored: this only clears leftovers, and refusing to start because the
     /// cleanup could not run would turn a recoverable state into a permanent one.
     pub pre_start: Option<(PathBuf, Vec<String>)>,
-    /// The unit's umask, which rclone applies to every file and directory it creates
-    /// inside the mount as well as to its own files: `--umask` defaults to the process
-    /// umask, and rclone masks its 0777/0666 defaults with it.
-    ///
-    /// So this must stay the ordinary value a login shell would have. The rc socket is
-    /// protected by the mode of the directory holding it, not by this.
+    /// rclone applies this to every file it creates inside the mount, not just its own:
+    /// `--umask` defaults to the process umask. So it must stay ordinary — the rc socket
+    /// is protected by the mode of the directory holding it.
     pub umask: u32,
 }
 
@@ -58,17 +55,12 @@ pub trait UnitManager: Send + Sync {
 
     fn status<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, Result<UnitStatus, SupervisorError>>;
 
-    /// Clear a failed unit so the name can be reused.
-    ///
-    /// systemd keeps a failed transient unit loaded, and `StartTransientUnit` on a name
-    /// that is still loaded fails with "unit already exists" — so a mount that failed
-    /// once could never be retried without this.
+    /// Clear a failed unit so the name can be reused. systemd keeps a failed transient
+    /// unit loaded, and `StartTransientUnit` refuses a name that still is.
     fn reset_failed<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>>;
 
-    /// The tail of the unit's log, for reporting why a mount failed.
-    ///
-    /// Returning nothing is acceptable: a missing explanation is worse than none, but it
-    /// must not turn a mount failure into a supervisor error.
+    /// The tail of the unit's log, for reporting why a mount failed. Returning nothing is
+    /// acceptable; failing to read it must not turn a mount failure into a supervisor one.
     fn recent_output<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, String>;
 }
 
@@ -159,33 +151,23 @@ pub mod dbus {
                     ("ExecStart", Value::from(exec_start)),
                     ("Type", Value::from("exec")),
                     ("UMask", Value::from(spec.umask)),
-                    // Restart the mount if rclone dies, but give up rather than loop: a
-                    // remote that rejects the credentials fails identically forever.
-                    //
-                    // The limit has to be set explicitly. systemd's defaults are a burst
-                    // of 5 within 10s, and restarts spaced 5s apart never put five starts
-                    // in a 10s window — so the unit would retry for the whole login
-                    // session and never reach `failed`, which is the state that carries
-                    // rclone's reason to the user.
+                    // Restart if rclone dies, but give up rather than loop. The limit is
+                    // explicit because systemd's default burst of 5 within 10s is never
+                    // reached by restarts 5s apart, so the unit would never reach `failed`
+                    // — the state that carries rclone's reason to the user.
                     ("Restart", Value::from("on-failure")),
                     ("StartLimitIntervalUSec", Value::from(60_000_000_u64)),
                     ("StartLimitBurst", Value::from(3_u32)),
-                    // These take systemd's *D-Bus property* names, which are not the
-                    // unit-file directive names: there is no `RestartSec` or
-                    // `TimeoutStopSec` property — `systemd-run` renames those client-side
-                    // — and both of these are microseconds. An unrecognised name fails
-                    // the whole call rather than being ignored, so a wrong name here
-                    // means no mount can start at all.
+                    // D-Bus property names, not unit-file directives: there is no
+                    // `RestartSec` or `TimeoutStopSec` property, both are microseconds, and
+                    // an unrecognised name fails the whole call rather than being ignored.
                     ("RestartUSec", Value::from(5_000_000_u64)),
                     // rclone needs a SIGTERM to flush and unmount cleanly; killing the
                     // whole cgroup immediately would leave the mount point stale.
                     ("KillMode", Value::from("mixed")),
                     ("TimeoutStopUSec", Value::from(30_000_000_u64)),
-                    // `CollectMode` is deliberately unset. It defaults to `inactive`,
-                    // which keeps a failed unit loaded so its state and log can still be
-                    // read. `inactive-or-failed` would garbage-collect precisely the
-                    // failure that has to be reported, leaving the mount looking merely
-                    // absent.
+                    // `CollectMode` is deliberately unset: its `inactive` default keeps a
+                    // failed unit loaded so its state and log survive to be reported.
                 ];
 
                 if let Some((bin, args)) = &spec.pre_start {
@@ -210,9 +192,8 @@ pub mod dbus {
                 let mgr = self.manager().await?;
                 match mgr.stop_unit(unit, "replace").await {
                     Ok(_) => Ok(()),
-                    // It stopped on its own between the status read and here — rclone
-                    // exited, or somebody ran `fusermount -u` — and systemd collected it.
-                    // The caller asked for it to be stopped, and it is.
+                    // It stopped between the status read and here, and systemd collected
+                    // it. The caller asked for it to be stopped, and it is.
                     Err(zbus::Error::MethodError(name, msg, _))
                         if name.as_str().ends_with(".NoSuchUnit")
                             || msg.as_deref().is_some_and(|m| m.contains("not loaded")) =>
@@ -230,14 +211,10 @@ pub mod dbus {
         ) -> BoxFuture<'a, Result<UnitStatus, SupervisorError>> {
             Box::pin(async move {
                 let mgr = self.manager().await?;
-                // A unit that was never started is not loaded at all, and `GetUnit`
-                // answers `NoSuchUnit` rather than reporting a state — that is Inactive,
-                // not a fault.
-                //
-                // Every *other* failure must be reported. Treating an unreachable manager
-                // as "no unit" would make every live mount resolve to `Foreign`, telling
-                // the user their own mounts belong to somebody else and refusing to
-                // unmount them, rather than saying the init system cannot be reached.
+                // A unit that was never started answers `NoSuchUnit`, which is Inactive
+                // rather than a fault. Every other failure must be reported: an
+                // unreachable manager read as "no unit" would resolve every live mount to
+                // `Foreign`.
                 let path = match mgr.get_unit(unit).await {
                     Ok(p) => p,
                     Err(zbus::Error::MethodError(name, _, _))
@@ -441,6 +418,79 @@ mod tests {
         assert!(
             !marker.exists(),
             "ExecStartPre was accepted but never ran, so nothing clears a stale socket"
+        );
+
+        let _ = units.stop(&name).await;
+        let _ = units.reset_failed(&name).await;
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[tokio::test]
+    async fn a_killed_unit_is_restarted_and_the_hook_runs_again() {
+        // `Restart=on-failure` and the pre-start hook only earn their place if systemd
+        // actually re-runs both after a hard kill. Deleting either leaves a suite that
+        // asserts a unit *settles in failed* — which "never retried at all" also
+        // satisfies — so this is what stops the whole recovery path becoming dead weight.
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+
+        let marker = std::env::temp_dir().join(format!("rvt-restart-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let name = format!("rvt-restarttest-{}.service", std::process::id());
+        let sleep_arg = format!("{}.5", 600 + std::process::id() % 100);
+        let _ = units.reset_failed(&name).await;
+        let spec = UnitSpec {
+            name: name.clone(),
+            description: "restart self test".into(),
+            executable: PathBuf::from("/bin/sleep"),
+            // A duration no other test uses, so the kill below cannot reach theirs — the
+            // suite runs in parallel and `pkill -f` matches on the command line.
+            args: vec![sleep_arg.clone()],
+            // Appends one line per start, so the count is the number of starts.
+            pre_start: Some((
+                PathBuf::from("/bin/sh"),
+                vec![
+                    "-c".into(),
+                    format!("echo x >> {}", marker.to_string_lossy()),
+                ],
+            )),
+            umask: 0o022,
+        };
+        if units.start_transient(&spec).await.is_err() {
+            eprintln!("skipped: no systemd user instance");
+            return;
+        }
+
+        // Wait for it to be up, then kill the payload so `on-failure` fires.
+        for _ in 0..40 {
+            if units.status(&name).await.ok() == Some(UnitStatus::Active) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let _ = tokio::process::Command::new("pkill")
+            .args(["-9", "-f", &format!("sleep {sleep_arg}")])
+            .output()
+            .await;
+
+        // RestartUSec is 5s, so allow for one backoff plus slack.
+        let mut starts = 0;
+        for _ in 0..60 {
+            starts = std::fs::read_to_string(&marker)
+                .map(|s| s.lines().count())
+                .unwrap_or(0);
+            if starts >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        assert!(
+            starts >= 2,
+            "the unit ran its pre-start {starts} time(s): systemd either did not restart \
+             it, or restarted it without re-running the hook that clears the leftovers"
         );
 
         let _ = units.stop(&name).await;

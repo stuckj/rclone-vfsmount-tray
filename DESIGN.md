@@ -201,7 +201,7 @@ not by comparing version numbers, which only guesses.
 
 | Tier | Source | Gives | Notes |
 |---|---|---|---|
-| **T1** | `core/stats` `transferring[]` | `{name, size}` always; `{bytes, percentage, speed, speedAvg, eta, group}` once rclone attaches accounting; `srcFs`/`dstFs` when a source/destination exists | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). Mixes directions — see below. Treat every field but `name` and `size` as optional. |
+| **T1** | `core/stats` `transferring[]` | `{name, size}` always; `{bytes, percentage, speed, speedAvg, eta, group}` once rclone attaches accounting; `srcFs`/`dstFs` when a source/destination exists | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). **Does not meet the bar**, despite being the most detailed tier: it shows transfers that have *started*, and lags `vfs/queue` by `--vfs-write-back`, so a total taken from it reads zero while gigabytes sit queued — wrong in the unsafe direction. Mixes directions — see below. Treat every field but `name` and `size` as optional. |
 | **T2** | `vfs/queue` (per-fs) | `{name, id, size, expiry, tries, delay, uploading}` | **The minimum bar.** `sum(size)` = bytes to send; `uploading` = in flight. `vfs/queue-set-expiry` forces an upload. |
 | **T3** | `vfs/stats` (per-fs) | `diskCache{uploadsInProgress, uploadsQueued, erroredFiles, outOfSpace, path, pathMeta}` | Counts only. Does not meet the bar alone, but hands over the cache paths for T4. |
 | **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` | `sum(Size where Dirty)` = bytes to send. **Meets the bar with no rc at all**, and survives an rclone crash — a dead process's dirty items are still on disk. |
@@ -219,7 +219,8 @@ differencing total dirty bytes as files drop out, so large files stall then jump
 
 **Tier the display honestly. Never fake precision the data source cannot support.**
 
-- T1 → per-file progress bars, real ETAs
+- T1 → per-file progress bars, real ETAs — but take the *outstanding total* from T2 or T4,
+  never from `transferring[]`
 - T2 → per-file sizes and an in-flight flag, aggregate rate, **no per-file percentages**
 - T3 → counts only
 - T4 → file list with sizes, aggregate bytes, coarse derived rate, **no in-flight flag**

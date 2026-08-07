@@ -97,8 +97,9 @@ or to pad toward a figure.
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.
 
-Verified rclone behaviour is v1.75.0 (issue #9). The version floor of 1.60 is a sanity
-check, not a compatibility claim — feature availability is detected with `rc/list`.
+Verified rclone behaviour is v1.75.0 (issue #9). The version floor of 1.61 is the oldest
+rclone on which `--rc-addr unix://` works at all; feature availability above that is
+detected with `rc/list`, not inferred from a version.
 
 Commit messages explain why. When a change corrects an earlier decision, say what was
 wrong with it.
@@ -109,7 +110,7 @@ wrong with it.
 cargo fmt --all
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p rvt-core
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
 ```
 
 All blocking in CI. Read clippy's output rather than its exit status — a failure has been

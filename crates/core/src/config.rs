@@ -265,10 +265,18 @@ pub enum ConfigError {
 impl Config {
     /// `$XDG_CONFIG_HOME/rclone-vfsmount-tray/config.toml`, else `~/.config/...`.
     pub fn default_path() -> Result<PathBuf, ConfigError> {
+        // Both are treated as unset when empty. `PathBuf::from("").join(".config")` is
+        // the *relative* path `.config`, which for a background service resolves against
+        // whatever directory it happens to be in — the same trap as an empty `PATH`
+        // element meaning the CWD.
         let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
             Some(v) => PathBuf::from(v),
-            None => PathBuf::from(std::env::var_os("HOME").ok_or(ConfigError::NoConfigDir)?)
-                .join(".config"),
+            None => PathBuf::from(
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .ok_or(ConfigError::NoConfigDir)?,
+            )
+            .join(".config"),
         };
         Ok(base.join("rclone-vfsmount-tray").join("config.toml"))
     }
@@ -747,7 +755,19 @@ mod tests {
             Config::default_path().unwrap(),
             PathBuf::from("/tmp/xdg-probe/rclone-vfsmount-tray/config.toml")
         );
+        // An empty HOME must be treated as unset, not joined into a relative path.
         std::env::remove_var("XDG_CONFIG_HOME");
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", "");
+        assert!(
+            matches!(Config::default_path(), Err(ConfigError::NoConfigDir)),
+            "an empty HOME must not yield a relative .config path"
+        );
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
         std::env::set_var("HOME", "/home/probe");
         assert_eq!(
             Config::default_path().unwrap(),

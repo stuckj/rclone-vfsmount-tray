@@ -112,35 +112,48 @@ impl Rclone {
     /// Find rclone and verify it: `override_path`, then `PATH`, then a short list of
     /// well-known install locations.
     pub fn discover(override_path: Option<&Path>) -> Result<Self, RcloneError> {
-        let mut searched: Vec<String> = Vec::new();
-
+        // An explicit choice is honoured or reported, never silently substituted.
         if let Some(p) = override_path {
-            searched.push(p.display().to_string());
-            return Self::probe(p, &searched);
+            return Self::probe(p);
         }
 
-        // `PATH` first: a user who installed a newer rclone expects it to win.
-        if let Some(found) = Self::which("rclone") {
-            searched.push(found.display().to_string());
-            return Self::probe(&found, &searched);
-        }
-        searched.push("$PATH".to_string());
-
+        // `PATH` first — someone who installed a newer rclone expects it to win — then
+        // the well-known locations, deduplicated so the same binary is not probed twice.
+        let mut candidates: Vec<PathBuf> = Self::which("rclone");
         for cand in FALLBACK_PATHS {
-            let p = Path::new(cand);
-            searched.push(cand.to_string());
-            if p.is_file() {
-                return Self::probe(p, &searched);
+            let p = PathBuf::from(cand);
+            if p.is_file() && !candidates.contains(&p) {
+                candidates.push(p);
             }
         }
 
-        Err(RcloneError::NotFound {
-            searched: searched.join(", "),
-        })
+        // Try each in turn rather than committing to the first one found: an unusable
+        // binary earlier in the search order should not mask a working one later.
+        // The first failure is kept, since candidates are in priority order and that is
+        // the one the user most likely means.
+        let mut first_err: Option<RcloneError> = None;
+        for c in &candidates {
+            match Self::probe(c) {
+                Ok(r) => return Ok(r),
+                Err(e) => first_err.get_or_insert(e),
+            };
+        }
+
+        Err(first_err.unwrap_or_else(|| RcloneError::NotFound {
+            searched: std::iter::once("$PATH".to_string())
+                .chain(FALLBACK_PATHS.iter().map(|s| s.to_string()))
+                .collect::<Vec<_>>()
+                .join(", "),
+        }))
     }
 
-    fn which(bin: &str) -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
+    /// Every `PATH` hit, in order — not just the first. A broken or too-old rclone
+    /// earlier on `PATH` should not hide a usable one behind it.
+    fn which(bin: &str) -> Vec<PathBuf> {
+        let Some(path) = std::env::var_os("PATH") else {
+            return Vec::new();
+        };
+        let mut hits: Vec<PathBuf> = Vec::new();
         std::env::split_paths(&path)
             // POSIX reads an empty PATH element as the current directory. For a
             // background service that means running whatever `./rclone` happens to be,
@@ -148,10 +161,16 @@ impl Rclone {
             // against its own search path rather than the binary we just verified.
             .filter(|dir| dir.is_absolute())
             .map(|dir| dir.join(bin))
-            .find(|c| c.is_file())
+            .filter(|c| c.is_file())
+            .for_each(|c| {
+                if !hits.contains(&c) {
+                    hits.push(c);
+                }
+            });
+        hits
     }
 
-    fn probe(path: &Path, searched: &[String]) -> Result<Self, RcloneError> {
+    fn probe(path: &Path) -> Result<Self, RcloneError> {
         let out = Command::new(path)
             .arg("version")
             .output()
@@ -159,9 +178,13 @@ impl Rclone {
                 path: path.to_path_buf(),
                 source,
             })?;
+        // Found and executed, but it did not work — reporting NotFound would be both
+        // wrong and would discard the stderr that says why.
         if !out.status.success() {
-            return Err(RcloneError::NotFound {
-                searched: searched.join(", "),
+            return Err(RcloneError::CommandFailed {
+                args: "version".into(),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
             });
         }
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();

@@ -82,18 +82,21 @@ esac
                 )
             },
         );
-        let bin = dir.join("rclone");
-        std::fs::write(&bin, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_executable(&dir.join("rclone"), &script);
         Stub { dir, _guard }
     }
 
     fn bin(&self) -> PathBuf {
         self.dir.join("rclone")
+    }
+}
+
+fn write_executable(path: &Path, body: &str) {
+    std::fs::write(path, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
 
@@ -216,4 +219,63 @@ fn the_shipped_example_config_is_valid() {
     assert_eq!(cfg.mounts.len(), 1, "one uncommented [[mount]] block");
     assert_eq!(cfg.mounts[0].fs_spec(), "backup:pictures/raw");
     assert!(cfg.mounts[0].cache_mode.has_writeback());
+}
+
+#[test]
+fn a_broken_candidate_does_not_mask_a_working_one() {
+    // The whole point of a fallback list. An old or broken rclone earlier in the search
+    // order used to abort discovery outright, so a usable one later never got tried.
+    //
+    // One Stub, two directories: a Stub holds STUB_LOCK for its lifetime, so building a
+    // second one here would self-deadlock on a non-reentrant mutex.
+    let good = Stub::new("fallthrough", VERSION_OUTPUT);
+    let old_dir = good.dir.join("old");
+    std::fs::create_dir_all(&old_dir).unwrap();
+    write_executable(
+        &old_dir.join("rclone"),
+        "#!/bin/sh\necho 'rclone v1.50.0'\n",
+    );
+
+    let prev = std::env::var_os("PATH");
+    // Old one first, so discovery has to get past it.
+    let joined = std::env::join_paths([old_dir.clone(), good.dir.clone()]).unwrap();
+    std::env::set_var("PATH", &joined);
+    let found = Rclone::discover(None);
+    match prev {
+        Some(p) => std::env::set_var("PATH", p),
+        None => std::env::remove_var("PATH"),
+    }
+
+    // Before the fix this returned TooOld: the first PATH hit was the only one tried.
+    let r = found.expect("the too-old stub must not mask the usable one behind it");
+    assert_eq!(r.version().to_string(), "1.75.0");
+}
+
+#[test]
+fn an_explicit_override_is_not_silently_substituted() {
+    // Falling through here would run a different binary than the one asked for.
+    let old = Stub::new("override-old", "rclone v1.50.0");
+    match Rclone::discover(Some(&old.bin())) {
+        Err(RcloneError::TooOld { .. }) => {}
+        other => panic!("an explicit path must be honoured or reported, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_binary_that_runs_but_fails_reports_why() {
+    // Reporting NotFound would be untrue — it was found and executed — and would throw
+    // away the stderr explaining what went wrong.
+    let stub = Stub::new("exits-nonzero", VERSION_OUTPUT);
+    std::fs::write(
+        stub.bin(),
+        "#!/bin/sh\necho 'cannot load config file: permission denied' >&2\nexit 1\n",
+    )
+    .unwrap();
+    match Rclone::discover(Some(&stub.bin())) {
+        Err(RcloneError::CommandFailed { args, stderr, .. }) => {
+            assert_eq!(args, "version");
+            assert!(stderr.contains("permission denied"), "{stderr}");
+        }
+        other => panic!("expected CommandFailed carrying stderr, got {other:?}"),
+    }
 }

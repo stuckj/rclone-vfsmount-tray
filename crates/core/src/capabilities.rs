@@ -35,9 +35,16 @@ impl Tier {
     /// Whether this tier can report what is outstanding well enough to answer "is it safe
     /// to unmount".
     ///
-    /// T3 cannot: counts alone do not give the byte total that question needs.
+    /// Only `vfs/queue` and the disk scan can. `core/stats` shows transfers that have
+    /// *started*, and it lags `vfs/queue` by `--vfs-write-back` — a file written seconds
+    /// ago is dirty on disk and absent from `transferring[]`, so a total taken from it
+    /// reads zero while gigabytes are still queued. That is wrong in the direction that
+    /// makes an unmount look safe when it is not. T3 gives counts without bytes.
+    ///
+    /// A build that resolves to T1 or T3 is not stuck: `vfs/queue` may still be present,
+    /// and the disk scan always is. See [`Capabilities::can_answer_outstanding`].
     pub fn meets_the_bar(self) -> bool {
-        matches!(self, Tier::T1 | Tier::T2 | Tier::T4)
+        matches!(self, Tier::T2 | Tier::T4)
     }
 
     /// Whether per-file percentages are honest at this tier.
@@ -62,6 +69,9 @@ impl Tier {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capabilities {
     commands: BTreeSet<String>,
+    /// Set when the commands are empty because rclone could not be asked, rather than
+    /// because it genuinely registers none.
+    degraded: Option<String>,
 }
 
 impl Capabilities {
@@ -73,6 +83,7 @@ impl Capabilities {
     {
         Self {
             commands: paths.into_iter().map(Into::into).collect(),
+            degraded: None,
         }
     }
 
@@ -81,15 +92,47 @@ impl Capabilities {
     /// An unreachable socket is not an error here: it resolves to no commands, which
     /// resolves to [`Tier::T4`], which is exactly right — the on-disk scan is what works
     /// when rclone is not answering.
+    ///
+    /// The reason is kept rather than discarded. "rclone is not running" and "rclone is
+    /// running and I refuse to talk to its socket" both degrade to T4, but only the second
+    /// is a misconfiguration the user can fix, and it is permanent until they do. Without
+    /// the reason nothing above this can tell them the difference.
     pub async fn probe(client: &RcClient) -> Result<Self, RcError> {
         match client
             .call::<RcList>("rc/list", serde_json::json!({}))
             .await
         {
             Ok(list) => Ok(Self::from_paths(list.commands.into_iter().map(|c| c.path))),
-            Err(e) if e.is_unreachable() => Ok(Self::default()),
+            Err(e) if e.is_unreachable() => Ok(Self::from_refusal(e.to_string())),
             Err(e) => Err(e),
         }
+    }
+
+    /// A capability set that is empty because rclone was refused or unreachable.
+    pub fn from_refusal(reason: impl Into<String>) -> Self {
+        Self {
+            commands: BTreeSet::new(),
+            degraded: Some(reason.into()),
+        }
+    }
+
+    /// Why this rclone could not be asked, when it could not be.
+    ///
+    /// `None` means the answer is genuine. `Some` means the tier below is a fallback, and
+    /// carries the text explaining it — an insecure socket says so here rather than
+    /// looking identical to a mount that is simply not up.
+    pub fn degraded_reason(&self) -> Option<&str> {
+        self.degraded.as_deref()
+    }
+
+    /// Whether the outstanding-bytes question can be answered at all.
+    ///
+    /// `vfs/queue` enumerates the queue; failing that the disk scan always works, so the
+    /// only thing that could make this false is an rc endpoint that answers but lacks
+    /// `vfs/queue` *and* a cache directory we cannot read. Kept as a predicate so callers
+    /// ask the capability set rather than inferring it from a single tier.
+    pub fn can_answer_outstanding(&self) -> bool {
+        self.has("vfs/queue") || self.tier() == Tier::T4
     }
 
     pub fn has(&self, command: &str) -> bool {
@@ -188,13 +231,47 @@ mod tests {
     }
 
     #[test]
-    fn t3_alone_cannot_answer_whether_it_is_safe_to_unmount() {
-        // Counts without a byte total do not answer the only question that matters at
-        // unmount time, so T3 must not be treated as sufficient.
-        assert!(!Tier::T3.meets_the_bar());
-        assert!(Tier::T1.meets_the_bar());
+    fn only_the_queue_and_the_disk_scan_can_say_what_is_outstanding() {
+        // T3 gives counts without bytes. T1 is the subtle one: `core/stats` shows
+        // transfers that have started, and lags `vfs/queue` by `--vfs-write-back`, so a
+        // total taken from it reads zero while gigabytes sit dirty — safe-looking when it
+        // is not.
         assert!(Tier::T2.meets_the_bar());
         assert!(Tier::T4.meets_the_bar());
+        assert!(!Tier::T3.meets_the_bar());
+        assert!(!Tier::T1.meets_the_bar());
+    }
+
+    #[test]
+    fn a_t1_build_can_still_answer_when_it_also_has_the_queue() {
+        // The tier names the most detailed source, not the only one available.
+        let c = Capabilities::from_paths(["core/stats", "vfs/queue"]);
+        assert_eq!(c.tier(), Tier::T1);
+        assert!(!c.tier().meets_the_bar());
+        assert!(c.can_answer_outstanding(), "vfs/queue is right there");
+
+        // No rc at all: the disk scan answers.
+        assert!(Capabilities::default().can_answer_outstanding());
+
+        // An rc endpoint with neither the queue nor anything above it.
+        let thin = Capabilities::from_paths(["core/stats"]);
+        assert!(!thin.can_answer_outstanding());
+    }
+
+    #[test]
+    fn a_refusal_is_distinguishable_from_an_absent_rclone() {
+        // Both degrade to T4, but only one is a misconfiguration the user can fix, and it
+        // stays broken until they do.
+        let absent = Capabilities::default();
+        assert_eq!(absent.tier(), Tier::T4);
+        assert!(absent.degraded_reason().is_none());
+
+        let refused = Capabilities::from_refusal("rc socket /run/x.sock is not private");
+        assert_eq!(refused.tier(), Tier::T4);
+        assert!(
+            refused.degraded_reason().unwrap().contains("not private"),
+            "the reason must survive so it can be shown"
+        );
     }
 
     #[test]

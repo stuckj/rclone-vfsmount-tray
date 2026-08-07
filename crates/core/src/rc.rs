@@ -84,6 +84,12 @@ pub enum RcError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The response exceeded the size cap. rclone answered, so this is a fault to
+    /// surface rather than a reason to silently degrade — and retrying would only
+    /// download it again.
+    #[error("rc call {command} returned more than {limit} bytes")]
+    ResponseTooLarge { command: String, limit: usize },
+
     #[error("rc call {command} failed: {source}")]
     Transport {
         command: String,
@@ -125,6 +131,12 @@ pub struct RcClient {
     socket: PathBuf,
     timeout: Duration,
     max_attempts: u32,
+    max_body: usize,
+    /// Who the socket file and its server must belong to. Always this user in production.
+    /// Separate knobs in tests because the two checks fire at different points and a test
+    /// cannot arrange for a real peer running as somebody else.
+    expected_owner_uid: Option<u32>,
+    expected_peer_uid: Option<u32>,
 }
 
 impl RcClient {
@@ -133,7 +145,39 @@ impl RcClient {
             socket: socket.into(),
             timeout: CALL_TIMEOUT,
             max_attempts: MAX_ATTEMPTS,
+            max_body: MAX_BODY,
+            expected_owner_uid: None,
+            expected_peer_uid: None,
         }
+    }
+
+    /// Shrink the response cap, so the limit path can be exercised without a 64MB body.
+    #[cfg(test)]
+    fn with_max_body(mut self, max_body: usize) -> Self {
+        self.max_body = max_body;
+        self
+    }
+
+    /// The uid the socket *file* must be owned by.
+    #[cfg(test)]
+    fn with_expected_owner_uid(mut self, uid: u32) -> Self {
+        self.expected_owner_uid = Some(uid);
+        self
+    }
+
+    /// The uid the process answering on the socket must be running as.
+    #[cfg(test)]
+    fn with_expected_peer_uid(mut self, uid: u32) -> Self {
+        self.expected_peer_uid = Some(uid);
+        self
+    }
+
+    fn required_owner_uid(&self) -> u32 {
+        self.expected_owner_uid.unwrap_or_else(current_uid)
+    }
+
+    fn required_peer_uid(&self) -> u32 {
+        self.expected_peer_uid.unwrap_or_else(current_uid)
     }
 
     /// Override the whole-call budget and attempt count.
@@ -238,7 +282,7 @@ impl RcClient {
                 });
             }
 
-            let uid = current_uid();
+            let uid = self.required_owner_uid();
             if md.uid() != uid {
                 return Err(RcError::InsecureSocket {
                     path: self.socket.clone(),
@@ -299,13 +343,16 @@ impl RcClient {
                     if !matches!(e, RcError::Transport { .. }) || attempt >= self.max_attempts {
                         return Err(e);
                     }
+                    let backoff = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                    if backoff >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
+                        // Out of budget, but nothing timed out. Reporting a timeout here
+                        // would name a duration that never elapsed and discard the
+                        // connection reset that identifies the real problem.
+                        return Err(e);
+                    }
+                    tokio::time::sleep(backoff).await;
                 }
             }
-            let backoff = RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
-            if backoff >= deadline.saturating_duration_since(tokio::time::Instant::now()) {
-                return Err(expired());
-            }
-            tokio::time::sleep(backoff).await;
         }
     }
 
@@ -359,7 +406,7 @@ impl RcClient {
                 path: self.socket.clone(),
                 source,
             })?;
-            let me = current_uid();
+            let me = self.required_peer_uid();
             if peer.uid() != me {
                 return Err(RcError::InsecureSocket {
                     path: self.socket.clone(),
@@ -391,10 +438,21 @@ impl RcClient {
             .await
             .map_err(|e| transport(Box::new(e)))?;
         let status = resp.status();
-        let body = http_body_util::Limited::new(resp.into_body(), MAX_BODY)
+        let body = http_body_util::Limited::new(resp.into_body(), self.max_body)
             .collect()
             .await
-            .map_err(transport)?
+            .map_err(|e| {
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    RcError::ResponseTooLarge {
+                        command: command.to_string(),
+                        limit: self.max_body,
+                    }
+                } else {
+                    transport(e)
+                }
+            })?
             .to_bytes();
 
         if !status.is_success() {
@@ -703,43 +761,159 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn the_timeout_bounds_the_whole_call_not_each_attempt() {
-        // A peer that accepts and never answers. With a per-attempt timeout this would
-        // block for timeout * max_attempts while still reporting the single-attempt
-        // figure, so a wedged rclone would hold the caller far longer than advertised.
-        let dir = std::env::temp_dir().join(format!("rvt-wedged-{}", std::process::id()));
+        // The peer must fail *slowly and repeatedly*, not hang. A peer that never answers
+        // produces exactly one attempt — the timeout arm does not retry — so it cannot
+        // tell a per-attempt budget from a whole-call one. Accepting and then resetting
+        // after a delay is a transport fault, which does retry, so the budget is the only
+        // thing that can stop the loop. This is what a crash-looping rclone looks like.
+        let dir = std::env::temp_dir().join(format!("rvt-slowfail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.join("rc.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let held = tokio::spawn(async move {
-            let mut keep = Vec::new();
-            while let Ok((s, _)) = listener.accept().await {
-                keep.push(s);
+
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    drop(stream);
+                });
             }
         });
 
         let budget = Duration::from_millis(400);
         let started = std::time::Instant::now();
         let e = RcClient::new(&socket)
-            .with_limits(budget, 3)
+            .with_limits(budget, 5)
             .call::<Version>("core/version", serde_json::json!({}))
             .await
-            .expect_err("a peer that never answers must time out");
+            .expect_err("every attempt fails");
         let elapsed = started.elapsed();
 
-        match e {
-            RcError::Timeout { after, .. } => assert_eq!(after, budget, "reports the budget"),
-            other => panic!("expected Timeout, got {other:?}"),
-        }
         assert!(
-            elapsed < budget * 2,
-            "the call took {elapsed:?}, which is more than the {budget:?} budget — the \
-             timeout is being applied per attempt rather than to the call"
+            e.is_unreachable(),
+            "a peer that keeps resetting is unreachable, got {e:?}"
+        );
+        // Five attempts at 300ms each would be 1.5s. The budget is what must stop it.
+        assert!(
+            elapsed < budget + Duration::from_millis(250),
+            "the call took {elapsed:?} against a {budget:?} budget — the timeout is being \
+             applied per attempt rather than to the whole call"
         );
 
-        held.abort();
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_peer_running_as_another_user_is_refused_after_connecting() {
+        // The check that closes the TOCTOU window: `verify()` can only describe a path,
+        // and the path can be swapped before the connect. This asks who actually answered.
+        // A test cannot run a server as another uid, so the expected uid is moved instead.
+        let server =
+            FakeRc::serving("peer", "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").await;
+
+        let wrong = current_uid().wrapping_add(1);
+        let e = RcClient::new(&server.socket)
+            .with_expected_peer_uid(wrong)
+            .call::<serde_json::Value>("core/version", serde_json::json!({}))
+            .await
+            .expect_err("a peer that is not us must be refused");
+        match e {
+            RcError::InsecureSocket { reason, .. } => {
+                assert!(reason.contains("served by uid"), "{reason}");
+            }
+            other => panic!("expected InsecureSocket from the peer check, got {other:?}"),
+        }
+
+        server.handle.abort();
+        let _ = std::fs::remove_dir_all(&server.dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_owned_by_another_user_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rvt-owner-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("rc.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let wrong = current_uid().wrapping_add(1);
+        match RcClient::new(&path).with_expected_owner_uid(wrong).verify() {
+            Err(RcError::InsecureSocket { reason, .. }) => {
+                assert!(reason.contains("owned by uid"), "{reason}");
+            }
+            other => panic!("a socket owned by somebody else must be refused, got {other:?}"),
+        }
+        // Same socket, right owner.
+        RcClient::new(&path)
+            .verify()
+            .expect("our own socket is fine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_standing_in_for_the_socket_is_refused() {
+        // Judged on its own account. Following it would approve whatever it points at
+        // right now, and the link can be repointed before the connect.
+        let dir = std::env::temp_dir().join(format!("rvt-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = dir.join("real.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let link = dir.join("link.sock");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        match RcClient::new(&link).verify() {
+            Err(RcError::InsecureSocket { reason, .. }) => {
+                assert!(reason.contains("symlink"), "{reason}");
+            }
+            other => panic!("a symlink must be refused, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_oversized_body_is_reported_rather_than_retried() {
+        use std::sync::atomic::Ordering;
+
+        // A body cap violation is rclone answering, not a transport fault: retrying would
+        // download it again, and degrading silently would hide it.
+        let body = "x".repeat(200);
+        let resp: &'static str = Box::leak(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n{body}").into_boxed_str(),
+        );
+        let (dir, socket, connects) = flaky_server("toolarge", 0, resp).await;
+
+        let e = RcClient::new(&socket)
+            .with_limits(Duration::from_secs(5), 3)
+            .with_max_body(8)
+            .call_raw("core/stats", serde_json::json!({}))
+            .await
+            .expect_err("200 bytes exceeds an 8 byte cap");
+        match e {
+            RcError::ResponseTooLarge { command, limit } => {
+                assert_eq!(command, "core/stats");
+                assert_eq!(limit, 8);
+            }
+            other => panic!("expected ResponseTooLarge, got {other:?}"),
+        }
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            1,
+            "an oversized body must not be fetched again"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -871,6 +1045,30 @@ mod tests {
         assert!(RcError::Timeout {
             command: "core/stats".into(),
             after: Duration::from_secs(10)
+        }
+        .is_unreachable());
+
+        // Pinned in both directions, because moving any one of these silently changes
+        // whether a whole class of problem reaches the user or vanishes into a fallback.
+        assert!(RcError::InsecureSocket {
+            path: PathBuf::from("/x"),
+            reason: "mode 0755".into()
+        }
+        .is_unreachable());
+
+        // Schema drift must stay visible: if this degraded silently, the fixture suite
+        // would catch a renamed field in CI while every mount quietly dropped to T4 in
+        // the field, which is the opposite of what that suite is for.
+        let decode = serde_json::from_str::<u32>("nope").unwrap_err();
+        assert!(!RcError::Decode {
+            command: "core/stats".into(),
+            source: decode
+        }
+        .is_unreachable());
+
+        assert!(!RcError::ResponseTooLarge {
+            command: "vfs/list".into(),
+            limit: 64
         }
         .is_unreachable());
     }

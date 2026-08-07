@@ -366,6 +366,32 @@ fn vfs_queue(name: &str) -> VfsQueue {
     parse_fixture(name, &VFS_QUEUE_SPEC)
 }
 
+/// Two files queued at once, captured from a live rclone v1.75.0.
+///
+/// A single-entry queue cannot exercise anything that joins per file: an assertion that
+/// "every other file stays unmeasured" iterates zero times and passes whatever the code
+/// does. This is the fixture the join in `TransferState::with_progress` is checked with.
+#[test]
+fn a_multi_item_queue_carries_a_distinct_entry_per_file() {
+    let q: VfsQueue = vfs_queue("vfs-queue-two-items.json");
+    assert_eq!(q.queue.len(), 2, "captured with two files queued");
+
+    let names: Vec<_> = q.queue.iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, vec!["one.bin", "two.bin"]);
+
+    let ids: std::collections::BTreeSet<_> = q.queue.iter().map(|i| i.id).collect();
+    assert_eq!(ids.len(), 2, "ids are what vfs/queue-set-expiry addresses");
+
+    // Distinct sizes, so a test that mixed the two entries up would show it.
+    assert_eq!(q.queue[0].size, 262_144);
+    assert_eq!(q.queue[1].size, 131_072);
+    assert_eq!(q.pending().known_bytes, 393_216);
+    assert!(
+        q.queue.iter().all(|i| !i.uploading),
+        "captured before upload"
+    );
+}
+
 #[test]
 fn core_stats_mid_upload_has_real_progress() {
     let s: CoreStats = core_stats("core-stats-vfs-upload-midflight.json", true);
@@ -486,6 +512,7 @@ const PINNED_FIXTURES: &[&str] = &[
     "rc-list-v1.75.0.json",
     "vfs-list.json",
     "vfs-queue-queued-not-uploading.json",
+    "vfs-queue-two-items.json",
     "vfs-queue-uploading.json",
     "vfs-stats-idle.json",
     "vfs-stats-upload-in-progress.json",

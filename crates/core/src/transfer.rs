@@ -36,8 +36,21 @@ pub struct TransferFile {
 #[non_exhaustive]
 pub struct TransferState {
     pub mount: String,
-    /// Which source produced this, and therefore what may be shown.
+    /// Which source produced the *outstanding total*, and therefore what may be claimed
+    /// about it. Deliberately not "the richest endpoint this rclone has": per-file
+    /// progress is an enrichment on top, reported by [`Self::has_progress`], and folding
+    /// the two together would label a `vfs/queue` total with a tier that cannot answer
+    /// what the total is for.
     pub fidelity: Tier,
+    /// Whether the figures below reflect reality at all.
+    ///
+    /// False when rclone could not be reached, and when the mount has no write-back cache
+    /// to observe — a `--vfs-cache-mode off` mount streams writes straight to the remote,
+    /// where nothing can see them. Zero outstanding then means "we cannot tell", not
+    /// "nothing to send", and the difference decides whether unmounting is safe.
+    pub outstanding_known: bool,
+    /// Whether any file carries byte progress. Only `core/stats` supplies it.
+    pub has_progress: bool,
     pub pending: Pending,
     /// Uploads in flight. `None` where the tier cannot distinguish queued from uploading.
     pub uploading: Option<u64>,
@@ -58,6 +71,8 @@ impl TransferState {
         Self {
             mount: mount.to_string(),
             fidelity,
+            outstanding_known: true,
+            has_progress: false,
             pending: Pending::default(),
             uploading: None,
             errored_files: 0,
@@ -99,7 +114,10 @@ impl TransferState {
         s.uploading = Some(cache.uploads_in_progress);
         s.errored_files = cache.errored_files;
         s.out_of_space = cache.out_of_space;
-        s.pending = Pending::new(cache.uploads_in_progress + cache.uploads_queued, 0, 0);
+        // Every size is unknown at this tier, which is what the third argument records.
+        // `Pending::new(n, 0, 0)` would claim "n files totalling exactly zero bytes".
+        let files = cache.uploads_in_progress + cache.uploads_queued;
+        s.pending = Pending::new(files, 0, files);
         s
     }
 
@@ -122,7 +140,22 @@ impl TransferState {
         s
     }
 
-    /// Add `core/stats` byte progress to a queue-derived state, lifting it to T1.
+    /// A mount whose outstanding work cannot be observed at all.
+    ///
+    /// Two causes, both of which must read as "unknown" rather than "nothing": rclone is
+    /// unreachable, or the mount has no write-back cache because its cache mode is `off`
+    /// (or `minimal` for write-only opens). In the second case writes stream straight to
+    /// the remote, so there is genuinely nothing on disk holding them — the one situation
+    /// where an interrupted write really is lost, and the one where reporting "idle" is
+    /// most harmful.
+    pub fn unmonitored(mount: &str, reason: impl Into<String>) -> Self {
+        let mut s = Self::empty(mount, Tier::T4);
+        s.outstanding_known = false;
+        s.degraded_reason = Some(reason.into());
+        s
+    }
+
+    /// Add `core/stats` byte progress to a queue-derived state.
     ///
     /// The queue stays the source of *what* is outstanding: `transferring[]` lags it by
     /// `--vfs-write-back`, so a file written seconds ago is in the queue and absent here.
@@ -131,12 +164,19 @@ impl TransferState {
         if self.fidelity != Tier::T2 {
             return self;
         }
+        let mut any = false;
         for f in &mut self.files {
             if let Some(t) = transferring.iter().find(|t| t.name == f.name) {
                 f.bytes_sent = u64::try_from(t.bytes).ok();
+                any |= f.bytes_sent.is_some();
             }
         }
-        self.fidelity = Tier::T1;
+        // `fidelity` stays T2: the queue produced the total, and the queue is what can
+        // answer whether unmounting is safe. Promoting to T1 here would relabel an exact
+        // total with the one tier that cannot vouch for it, and would claim per-file
+        // progress for the whole `--vfs-write-back` window, during which `transferring[]`
+        // is empty and no file has any.
+        self.has_progress = any;
         self
     }
 
@@ -163,8 +203,27 @@ impl TransferState {
     }
 
     /// Whether anything is outstanding.
+    ///
+    /// False when the answer is unknown: a mount we cannot observe is not an idle one,
+    /// and this is what an unmount check and the poll cadence both read.
     pub fn is_idle(&self) -> bool {
-        self.pending.files == 0
+        self.outstanding_known && self.pending.files == 0
+    }
+
+    /// Whether the outstanding *byte* total means anything. `vfs/stats` reports counts
+    /// with no sizes, so a rate derived from its total would be a confident zero.
+    pub fn has_byte_total(&self) -> bool {
+        self.outstanding_known && self.fidelity != Tier::T3
+    }
+
+    /// Bytes still to send, discounting what is already on the wire.
+    ///
+    /// Without this a rate derived by differencing the queue total reads zero for the
+    /// whole upload of a large file — the total only moves when a file *leaves* the
+    /// queue — and then spikes to the file's entire size in one interval.
+    pub fn remaining_bytes(&self) -> u64 {
+        let sent: u64 = self.files.iter().filter_map(|f| f.bytes_sent).sum();
+        self.pending.known_bytes.saturating_sub(sent)
     }
 }
 
@@ -258,6 +317,14 @@ mod tests {
             "`vfs/queue` carries no byte progress, so nothing may claim it"
         );
         assert_eq!(s.uploading, Some(1), "the capture has one file in flight");
+        assert!(
+            s.files.iter().all(|f| f.size.is_some()),
+            "the queue carries a size per file"
+        );
+        assert!(
+            s.files.iter().all(|f| f.tries.is_some()),
+            "#21 wants `tries` surfaced: a climbing value is repeated upload failure"
+        );
     }
 
     #[test]
@@ -294,9 +361,15 @@ mod tests {
     }
 
     #[test]
-    fn progress_lifts_the_queue_to_t1_and_only_for_files_in_both() {
-        let s = TransferState::from_queue("backup", &queue_fixture("vfs-queue-uploading.json"));
+    fn progress_attaches_only_to_files_present_in_both_sources() {
+        // Two entries, captured from a live rclone, because with one the "everything
+        // else stays unmeasured" assertion never executes and the join key is unguarded.
+        let q = queue_fixture("vfs-queue-two-items.json");
+        assert!(q.queue.len() >= 2, "this test needs a multi-item queue");
+        let s = TransferState::from_queue("backup", &q);
         let known = s.files[0].name.clone();
+        let other = s.files[1].name.clone();
+
         let transferring = vec![Transfer {
             name: known.clone(),
             size: 1_000,
@@ -305,14 +378,60 @@ mod tests {
         }];
         let lifted = s.with_progress(&transferring);
 
-        assert_eq!(lifted.fidelity, Tier::T1);
-        let hit = lifted.files.iter().find(|f| f.name == known).unwrap();
-        assert_eq!(hit.bytes_sent, Some(400));
-        // `transferring[]` lags `vfs/queue` by --vfs-write-back, so a queued file that has
-        // not started must stay unmeasured rather than reading as 0% sent.
-        for f in lifted.files.iter().filter(|f| f.name != known) {
-            assert_eq!(f.bytes_sent, None, "{} was not transferring", f.name);
-        }
+        assert_eq!(
+            lifted
+                .files
+                .iter()
+                .find(|f| f.name == known)
+                .unwrap()
+                .bytes_sent,
+            Some(400)
+        );
+        // `transferring[]` lags `vfs/queue` by --vfs-write-back, so a queued file that
+        // has not started must stay unmeasured rather than reading as 0% sent — or, if
+        // the join key were dropped, as the *other* file's byte count.
+        assert_eq!(
+            lifted
+                .files
+                .iter()
+                .find(|f| f.name == other)
+                .unwrap()
+                .bytes_sent,
+            None,
+            "{other} was not transferring, so it has no progress to show"
+        );
+        assert!(lifted.has_progress, "one file did gain progress");
+    }
+
+    #[test]
+    fn progress_does_not_relabel_the_source_of_the_total() {
+        // The total came from `vfs/queue` and is exact. Promoting the state to T1 would
+        // stamp it with the one tier that cannot vouch for an outstanding total, so an
+        // unmount check would refuse to trust a figure that is in fact reliable.
+        let q = queue_fixture("vfs-queue-two-items.json");
+        let s = TransferState::from_queue("backup", &q);
+        let bytes = s.pending.known_bytes;
+        let lifted = s.with_progress(&[Transfer {
+            name: "one.bin".into(),
+            size: 262_144,
+            bytes: 1_000,
+            ..Default::default()
+        }]);
+
+        assert_eq!(lifted.fidelity, Tier::T2, "the queue produced the total");
+        assert!(lifted.fidelity.meets_the_bar());
+        assert_eq!(lifted.pending.known_bytes, bytes);
+        assert!(lifted.has_progress);
+    }
+
+    #[test]
+    fn a_queue_with_nothing_transferring_reports_no_progress() {
+        // The whole --vfs-write-back window looks like this: files queued, none started.
+        // Claiming per-file progress here is what draws a bar with no data behind it.
+        let s = TransferState::from_queue("backup", &queue_fixture("vfs-queue-two-items.json"))
+            .with_progress(&[]);
+        assert!(!s.has_progress);
+        assert!(s.files.iter().all(|f| f.bytes_sent.is_none()));
     }
 
     #[test]
@@ -328,6 +447,48 @@ mod tests {
         }]);
         assert_eq!(lifted.fidelity, Tier::T4);
         assert!(lifted.files.iter().all(|f| f.bytes_sent.is_none()));
+    }
+
+    /// A cache in trouble. Captured fixtures are all healthy, so the states a user must
+    /// act on cannot be reached from `testdata/`.
+    fn unhealthy_cache() -> DiskCache {
+        let mut c = stats_fixture("vfs-stats-upload-in-progress.json");
+        c.errored_files = 3;
+        c.out_of_space = true;
+        // Non-zero, so the "bytesUsed is not pending bytes" guard can actually detect the
+        // mistake it is named for. rclone reports 0 here throughout an upload.
+        c.bytes_used = 999_999;
+        c
+    }
+
+    #[test]
+    fn the_actionable_flags_survive_the_merge() {
+        // `erroredFiles` and `outOfSpace` are the two states #21 says the user must act
+        // on, and both are only in `vfs/stats`.
+        let s = TransferState::from_queue("backup", &queue_fixture("vfs-queue-uploading.json"))
+            .with_cache_health(&unhealthy_cache());
+        assert_eq!(
+            s.errored_files, 3,
+            "repeated upload failure must reach the user"
+        );
+        assert!(s.out_of_space, "a full cache silently breaks uploads");
+    }
+
+    #[test]
+    fn counts_only_never_borrows_a_byte_total_from_the_cache_size() {
+        // `diskCache.bytesUsed` is cache size, not pending bytes — the one trap DESIGN
+        // names for this endpoint.
+        let s = TransferState::from_stats("backup", &unhealthy_cache());
+        assert_eq!(
+            s.pending.known_bytes, 0,
+            "bytesUsed is not what is outstanding, however tempting the number is"
+        );
+        assert!(
+            !s.pending.is_exact(),
+            "counts with no sizes must not claim an exact zero-byte total"
+        );
+        assert_eq!(s.pending.unknown_size_files, s.pending.files);
+        assert!(!s.has_byte_total());
     }
 
     #[test]

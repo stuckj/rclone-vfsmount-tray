@@ -78,43 +78,71 @@ impl MountPoller {
             // No `vfs/queue` on this build: counts are all there is over rc.
             Err(RcError::Failed { status: 404, .. }) => match &cache {
                 Some(c) => TransferState::from_stats(&self.name, c),
-                None => TransferState::from_scan(&self.name, Vec::new())
-                    .degraded("this rclone has no vfs/queue and no disk cache"),
+                None => {
+                    return Ok(TransferState::unmonitored(
+                        &self.name,
+                        "this rclone registers no vfs/queue and this mount has no \
+                         write-back cache, so nothing outstanding can be observed",
+                    ))
+                }
             },
             Err(e) => return Err(e),
         };
 
-        if let Some(c) = &cache {
-            state = state.with_cache_health(c);
-        }
+        // No disk cache means no write-back queue to observe: this mount's cache mode is
+        // `off`, so writes stream straight to the remote where nothing can see them.
+        // DESIGN.md: say the mount is unmonitored rather than imply it is idle. rclone
+        // answers `vfs/queue` with `{}` here rather than an error, so without this the
+        // state would read as a confident, non-degraded zero.
+        let Some(cache) = cache else {
+            return Ok(TransferState::unmonitored(
+                &self.name,
+                "this mount has no write-back cache (--vfs-cache-mode off), so writes \
+                 stream straight to the remote and nothing outstanding can be observed",
+            ));
+        };
+        state = state.with_cache_health(&cache);
 
         // Per-file progress, where the build has `core/stats` and the transfers can be
         // attributed to this mount. Without the cache path a transfer cannot be told from
         // another mount's, so the lift is skipped rather than guessed at.
         if self.caps.has("core/stats") && self.cache_path.is_some() {
-            if let Ok(stats) = self.client.call::<CoreStats>("core/stats", empty()).await {
-                // Both conditions, per DESIGN.md: the `global_stats` group alone admits
-                // cache *downloads*, which would then be counted as pending uploads.
-                let cache = self.cache_path.clone().unwrap_or_default();
-                let mine: Vec<_> = stats.writeback_uploads(&cache).cloned().collect();
-                state = state.with_progress(&mine);
+            match self.client.call::<CoreStats>("core/stats", empty()).await {
+                Ok(stats) => {
+                    // Both conditions, per DESIGN.md: the `global_stats` group alone admits
+                    // cache *downloads*, which would then be counted as pending uploads.
+                    let cache = self.cache_path.clone().unwrap_or_default();
+                    let mine: Vec<_> = stats.writeback_uploads(&cache).cloned().collect();
+                    state = state.with_progress(&mine);
+                }
+                // Losing per-file progress is a silent downgrade otherwise.
+                Err(e) => tracing::debug!(mount = %self.name, error = %e,
+                    "core/stats unavailable; reporting without per-file progress"),
             }
         }
 
-        let rate = if state.is_idle() {
+        let rate = if state.is_idle() || !state.has_byte_total() {
+            // Nothing moving, or no byte total to difference. `vfs/stats` reports counts
+            // without sizes, so sampling it would yield a confident 0 B/s.
             self.rate.reset();
             None
         } else {
-            self.rate.sample(state.pending.known_bytes)
+            // Discounting bytes already on the wire, so a large file's progress is
+            // visible rather than only its departure from the queue.
+            self.rate
+                .sample(state.remaining_bytes())
+                // Zero asserts "stalled". While something is in flight the truth is
+                // "moving, not measurable at this granularity", which is `None`.
+                .filter(|r| *r > 0 || state.uploading == Some(0))
         };
         Ok(state.with_rate(rate))
     }
 
     fn unreachable(&self, e: &RcError) -> TransferState {
-        // An empty scan rather than a fabricated one: the on-disk scanner is #22, and
-        // reporting zero outstanding when the answer is unknown would be worse than
-        // saying so. The reason is what tells the UI to show a degraded state.
-        TransferState::from_scan(&self.name, Vec::new()).degraded(e.to_string())
+        // Not an empty scan: that reports zero outstanding, exactly, which is a claim.
+        // The on-disk scanner that could answer here is #22; until then the honest answer
+        // is that we do not know.
+        TransferState::unmonitored(&self.name, e.to_string())
     }
 
     async fn fetch_stats(&mut self) -> Result<Option<DiskCache>, RcError> {
@@ -505,7 +533,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_rate_appears_only_once_bytes_have_actually_moved() {
+    async fn a_stalled_looking_poll_reports_no_rate_rather_than_zero() {
+        // Two polls of the same queue: nothing left it, but a file is in flight. Zero
+        // asserts "stalled"; the truth is "moving, not measurable at this granularity".
         let fake = FakeRc::new(
             "rate",
             vec![
@@ -519,9 +549,101 @@ mod tests {
         let first = p.poll().await.unwrap();
         assert_eq!(
             first.rate_bytes_per_sec, None,
-            "one sample cannot be a rate; reporting 0 would read as stalled"
+            "one sample cannot be a rate"
         );
+        assert_eq!(first.uploading, Some(1), "the capture has a file in flight");
+
         let second = p.poll().await.unwrap();
-        assert!(second.rate_bytes_per_sec.is_some());
+        assert_eq!(
+            second.rate_bytes_per_sec, None,
+            "nothing left the queue and a file is uploading, so 0 B/s would read as \
+             stalled when the transfer is in fact moving"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mount_with_no_write_back_cache_is_unmonitored_not_idle() {
+        // `--vfs-cache-mode off` streams writes straight to the remote: rclone answers
+        // `vfs/queue` with `{}` and omits `diskCache` entirely, so a naive read is a
+        // confident zero. Verified against real rclone v1.75.0. This is also the one
+        // configuration where an interrupted write is genuinely lost, since nothing on
+        // disk is holding it.
+        let fake = FakeRc::new(
+            "cacheoff",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", "{}".to_string()),
+                // No `diskCache` key, exactly as rclone reports with cache mode off.
+                (
+                    "vfs/stats",
+                    r#"{"fs":"/src","inUse":1,"metadataCache":{"dirs":1,"files":0}}"#.to_string(),
+                ),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let s = p.poll().await.expect("this is not a fault");
+
+        assert!(
+            !s.outstanding_known,
+            "nothing can be observed here, so the figures must not be presented as fact"
+        );
+        assert!(
+            !s.is_idle(),
+            "an unobservable mount is not an idle one — an unmount check reads this"
+        );
+        let why = s
+            .degraded_reason
+            .clone()
+            .expect("the user has to be told why");
+        assert!(why.contains("vfs-cache-mode off"), "{why}");
+        assert_eq!(
+            MountPoller::interval(&s),
+            ACTIVE,
+            "it must not drop to the idle cadence on a mount it cannot see"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_rclone_that_dies_after_connecting_does_not_report_an_exact_zero() {
+        // The path that matters: capabilities were probed successfully, so the poller
+        // knows this mount *has* a queue — and then rclone goes away. A mount with 12GB
+        // queued must not flip to "nothing outstanding, exactly".
+        //
+        // Connecting to a socket that never existed takes a different branch (no
+        // capabilities, so no cache), which is why that case cannot stand in for this one.
+        let fake = FakeRc::new(
+            "died",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", fixture("vfs-queue-uploading.json")),
+                ("vfs/stats", fixture("vfs-stats-upload-in-progress.json")),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let before = p.poll().await.unwrap();
+        assert!(before.outstanding_known && !before.is_idle());
+
+        // rclone exits: the socket is gone, the capabilities are not.
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await.expect("a departed rclone is not a fault");
+        assert!(
+            !after.outstanding_known,
+            "the queue did not empty — we simply stopped being able to see it"
+        );
+        assert!(
+            !after.is_idle(),
+            "'idle' is a claim we cannot make about a mount we cannot observe"
+        );
+        // `pending` itself cannot express "unknown" — zero files is vacuously exact, and
+        // inventing an unknown-size file to say otherwise would be worse. That is what
+        // `outstanding_known` is for, and why `is_idle()` consults it rather than the
+        // count alone.
+        assert_eq!(after.pending.files, 0);
+        assert_eq!(after.rate_bytes_per_sec, None);
+        assert!(after.degraded_reason.is_some());
     }
 }

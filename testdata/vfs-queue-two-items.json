@@ -1,0 +1,22 @@
+{
+	"queue": [
+		{
+			"delay": 300,
+			"expiry": 297.912608141,
+			"id": 1,
+			"name": "one.bin",
+			"size": 262144,
+			"tries": 0,
+			"uploading": false
+		},
+		{
+			"delay": 300,
+			"expiry": 297.925088148,
+			"id": 2,
+			"name": "two.bin",
+			"size": 131072,
+			"tries": 0,
+			"uploading": false
+		}
+	]
+}

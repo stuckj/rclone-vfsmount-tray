@@ -271,10 +271,11 @@ impl RcClient {
                 }
             }
 
-            // rclone creates the socket 0775 whatever it is asked for, so this is a real
-            // condition rather than a defensive one; the mount unit sets UMask=0077 to
-            // bring it down. Group and other must have nothing at all — write alone is
-            // enough to connect.
+            // rclone does no chmod when binding, so the socket gets `0777 & ~umask` —
+            // 0755 under the common umask 022, 0775 under the 002 some distributions
+            // ship. A real condition, not a defensive one. Group and other must have
+            // nothing at all: write permission alone is enough to connect, and connecting
+            // is all an attacker needs.
             let mode = md.mode() & 0o777;
             if mode & 0o077 != 0 {
                 return Err(RcError::InsecureSocket {
@@ -884,6 +885,38 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn an_untrusted_socket_is_never_even_connected_to() {
+        use std::sync::atomic::Ordering;
+
+        // "Refused before anything is sent" has to mean the connection is never made, not
+        // merely that the reply is distrusted. Counting accepts is what pins the ordering:
+        // moving the check after the request would still return the right error.
+        let (dir, socket, connects, server) =
+            slow_failing_server("unconnected", Duration::from_millis(10)).await;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o775)).unwrap();
+
+        let e = RcClient::new(&socket)
+            .call::<serde_json::Value>("core/version", serde_json::json!({}))
+            .await
+            .expect_err("a group-accessible socket must not be used");
+        assert!(matches!(e, RcError::InsecureSocket { .. }), "{e:?}");
+
+        // `connect` on a UNIX socket succeeds against the listen backlog, so the server's
+        // `accept` — and the counter with it — lags the client by a scheduling hop.
+        // Reading it immediately would see zero whether or not a connection was made.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            connects.load(Ordering::SeqCst),
+            0,
+            "the client connected to a socket it had already judged unsafe"
+        );
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_peer_running_as_another_user_is_refused_after_connecting() {
         // The check that closes the TOCTOU window: `verify()` can only describe a path,
         // and the path can be swapped before the connect. This asks who actually answered.
@@ -1144,6 +1177,21 @@ mod tests {
         assert!(!RcError::ResponseTooLarge {
             command: "vfs/list".into(),
             limit: 64
+        }
+        .is_unreachable());
+
+        // An rclone restarting closes the connection mid-response. Surfacing that as a
+        // fault would put a connection-reset message on every poll tick for the length of
+        // a `systemctl --user restart`, where the disk scan would have answered.
+        assert!(RcError::Transport {
+            command: "rc/list".into(),
+            source: "connection reset by peer".into()
+        }
+        .is_unreachable());
+
+        assert!(RcError::Connect {
+            path: PathBuf::from("/run/x.sock"),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused)
         }
         .is_unreachable());
     }

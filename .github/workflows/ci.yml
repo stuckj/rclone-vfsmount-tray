@@ -57,6 +57,13 @@ jobs:
       - name: clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Docs build without warnings
+        # CLAUDE.md lists this among the blocking checks; it was not actually run, so a
+        # broken intra-doc link could reach main.
+        run: cargo doc --locked --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: unit + fixture tests
         run: cargo test --locked --workspace
 

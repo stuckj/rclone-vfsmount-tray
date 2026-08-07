@@ -399,7 +399,12 @@ pub struct CoreVersion {
 /// how rclone was built, where a version comparison only guesses.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RcList {
-    #[serde(default)]
+    /// Deliberately **not** `#[serde(default)]`. This is the field capability detection
+    /// reads, so if a future rclone renames or wraps it, defaulting would produce an empty
+    /// command set that is indistinguishable from a genuine answer — every mount silently
+    /// at T4, reporting nothing wrong. Without the default the same drift is a `Decode`
+    /// error, which is surfaced. The fixture guard cannot catch this: it replays the
+    /// captured payload, not the new one.
     pub commands: Vec<RcCommand>,
 }
 

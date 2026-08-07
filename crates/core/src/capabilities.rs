@@ -42,7 +42,7 @@ impl Tier {
     /// makes an unmount look safe when it is not. T3 gives counts without bytes.
     ///
     /// A build that resolves to T1 or T3 is not stuck: `vfs/queue` may still be present,
-    /// and the disk scan always is. See [`Capabilities::can_answer_outstanding`].
+    /// and the disk scan always is. See [`Capabilities::rc_can_answer_outstanding`].
     pub fn meets_the_bar(self) -> bool {
         matches!(self, Tier::T2 | Tier::T4)
     }

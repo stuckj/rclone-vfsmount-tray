@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 
 /// Filesystem types a rclone FUSE mount can appear under.
 ///
-/// rclone passes `-o subtype=rclone`, which the kernel renders as `fuse.rclone`. Mounts
-/// made without the subtype — an explicit `-o` override, or an older rclone — land on
-/// bare `fuse`, so those are matched on the mount source instead.
+/// rclone sets the `rclone` subtype, which the kernel renders as `fuse.rclone`; both the
+/// `mount` and `mount2` implementations do. A mount made with an explicit `-o subtype`
+/// override lands on bare `fuse`, and is matched on its source instead.
 const RCLONE_FSTYPE: &str = "fuse.rclone";
-const BARE_FUSE_FSTYPES: &[&str] = &["fuse", "fuse.rclone2"];
+const BARE_FUSE_FSTYPES: &[&str] = &["fuse"];
 
 /// One live mount.
 #[derive(Debug, Clone, PartialEq, Eq)]

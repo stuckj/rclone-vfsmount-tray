@@ -200,6 +200,11 @@ pub struct Mount {
     #[serde(default)]
     pub gid: Option<u32>,
     /// Octal, as a string, so `0022` survives a round trip.
+    ///
+    /// Passed to rclone's `--umask` verbatim. Older rclone registers that flag as an
+    /// integer and parses it base-10, so `"0022"` is read as decimal 22 there rather than
+    /// octal — see #69. Leaving this unset avoids the question entirely and is what the
+    /// example config does.
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -496,6 +501,23 @@ impl Config {
             }
             if !names.insert(n.to_string()) {
                 return Err(ConfigError::Invalid(format!("duplicate mount name {n:?}")));
+            }
+            // `--rc-addr` is a repeatable flag: rclone appends listeners rather than
+            // replacing them, so an extra one here does not override the UNIX socket, it
+            // adds a second endpoint beside it. Since the composed argv already carries
+            // `--rc-no-auth` — safe only because the socket is unreachable to anyone else
+            // — an added TCP listener would serve `core/command` and `config/dump`
+            // unauthenticated to the network. rc access is shell access as this user.
+            if let Some(bad) = m.extra_args.iter().find(|a| {
+                a.strip_prefix("--rc")
+                    .is_some_and(|r| r.is_empty() || r.starts_with('-') || r.starts_with('='))
+            }) {
+                return Err(ConfigError::Invalid(format!(
+                    "mount {n:?}: extra_args may not set rc flags ({bad:?}). The rc endpoint \
+                     is configured for you as a private UNIX socket; adding another listener \
+                     would expose an unauthenticated rc API, which is equivalent to shell \
+                     access as this user."
+                )));
             }
             // The colon case first, so it keeps its more specific advice.
             if m.remote.contains(':') {

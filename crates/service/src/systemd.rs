@@ -16,9 +16,12 @@ pub struct UnitSpec {
     pub description: String,
     pub executable: PathBuf,
     pub args: Vec<String>,
-    /// Applied to rclone's own file creation. rclone creates its rc socket 0775 whatever
-    /// it is asked for, and rc access is equivalent to shell access as this user, so this
-    /// is what actually keeps the socket private. Raising it reopens that hole.
+    /// The unit's umask, which rclone applies to every file and directory it creates
+    /// inside the mount as well as to its own files: `--umask` defaults to the process
+    /// umask, and rclone masks its 0777/0666 defaults with it.
+    ///
+    /// So this must stay the ordinary value a login shell would have. The rc socket is
+    /// protected by the mode of the directory holding it, not by this.
     pub umask: u32,
 }
 
@@ -27,6 +30,9 @@ pub struct UnitSpec {
 pub enum UnitStatus {
     Active,
     Activating,
+    /// Being stopped. Distinct from `Activating` because the supervisor maps it to
+    /// `Unmounting`, and a mount being torn down must not report as coming up.
+    Deactivating,
     Failed,
     /// Not loaded, or loaded and dead. Both mean "not running and not trying to".
     #[default]
@@ -151,14 +157,22 @@ pub mod dbus {
                     // Restart the mount if rclone dies, but give up rather than loop:
                     // a remote that rejects the credentials fails identically forever.
                     ("Restart", Value::from("on-failure")),
-                    ("RestartSec", Value::from(5_u64)),
-                    // Keep the unit loaded after it fails so its state and logs can be
-                    // read; `reset_failed` clears it before a retry.
-                    ("CollectMode", Value::from("inactive-or-failed")),
+                    // These take systemd's *D-Bus property* names, which are not the
+                    // unit-file directive names: there is no `RestartSec` or
+                    // `TimeoutStopSec` property — `systemd-run` renames those client-side
+                    // — and both of these are microseconds. An unrecognised name fails
+                    // the whole call rather than being ignored, so a wrong name here
+                    // means no mount can start at all.
+                    ("RestartUSec", Value::from(5_000_000_u64)),
                     // rclone needs a SIGTERM to flush and unmount cleanly; killing the
                     // whole cgroup immediately would leave the mount point stale.
                     ("KillMode", Value::from("mixed")),
-                    ("TimeoutStopSec", Value::from(30_u64)),
+                    ("TimeoutStopUSec", Value::from(30_000_000_u64)),
+                    // `CollectMode` is deliberately unset. It defaults to `inactive`,
+                    // which keeps a failed unit loaded so its state and log can still be
+                    // read. `inactive-or-failed` would garbage-collect precisely the
+                    // failure that has to be reported, leaving the mount looking merely
+                    // absent.
                 ];
 
                 // "fail" rather than "replace": if something already holds this unit
@@ -203,7 +217,8 @@ pub mod dbus {
                     .map_err(|e| supervision(&format!("reading state of {unit}"), e))?;
                 Ok(match state.as_str() {
                     "active" | "reloading" => UnitStatus::Active,
-                    "activating" | "deactivating" => UnitStatus::Activating,
+                    "activating" => UnitStatus::Activating,
+                    "deactivating" => UnitStatus::Deactivating,
                     "failed" => UnitStatus::Failed,
                     _ => UnitStatus::Inactive,
                 })
@@ -238,21 +253,76 @@ pub mod dbus {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_umask_that_protects_the_rc_socket_is_carried_on_the_spec() {
-        // rclone creates the socket 0775; 0077 is what brings it to 0700. This is the
-        // only thing standing between a shared-group login and rc access.
+    /// Exercise the real property set against the running systemd.
+    ///
+    /// `StartTransientUnit` rejects the whole call on one unrecognised property name, and
+    /// the D-Bus names differ from the unit-file directives — `RestartSec` does not exist
+    /// as a property, only `RestartUSec`. No amount of testing against a double catches
+    /// that, because the double accepts whatever it is handed.
+    ///
+    /// Skipped where there is no systemd user instance, which includes most CI runners.
+    #[tokio::test]
+    async fn the_property_set_is_one_systemd_actually_accepts() {
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+
+        let name = format!("rvt-selftest-{}.service", std::process::id());
+        // `sleep` stands in for rclone: the point is the property set, not the payload.
         let spec = UnitSpec {
-            name: "rvt-mount-backup.service".into(),
-            description: "rclone mount backup:".into(),
-            executable: PathBuf::from("/usr/bin/rclone"),
-            args: vec!["mount".into()],
+            name: name.clone(),
+            description: "rclone-vfsmount-tray self test".into(),
+            executable: PathBuf::from("/bin/sleep"),
+            args: vec!["30".into()],
             umask: 0o077,
         };
-        assert_eq!(
-            spec.umask & 0o007,
-            0o007,
-            "group and other must be masked off"
-        );
+
+        let started = units.start_transient(&spec).await;
+        // A systemd that is not the user instance (no --user manager) shows up here
+        // rather than at connect, and is a skip rather than a failure.
+        if let Err(e) = &started {
+            let msg = e.to_string();
+            if msg.contains("ServiceUnknown") || msg.contains("not supported") {
+                eprintln!("skipped: no systemd user instance ({msg})");
+                return;
+            }
+        }
+        started.expect("systemd must accept every property this sends");
+
+        let mut status = UnitStatus::Inactive;
+        for _ in 0..40 {
+            status = units.status(&name).await.expect("status must be readable");
+            if status == UnitStatus::Active {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(status, UnitStatus::Active, "the unit should have started");
+
+        units.stop(&name).await.expect("stop must succeed");
+        let _ = units.reset_failed(&name).await;
+    }
+
+    #[tokio::test]
+    async fn a_unit_that_was_never_started_reads_as_inactive_not_as_an_error() {
+        // The supervisor calls this for every configured mount on every poll, including
+        // ones that have never run. Surfacing that as an error would make a down mount
+        // indistinguishable from a broken bus.
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+        let name = format!("rvt-absent-{}.service", std::process::id());
+        match units.status(&name).await {
+            Ok(s) => assert_eq!(s, UnitStatus::Inactive),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("ServiceUnknown") || msg.contains("not supported"),
+                    "an absent unit must not error: {msg}"
+                );
+            }
+        }
     }
 }

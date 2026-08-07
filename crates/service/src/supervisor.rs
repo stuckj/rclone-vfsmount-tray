@@ -20,6 +20,10 @@ use std::time::Duration;
 /// Generous, because this covers an OAuth token refresh and the first listing of a cold
 /// remote, not just process startup.
 const READY_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// `ENOTCONN`. What every operation on a mount point returns once the FUSE daemon
+/// serving it has gone away without unmounting.
+const ENOTCONN: i32 = 107;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Starts rclone mounts as transient systemd units.
@@ -67,6 +71,30 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             .ok_or_else(|| SupervisorError::UnknownMount(name.to_string()))
     }
 
+    /// The mount point as the kernel will report it.
+    ///
+    /// mountinfo records fully resolved paths. A configured `/home/u/mnt/x` where
+    /// `/home/u/mnt` is a symlink appears there as its target, so an uncanonicalised
+    /// comparison never matches and a working mount reads as down.
+    ///
+    /// Falls back to the configured path when it cannot be resolved, which is the normal
+    /// case before the directory exists.
+    fn resolved_point(m: &Mount) -> PathBuf {
+        std::fs::canonicalize(&m.mount_point).unwrap_or_else(|_| m.mount_point.clone())
+    }
+
+    /// Whether a mount point is present but no longer served.
+    ///
+    /// When a FUSE daemon dies without unmounting, the kernel keeps the mountinfo entry
+    /// and every operation on it fails with `ENOTCONN`. It is indistinguishable from a
+    /// healthy mount by path alone, so it has to be probed.
+    fn is_stale(path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Err(e) => e.raw_os_error() == Some(ENOTCONN),
+            Ok(_) => false,
+        }
+    }
+
     fn live_mounts(&self) -> Vec<MountEntry> {
         // A mountinfo that cannot be read means no evidence of any mount, not an error:
         // reporting everything as down is honest, and the next poll recovers.
@@ -78,13 +106,30 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// The kernel says whether anything is mounted there; the unit says whether it is
     /// ours. Both are needed — mounted with no unit of ours is precisely a foreign mount.
     async fn resolve(&self, m: &Mount) -> Result<MountState, SupervisorError> {
-        let live = mountinfo::is_mounted_at(&self.live_mounts(), &m.mount_point);
+        let point = Self::resolved_point(m);
+        let live = mountinfo::is_mounted_at(&self.live_mounts(), &point);
+
+        // A mount point left behind by a dead rclone is still "mounted" as far as the
+        // kernel is concerned. Calling it Foreign would be doubly wrong: it is ours, and
+        // it would be neither startable (something is already there) nor stoppable
+        // (foreign mounts refuse to unmount without force).
+        if live && Self::is_stale(&point) {
+            return Ok(MountState::Failed {
+                reason: format!(
+                    "{} is mounted but not responding — the rclone serving it exited \
+                     without unmounting. Mounting again will clear it.",
+                    point.display()
+                ),
+            });
+        }
+
         let unit = self.units.status(&m.unit_name()).await?;
         Ok(match (live, unit) {
             (true, UnitStatus::Active | UnitStatus::Activating) => MountState::Mounted,
             // Mounted, but not by a unit of ours. Adopted for display only.
             (true, _) => MountState::Foreign,
             (false, UnitStatus::Activating) => MountState::Mounting,
+            (false, UnitStatus::Deactivating) => MountState::Unmounting,
             (false, UnitStatus::Failed) => MountState::Failed {
                 reason: self.units.recent_output(&m.unit_name()).await,
             },
@@ -99,7 +144,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     async fn await_ready(&self, m: &Mount) -> Result<(), SupervisorError> {
         let deadline = std::time::Instant::now() + self.ready_timeout;
         loop {
-            if mountinfo::is_mounted_at(&self.live_mounts(), &m.mount_point) {
+            if mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m)) {
                 return Ok(());
             }
             // A unit that has already failed will never become ready; waiting out the
@@ -134,6 +179,32 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         } else {
             out
         }
+    }
+
+    /// Create the runtime directory private to this user.
+    ///
+    /// This is what actually protects the rc sockets. rclone creates a socket 0775
+    /// whatever it is asked for, and connecting to a UNIX socket needs only write
+    /// permission — but a 0700 directory cannot be traversed by anyone else, so the mode
+    /// of the socket inside it stops being reachable. Doing it this way keeps the
+    /// protection off the *mount unit's* umask, which rclone also applies to every file
+    /// it creates inside the mount.
+    fn prepare_runtime_dir(&self) -> Result<(), SupervisorError> {
+        let ctx = |e: std::io::Error| SupervisorError::Supervision {
+            context: format!(
+                "preparing the runtime directory {}",
+                self.runtime_dir.display()
+            ),
+            source: Some(Box::new(e)),
+        };
+        std::fs::create_dir_all(&self.runtime_dir).map_err(ctx)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.runtime_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(ctx)?;
+        }
+        Ok(())
     }
 
     /// Make sure the mount point is a directory we can mount onto.
@@ -202,7 +273,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     async fn await_gone(&self, m: &Mount, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if !mountinfo::is_mounted_at(&self.live_mounts(), &m.mount_point) {
+            if !mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m)) {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -218,23 +289,30 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
         Box::pin(async move {
             let m = self.mount_config(name)?;
 
-            // Already serving, however it got there. Mounting again would fail on a
-            // busy mount point and tell the user nothing useful, and this is the path
-            // taken after a service restart, when every mount is already up.
-            if mountinfo::is_mounted_at(&self.live_mounts(), &m.mount_point) {
-                return Ok(());
+            let point = Self::resolved_point(m);
+            if mountinfo::is_mounted_at(&self.live_mounts(), &point) {
+                // A mount point the kernel still lists but nothing is serving. Left
+                // alone it blocks every future attempt, since rclone cannot mount over
+                // it — so clear it rather than reporting success onto a dead mount.
+                if Self::is_stale(&point) {
+                    Self::fusermount(&point, false).await?;
+                } else {
+                    // Already serving, however it got there. This is the path taken
+                    // after a service restart, when every mount is already up.
+                    return Ok(());
+                }
             }
 
             Self::prepare_mount_point(&m.mount_point)?;
-            std::fs::create_dir_all(&self.runtime_dir).map_err(|e| {
-                SupervisorError::Supervision {
-                    context: format!(
-                        "creating the runtime directory {}",
-                        self.runtime_dir.display()
-                    ),
-                    source: Some(Box::new(e)),
-                }
-            })?;
+            self.prepare_runtime_dir()?;
+
+            // rclone binds its rc socket with a bare listen and will not replace a stale
+            // one, so a socket left by a killed rclone makes every subsequent start fail
+            // with "address already in use".
+            let socket = self.socket_path(&m.name);
+            if socket.exists() {
+                let _ = std::fs::remove_file(&socket);
+            }
 
             // A previous failure leaves the unit loaded, and StartTransientUnit refuses a
             // name that already exists — without this, a mount could be retried once and
@@ -250,7 +328,10 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 ),
                 executable: self.rclone.clone(),
                 args: m.mount_args(&self.socket_path(&m.name)),
-                umask: 0o077,
+                // Ordinary, because rclone applies this to every file it creates inside
+                // the mount. A mount with `allow_other` set so another service account
+                // can read it would get 0600 files and fail with EACCES on all of them.
+                umask: 0o022,
             };
             self.units.start_transient(&spec).await?;
             self.await_ready(m).await
@@ -339,15 +420,15 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
     }
 }
 
-/// A display name for a mount we did not configure.
+/// A name for a mount we did not configure.
 ///
-/// The mount point rather than the remote, because that is what distinguishes two mounts
-/// of the same remote and is what the user sees in their file manager.
+/// The full mount point, not its last component. Two foreign mounts can share a basename
+/// (`/mnt/a/data` and `/mnt/b/data`), and a basename can equal a configured mount's name —
+/// and since names are how clients address mounts, a collision means an action aimed at
+/// one mount lands on another. A configured name cannot contain `/`, so a path can never
+/// collide with one.
 fn foreign_name(e: &MountEntry) -> String {
-    e.mount_point
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| e.source.clone())
+    e.mount_point.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -539,13 +620,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_started_unit_masks_the_rc_socket() {
+    async fn the_rc_socket_is_protected_by_its_directory_not_by_the_units_umask() {
+        // rclone applies the unit's umask to every file it creates inside the mount, so a
+        // restrictive one here gives a mount with `allow_other` 0600 files that the
+        // account it was shared with cannot read. The socket is kept private by the mode
+        // of the directory holding it instead.
         let s = supervisor("umask", false, &[], UnitStatus::Inactive);
         let _ = s.mount("backup").await;
+
         let started = s.units.started.lock().unwrap();
         let spec = started.first().expect("a unit should have been started");
-        assert_eq!(spec.umask, 0o077, "rclone creates the rc socket 0775");
+        assert_eq!(
+            spec.umask, 0o022,
+            "an ordinary umask, or files inside the mount become unreadable"
+        );
         assert!(spec.args.iter().any(|a| a.starts_with("unix://")));
+        drop(started);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&s.runtime_dir)
+                .expect("the runtime directory should have been created")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "the rc socket directory must not be traversable by anyone else"
+            );
+        }
     }
 
     #[tokio::test]
@@ -576,8 +680,9 @@ mod tests {
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].name, "backup");
         assert_eq!(found[0].state, MountState::Mounted);
-        // The unconfigured one is reported rather than ignored.
-        assert_eq!(found[1].name, "somebody-elses");
+        // The unconfigured one is reported rather than ignored, and named by its full
+        // path so it cannot collide with a configured name or another foreign mount.
+        assert_eq!(found[1].name, other);
         assert_eq!(found[1].state, MountState::Foreign);
     }
 

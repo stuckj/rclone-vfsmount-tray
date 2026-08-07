@@ -1180,6 +1180,15 @@ mod tests {
         }
         .is_unreachable());
 
+        // A command string we could not turn into a request is a programming error, not a
+        // reason to fall back — degrading would hide it behind a mount that merely looks
+        // unable to do much.
+        assert!(!RcError::InvalidCommand {
+            command: "vfs/ nope".into(),
+            source: "invalid uri character".into()
+        }
+        .is_unreachable());
+
         // An rclone restarting closes the connection mid-response. Surfacing that as a
         // fault would put a connection-reset message on every poll tick for the length of
         // a `systemctl --user restart`, where the disk scan would have answered.

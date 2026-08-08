@@ -62,11 +62,18 @@ fn cache_root(cache: &Path, tree: &str, remote: &Path) -> Option<PathBuf> {
     Some(backend.join(rel))
 }
 
-/// Wait for the scan to see `expect_files`, or give up.
+/// Wait until a scan satisfies `done`, or give up.
 ///
-/// rclone writes the data file and its descriptor separately and after the PUT returns,
-/// so a scan immediately afterwards is a race rather than a bug in the scanner.
-fn scan_until(cache: &Path, remote: &Path, expect_files: usize) -> scan::CacheScan {
+/// rclone writes the data file and its descriptor separately, and both after the PUT
+/// returns, so scanning immediately afterwards races it rather than exposing a bug in the
+/// scanner. The predicate is the condition the caller is about to assert — waiting on the
+/// file count and then asserting on bytes leaves exactly the gap this is meant to close.
+fn scan_until(
+    cache: &Path,
+    remote: &Path,
+    what: &str,
+    done: impl Fn(&scan::CacheScan) -> bool,
+) -> scan::CacheScan {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let mut last = None;
     while std::time::Instant::now() < deadline {
@@ -75,7 +82,7 @@ fn scan_until(cache: &Path, remote: &Path, expect_files: usize) -> scan::CacheSc
             cache_root(cache, "vfs", remote),
         ) {
             if let Ok(found) = scan::scan(&meta, &data) {
-                if found.files.len() == expect_files {
+                if done(&found) {
                     return found;
                 }
                 last = Some(found);
@@ -83,7 +90,7 @@ fn scan_until(cache: &Path, remote: &Path, expect_files: usize) -> scan::CacheSc
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    panic!("cache never settled to {expect_files} dirty file(s); last saw {last:?}");
+    panic!("cache never settled to {what}; last saw {last:?}");
 }
 
 #[test]
@@ -133,7 +140,9 @@ fn a_real_rclone_cache_reads_back_as_one_dirty_file() {
     mkcol(port, "sub");
     put(port, "sub/queued.bin", &body);
 
-    let found = scan_until(&cache, &src, 1);
+    let found = scan_until(&cache, &src, "one fully-written dirty file", |f| {
+        f.files.len() == 1 && f.known_bytes() == body.len() as u64
+    });
 
     assert!(
         found.is_complete(),
@@ -155,10 +164,87 @@ fn a_real_rclone_cache_reads_back_as_one_dirty_file() {
         body.len() as u64,
         "and that is what a caller would show as bytes still to send"
     );
-    assert!(
-        !found.files[0].still_open,
-        "the PUT completed, so rclone has closed the handle and filled in Size and Rs"
+}
+
+#[test]
+fn a_write_still_in_flight_is_dirty_on_disk_before_it_reaches_the_queue() {
+    // The claim this whole tier rests on: `Dirty` is set when the file is *written*, while
+    // rclone only puts an item in `vfs/queue` when it is *closed*. If that were the other
+    // way round the disk would be no better than the rc endpoints, and the fallback would
+    // be pointless.
+    //
+    // Held open by starting a PUT with a Content-Length and stopping half way, which is a
+    // write in progress as far as the VFS is concerned.
+    let Some(rclone) = which_rclone() else {
+        eprintln!("skipped: no rclone on PATH");
+        return;
+    };
+
+    let dir = TempDir(std::env::temp_dir().join(format!("rvt-scanmid-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&dir.0);
+    let (src, cache) = (dir.0.join("src"), dir.0.join("cache"));
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&cache).unwrap();
+
+    let mut child = Rclone(
+        Command::new(&rclone)
+            .args([
+                "serve",
+                "webdav",
+                &src.to_string_lossy(),
+                "--addr",
+                "127.0.0.1:0",
+                "--vfs-cache-mode",
+                "writes",
+                "--vfs-write-back",
+                "300s",
+                "--cache-dir",
+                &cache.to_string_lossy(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("rclone should start"),
     );
+    let stderr = child.0.stderr.take().expect("piped");
+    let port = read_served_port(stderr).expect("rclone should log its address");
+
+    // Announce 4MB, send 1MB, and keep the connection open.
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("webdav listener");
+    let total = 4 * 1024 * 1024;
+    stream
+        .write_all(
+            format!(
+                "PUT /halfway.bin HTTP/1.1\r\nHost: localhost\r\nContent-Length: {total}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    stream.write_all(&vec![b'q'; 1024 * 1024]).unwrap();
+    stream.flush().unwrap();
+
+    let found = scan_until(&cache, &src, 1);
+    assert_eq!(
+        found
+            .files
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["halfway.bin"],
+        "the disk knows about a write nothing has closed yet"
+    );
+    assert!(
+        found.known_bytes() > 0,
+        "and it knows roughly how much has arrived — the descriptor's own Size reads 0 \
+         here, which is why the size comes from the data file: {found:?}"
+    );
+    assert!(
+        found.known_bytes() < total as u64,
+        "less than the whole file, since the PUT is only part way through: {found:?}"
+    );
+
+    drop(stream);
 }
 
 /// Create a collection, so a nested PUT has somewhere to land.

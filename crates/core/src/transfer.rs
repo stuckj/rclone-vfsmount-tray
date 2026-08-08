@@ -163,17 +163,18 @@ impl TransferState {
     /// From the on-disk cache scan. Sizes and a total, but `Dirty` stays true until an
     /// upload completes, so queued and uploading are indistinguishable.
     ///
-    /// [`Self::outstanding_known`] follows [`CacheScan::is_complete`]: a walk that could
-    /// not read an entry, or stopped at its cap, has not established that nothing else is
-    /// waiting.
+    /// [`Self::outstanding_known`] needs [`CacheScan::is_complete`] *and*
+    /// [`CacheScan::root_present`]: a walk that could not read an entry, stopped at its
+    /// cap, or found no tree at all has not established that nothing else is waiting.
     ///
-    /// [`crate::scan::DirtyFile::still_open`] is deliberately not folded into
-    /// [`TransferFile::in_flight`]. "Being written" and "being uploaded" are different
-    /// states, and this tier can tell the first apart while it genuinely cannot tell the
-    /// second — a caller that needs it should read the [`CacheScan`].
+    /// [`TransferFile::in_flight`] stays `None`: `Dirty` is set from the write until the
+    /// upload completes, so the disk cannot tell a queued file from one being sent.
     pub fn from_scan(mount: &str, found: &CacheScan) -> Self {
         let mut s = Self::empty(mount, Some(Tier::T4));
-        s.outstanding_known = found.is_complete();
+        // `root_present` as well as `is_complete`: an absent tree is completely read and
+        // finds nothing, which is only an answer if the caller expected no cache. The type
+        // decides rather than leaving it to whoever calls next.
+        s.outstanding_known = found.is_complete() && found.root_present;
         s.pending = Pending::new(
             found.files.len() as u64,
             found.known_bytes(),
@@ -397,7 +398,6 @@ mod tests {
                 .map(|(name, bytes)| crate::scan::DirtyFile {
                     name: (*name).to_string(),
                     bytes: *bytes,
-                    still_open: false,
                 })
                 .collect(),
             unreadable: 0,
@@ -481,6 +481,14 @@ mod tests {
             !TransferState::from_scan("backup", &capped).outstanding_known,
             "a walk stopped at its cap found no files because it stopped, not because \
              there are none"
+        );
+
+        let mut gone = scanned(&[]);
+        gone.root_present = false;
+        assert!(
+            !TransferState::from_scan("backup", &gone).outstanding_known,
+            "an absent tree is read completely and finds nothing, which is only an answer \
+             if no cache was expected — the type must not decide that for the caller"
         );
 
         // The complete case still reports a total, or the tier would be useless.

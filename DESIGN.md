@@ -204,7 +204,7 @@ not by comparing version numbers, which only guesses.
 | **T1** | `core/stats` `transferring[]` | `{name, size}` always; `{bytes, percentage, speed, speedAvg, eta, group}` once rclone attaches accounting; `srcFs`/`dstFs` when a source/destination exists | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). **Does not meet the bar**, despite being the most detailed tier: it shows transfers that have *started*, and lags `vfs/queue` by `--vfs-write-back`, so a total taken from it reads zero while gigabytes sit queued — wrong in the unsafe direction. Mixes directions — see below. Treat every field but `name` and `size` as optional. |
 | **T2** | `vfs/queue` (per-fs) | `{name, id, size, expiry, tries, delay, uploading}` | **The minimum bar.** `sum(size)` = bytes to send; `uploading` = in flight. `vfs/queue-set-expiry` forces an upload. |
 | **T3** | `vfs/stats` (per-fs) | `diskCache{uploadsInProgress, uploadsQueued, erroredFiles, outOfSpace, path, pathMeta}` | Counts only. Does not meet the bar alone, but hands over the cache paths for T4. |
-| **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` | `sum(Size where Dirty)` = bytes to send. **Meets the bar with no rc at all**, and survives an rclone crash — a dead process's dirty items are still on disk. |
+| **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` plus the data file's own size | Bytes to send is the **data file's** size summed over dirty items — the descriptor's `Size` reads 0 for the whole time a file is open (#10), so summing it reports nothing during exactly the copy the user is watching. **Meets the bar with no rc at all**, survives an rclone crash, and is the only tier that sees a write before it is closed. |
 
 T4 is a first-class tier, not a fallback of last resort. It is the only tier that works when
 the rclone process is unreachable, and the only one that survives a crash, because the rc
@@ -331,8 +331,13 @@ read and no write leaves `files: 1` with the descriptor's `Dirty` false. Countin
 entries would condemn every read-mostly `full` mount, which is what `full` is recommended
 for, to a permanent "cannot tell".
 
-Only the on-disk `Dirty` flag under `diskCache.pathMeta` is exact. **Reading it per poll is
-the wrong shape and is deliberately not done here:**
+Only the on-disk `Dirty` flag under `diskCache.pathMeta` is exact — `Dirty` is set when the
+file is *written*, measured both for a first write and for a rewrite of an already-uploaded
+file, whereas an item reaches `vfs/queue` only on close. `rvt_core::scan` reads it, and the
+poller falls to it when rclone is unreachable.
+
+**Reading it on every poll of a live mount is still the wrong shape, and is deliberately not
+done:**
 
 - rclone rewrites descriptors non-atomically — 260 zero-length reads in 291,614 while a
   mount was under load — so a single-shot read votes "clean" for a file that is dirty.
@@ -341,11 +346,18 @@ the wrong shape and is deliberately not done here:**
 - The path comes from an rc response, so walking it needs the untrusted-input handling this
   document already requires below.
 
-**T4 is therefore strictly better than T2 for this one question** — the single place the
-ladder's ordering does not hold — and #22 is where it belongs, because inotify maintains
-the answer incrementally instead of re-deriving it.
+A torn read is not the same as a clean one: `rvt_core::scan` counts an entry it could not
+read and refuses to call the result complete, so a walk that lost a race says so rather
+than voting "clean". What remains is the cost, which is why the walk runs only when rclone
+is unreachable — there is nothing uploading then, so the figures cannot move — and never on
+the 1s cadence of a live mount. Making it cheap enough to run continuously is what inotify
+is for, in the rest of #22.
 
-Until then the queue is taken at its word, and **the blind spot can lose data** — the
+**T4 is therefore strictly better than T2 for this one question**: the single place the
+ladder's ordering does not hold.
+
+On a *live* mount the queue is still taken at its word, and **that blind spot can lose
+data** — the
 kernel does not save us. Measured end to end on rclone v1.75.0, `--vfs-cache-mode writes`,
 15 MB written to a file still open:
 

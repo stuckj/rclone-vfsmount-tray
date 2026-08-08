@@ -43,6 +43,12 @@ pub struct MountPoller {
     /// the on-disk tier exists to answer once rclone can no longer be asked, so the roots
     /// have to be remembered from when it could.
     meta_path: Option<String>,
+    /// The cache mode from the last `vfs/stats` that answered.
+    ///
+    /// Latched alongside the roots because the disk fallback needs the same qualification
+    /// the live path applies: a `minimal` mount's writes can stream past the cache
+    /// entirely, so a scan finding nothing has not established that nothing is in flight.
+    mode: Option<CacheMode>,
 }
 
 impl MountPoller {
@@ -64,6 +70,7 @@ impl MountPoller {
             rate: RateEstimator::new(),
             cache_path: None,
             meta_path: None,
+            mode: None,
         }
     }
 
@@ -77,6 +84,14 @@ impl MountPoller {
     /// idle. A mount that cannot be observed has nothing to re-derive every second, and a
     /// partially observed one with real entries in its queue still has to be watched.
     pub fn interval(state: &TransferState) -> Duration {
+        // A disk-derived state is never the fast case, however much it found: rclone is
+        // not answering, so nothing is uploading and the figures cannot move — and the
+        // walk behind it costs a full read of the metadata tree, which DESIGN.md measures
+        // at ~0.7s over 50k descriptors. Re-deriving that every second would be the shape
+        // that document says not to use.
+        if state.fidelity == Some(Tier::T4) {
+            return IDLE;
+        }
         if state.pending.files > 0 {
             ACTIVE
         } else {
@@ -290,10 +305,24 @@ impl MountPoller {
                 &self.name,
                 format!("{e}; and the cache it reported is no longer on disk"),
             ),
-            Ok(Ok(found)) => TransferState::from_scan(&self.name, &found).degraded(format!(
-                "{e}; read {} pending file(s) from the cache on disk instead",
-                found.files.len()
-            )),
+            Ok(Ok(found)) => {
+                let state = TransferState::from_scan(&self.name, &found).degraded(format!(
+                    "{e}; read {} pending file(s) from the cache on disk instead",
+                    found.files.len()
+                ));
+                // The same rule the live path applies, and for the same reason: under
+                // `minimal` a write-only open never enters the cache, so a scan that
+                // finds nothing has not established that nothing is in flight. An
+                // unrecognised or unseen mode fails closed here too.
+                if self.mode.is_some_and(CacheMode::all_writes_queued) {
+                    state
+                } else {
+                    state.partially_observed(format!(
+                        "{e}; and this mount's cache mode does not put every write through \
+                         the cache, so what is on disk is a floor"
+                    ))
+                }
+            }
             Ok(Err(scan_err)) => TransferState::unmonitored(
                 &self.name,
                 format!("{e}; and its cache could not be read either: {scan_err}"),
@@ -316,6 +345,9 @@ impl MountPoller {
             Err(e) => return Err(e),
         };
         let mode = stats.cache_mode();
+        if mode.is_some() {
+            self.mode = mode;
+        }
         let Some(cache) = stats.disk_cache else {
             return Ok(CacheProbe::Absent);
         };
@@ -1331,6 +1363,88 @@ mod tests {
             after.degraded_reason.is_some(),
             "this is a fallback, and the user should be told which one"
         );
+    }
+
+    #[tokio::test]
+    async fn a_minimal_mount_is_not_trusted_just_because_the_disk_was_readable() {
+        // The live path refuses to call a `minimal` mount idle on an empty queue, because
+        // a write-only open streams past the cache entirely. The disk fallback has to
+        // inherit that: the cache is exactly what such a write bypasses, so a scan finding
+        // nothing there proves even less than an empty queue did. Without the mode latched
+        // beside the roots, falling back produced a *more* confident answer than the live
+        // path it replaced.
+        let cache =
+            TempDir(std::env::temp_dir().join(format!("rvt-minfall-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&cache.0);
+        std::fs::create_dir_all(cache.0.join("vfsMeta")).unwrap();
+        std::fs::create_dir_all(cache.0.join("vfs")).unwrap();
+
+        let mut v: serde_json::Value = serde_json::from_str(&stats_pointing_at(
+            &cache.0.join("vfsMeta"),
+            &cache.0.join("vfs"),
+        ))
+        .unwrap();
+        v["opt"]["CacheMode"] = serde_json::json!(1);
+
+        let fake = FakeRc::new(
+            "minfall",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", v.to_string()),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
+        assert!(
+            !after.safe_to_unmount(),
+            "an empty cache on a minimal mount says nothing about a streaming write"
+        );
+        assert!(!after.outstanding_known);
+    }
+
+    #[tokio::test]
+    async fn a_writes_mount_falling_to_disk_is_still_trusted() {
+        // The other side, or the rule above would just be "never trust the fallback",
+        // which makes the tier pointless.
+        let cache =
+            TempDir(std::env::temp_dir().join(format!("rvt-writefall-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&cache.0);
+        std::fs::create_dir_all(cache.0.join("vfsMeta")).unwrap();
+        std::fs::create_dir_all(cache.0.join("vfs")).unwrap();
+
+        let fake = FakeRc::new(
+            "writefall",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                (
+                    "vfs/stats",
+                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                ),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
+        assert!(
+            after.safe_to_unmount(),
+            "the cache is present, readable and empty on a mode that queues every write: \
+             {:?}",
+            after.degraded_reason
+        );
+        assert_eq!(after.fidelity, Some(Tier::T4));
     }
 
     #[tokio::test]

@@ -1,9 +1,13 @@
 //! Reading pending uploads off disk, when rclone cannot be asked.
 //!
 //! The tier that needs no rc access: dirty items from a crashed rclone are still on disk,
-//! where the rc endpoints only ever knew a running process's in-memory queue. It is also
-//! the *only* tier that can see a file still being written — see [`DirtyFile::still_open`]
-//! and DESIGN.md.
+//! where the rc endpoints only ever knew a running process's in-memory queue.
+//!
+//! It is also the only tier that sees a write while it is happening. `Dirty` is set when
+//! the file is *written*, whereas rclone puts an item in `vfs/queue` only when it is
+//! *closed* — measured both ways: a first write shows `Dirty: true` with `Size: 0`, and
+//! rewriting an already-uploaded file flips its clean descriptor back to `Dirty: true`
+//! mid-write. See DESIGN.md.
 //!
 //! The paths come from an rc response (`vfs/stats` `diskCache.path` and `pathMeta`), so
 //! they are untrusted input: the walk stays on regular files inside the root it was given
@@ -44,13 +48,6 @@ pub struct DirtyFile {
     /// reports nothing outstanding during exactly the copy a user is watching (#10).
     /// `None` when the data file is missing or could not be measured.
     pub bytes: Option<u64>,
-    /// Whether the file is still being written, rather than closed and waiting to upload.
-    ///
-    /// `Size: 0` with no `Rs` on a dirty item is what rclone leaves while a handle is
-    /// open; both are filled in on close. This is the state no rc endpoint reports — the
-    /// queue is empty and every `diskCache` upload counter reads zero — so it is the whole
-    /// reason this tier outranks the rc ones for the unmount question.
-    pub still_open: bool,
 }
 
 /// What one walk of a mount's cache found.
@@ -59,11 +56,9 @@ pub struct DirtyFile {
 pub struct CacheScan {
     /// Dirty files, in no particular order.
     pub files: Vec<DirtyFile>,
-    /// Entries that exist but could not be read or parsed.
-    ///
-    /// Not folded into "clean". rclone rewrites descriptors in place, so a torn read is
-    /// expected rather than a fault — but a descriptor that might be dirty and cannot be
-    /// read is unknown, and a caller must not report an exact zero over the top of one.
+    /// Entries that exist but could not be read or parsed. Never folded into "clean":
+    /// rclone rewrites descriptors in place, so a torn read is expected rather than a
+    /// fault, and a zero over the top of one would be a claim.
     pub unreadable: u64,
     /// Whether the walk hit its entry cap with entries left unvisited.
     pub truncated: bool,
@@ -92,11 +87,6 @@ impl CacheScan {
     /// whether that counts as an answer depends on why the caller expected one.
     pub fn is_complete(&self) -> bool {
         self.unreadable == 0 && !self.truncated
-    }
-
-    /// Whether any file is still being written.
-    pub fn any_still_open(&self) -> bool {
-        self.files.iter().any(|f| f.still_open)
     }
 }
 
@@ -157,8 +147,6 @@ pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
                         };
                         out.files.push(DirtyFile {
                             bytes: data_size(&data_root.join(&name)),
-                            // Both filled in on close; neither is present while open.
-                            still_open: item.size == 0 && item.ranges.is_none(),
                             name,
                         });
                     }
@@ -175,8 +163,18 @@ pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
 
 /// Parse one descriptor, or `None` if it cannot be read as one.
 fn read_item(path: &Path) -> Option<VfsMetaItem> {
-    let file = std::fs::File::open(path).ok()?;
-    // Re-check through the handle: `read_dir` said "file", but that was a separate stat.
+    use std::os::unix::fs::OpenOptionsExt;
+    // The type check in the walk was a separate stat, so it is only a filter, not a
+    // guarantee: anything that can write in the cache can swap a descriptor for a FIFO in
+    // between, and a plain `open` on one blocks until a writer appears — forever, holding
+    // a blocking-pool thread per poll. `O_NONBLOCK` makes that return instead, and
+    // `O_NOFOLLOW` refuses a symlink swapped in the same way.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    // And re-check through the handle, since the flags only stop the open from hanging.
     if !file.metadata().ok()?.is_file() {
         return None;
     }
@@ -303,21 +301,18 @@ mod tests {
             Some(7_340_032),
             "the descriptor says 0; the data file says 7MB, and the data file is right"
         );
-        assert!(s.files[0].still_open);
-        assert!(s.any_still_open());
         assert_eq!(s.known_bytes(), 7_340_032);
     }
 
     #[test]
-    fn a_closed_item_is_not_mistaken_for_an_open_one() {
-        // The other side: `still_open` drives whether an unmount is safe, so it must not
-        // simply be true for everything dirty.
+    fn a_closed_item_still_counts_until_it_uploads() {
+        // `Dirty` stays true from the write until the upload completes, so a file that has
+        // been closed and is merely waiting is every bit as outstanding as one mid-write.
         let t = Tree::new("closed");
         t.put("done.bin", &closed(4096), Some(4096));
         let s = t.scan();
 
-        assert!(!s.files[0].still_open);
-        assert!(!s.any_still_open());
+        assert_eq!(s.files.len(), 1);
         assert_eq!(s.known_bytes(), 4096);
     }
 

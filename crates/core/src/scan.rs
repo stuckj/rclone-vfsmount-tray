@@ -1,0 +1,407 @@
+//! Reading pending uploads off disk, when rclone cannot be asked.
+//!
+//! The tier that needs no rc access: dirty items from a crashed rclone are still on disk,
+//! where the rc endpoints only ever knew a running process's in-memory queue. It is also
+//! the *only* tier that can see a file still being written — see [`DirtyFile::still_open`]
+//! and DESIGN.md.
+//!
+//! The paths come from an rc response (`vfs/stats` `diskCache.path` and `pathMeta`), so
+//! they are untrusted input: the walk stays on regular files inside the root it was given
+//! and never follows a link out of it.
+
+use crate::models::VfsMetaItem;
+use std::io;
+use std::path::Path;
+
+/// Cap on a single metadata descriptor.
+///
+/// These are a few hundred bytes. The cap is there because the tree is named by an rc
+/// response, and a scanner that will happily read whatever it is pointed at is a way to
+/// OOM this process.
+const MAX_DESCRIPTOR: u64 = 64 * 1024;
+
+/// How many entries a single scan will look at before giving up. Reported as
+/// [`CacheScan::truncated`].
+///
+/// A cache holding a media library runs to hundreds of thousands of files, and a scan is
+/// on the path that answers "can I unmount". Stopping and saying so beats an unbounded
+/// walk that blocks for seconds.
+const MAX_ENTRIES: usize = 50_000;
+
+/// One file the cache is holding that has not reached the remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DirtyFile {
+    /// Path within the VFS, as the user sees it in the mount.
+    ///
+    /// No decoding needed: the cache tree mirrors the VFS namespace, not the backend's
+    /// encoded object names. Measured on `local` with and without a forced encoder — see
+    /// issue #10.
+    pub name: String,
+    /// Bytes held for this file, taken from the **data file**, not from the descriptor.
+    ///
+    /// `Size` in the descriptor is 0 for the whole time a file is open, so summing it
+    /// reports nothing outstanding during exactly the copy a user is watching (#10).
+    /// `None` when the data file is missing or could not be measured.
+    pub bytes: Option<u64>,
+    /// Whether the file is still being written, rather than closed and waiting to upload.
+    ///
+    /// `Size: 0` with no `Rs` on a dirty item is what rclone leaves while a handle is
+    /// open; both are filled in on close. This is the state no rc endpoint reports — the
+    /// queue is empty and every `diskCache` upload counter reads zero — so it is the whole
+    /// reason this tier outranks the rc ones for the unmount question.
+    pub still_open: bool,
+}
+
+/// What one walk of a mount's cache found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CacheScan {
+    /// Dirty files, in no particular order.
+    pub files: Vec<DirtyFile>,
+    /// Entries that exist but could not be read or parsed.
+    ///
+    /// Not folded into "clean". rclone rewrites descriptors in place, so a torn read is
+    /// expected rather than a fault — but a descriptor that might be dirty and cannot be
+    /// read is unknown, and a caller must not report an exact zero over the top of one.
+    pub unreadable: u64,
+    /// Whether the walk hit its entry cap with entries left unvisited.
+    pub truncated: bool,
+}
+
+impl CacheScan {
+    /// Bytes known to be waiting, counting only files whose size could be measured.
+    pub fn known_bytes(&self) -> u64 {
+        self.files.iter().filter_map(|f| f.bytes).sum()
+    }
+
+    /// Whether this scan is the whole story.
+    ///
+    /// False when something could not be read or the walk was cut short — in which case a
+    /// zero here means "we did not finish looking", not "nothing to send".
+    pub fn is_complete(&self) -> bool {
+        self.unreadable == 0 && !self.truncated
+    }
+
+    /// Whether any file is still being written.
+    pub fn any_still_open(&self) -> bool {
+        self.files.iter().any(|f| f.still_open)
+    }
+}
+
+/// Walk one mount's cache and report what has not reached the remote.
+///
+/// `meta_root` is `diskCache.pathMeta` and `data_root` is `diskCache.path`; the two trees
+/// mirror each other, and a file's size comes from the second.
+///
+/// A missing `meta_root` is an empty scan: rclone creates the tree lazily, so a mount that
+/// has never cached anything genuinely has nothing outstanding. Anything else that goes
+/// wrong at the root is an error, because "could not look" is not "nothing there".
+pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
+    let mut out = CacheScan::default();
+    let mut stack = vec![meta_root.to_path_buf()];
+    let mut visited = 0usize;
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // Only at the root, and only for absence. A subdirectory that vanished
+            // mid-walk is a cache eviction racing us, which is not this scan's problem.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if dir == meta_root {
+                    return Ok(out);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+
+        for entry in entries {
+            let Ok(entry) = entry else {
+                out.unreadable += 1;
+                continue;
+            };
+            if visited >= MAX_ENTRIES {
+                out.truncated = true;
+                return Ok(out);
+            }
+            visited += 1;
+
+            let path = entry.path();
+            // `file_type` here does not follow links, so a symlink is neither a dir nor a
+            // file and falls through. That is deliberate: the root came from rclone, and
+            // following a link out of it would read whatever it points at — a FIFO blocks
+            // the walk forever, a device file never ends.
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(path),
+                Ok(t) if t.is_file() => match read_item(&path) {
+                    Some(item) if item.dirty => {
+                        let Some(name) = relative_name(meta_root, &path) else {
+                            out.unreadable += 1;
+                            continue;
+                        };
+                        out.files.push(DirtyFile {
+                            bytes: data_size(&data_root.join(&name)),
+                            // Both filled in on close; neither is present while open.
+                            still_open: item.size == 0 && item.ranges.is_none(),
+                            name,
+                        });
+                    }
+                    Some(_) => {}
+                    None => out.unreadable += 1,
+                },
+                // A socket, a FIFO, a symlink, or a type we could not determine.
+                _ => out.unreadable += 1,
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Parse one descriptor, or `None` if it cannot be read as one.
+fn read_item(path: &Path) -> Option<VfsMetaItem> {
+    let file = std::fs::File::open(path).ok()?;
+    // Re-check through the handle: `read_dir` said "file", but that was a separate stat.
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut buf = String::new();
+    {
+        use std::io::Read;
+        file.take(MAX_DESCRIPTOR).read_to_string(&mut buf).ok()?;
+    }
+    serde_json::from_str(&buf).ok()
+}
+
+/// The size of a cached data file, or `None` when it is absent or not a regular file.
+///
+/// Absent is normal: the descriptor and the data file are written separately, so a walk
+/// can land between them.
+fn data_size(path: &Path) -> Option<u64> {
+    let md = std::fs::symlink_metadata(path).ok()?;
+    md.is_file().then_some(md.len())
+}
+
+/// A descriptor's path within the cache, as the VFS presents it.
+///
+/// `None` for a path that is not under the root, or that does not render as UTF-8 — both
+/// of which mean this entry cannot be named to a user, so it counts as unreadable rather
+/// than being reported under a mangled name.
+fn relative_name(root: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(root).ok()?;
+    let s = rel.to_str()?;
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A cache tree under a directory that removes itself.
+    struct Tree(PathBuf);
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl Tree {
+        fn new(tag: &str) -> Self {
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("rvt-scan-{}-{tag}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(root.join("vfsMeta")).unwrap();
+            std::fs::create_dir_all(root.join("vfs")).unwrap();
+            Self(root)
+        }
+
+        fn meta(&self) -> PathBuf {
+            self.0.join("vfsMeta")
+        }
+        fn data(&self) -> PathBuf {
+            self.0.join("vfs")
+        }
+
+        /// Write a descriptor, and optionally the data file beside it.
+        fn put(&self, name: &str, json: &str, data_bytes: Option<usize>) {
+            let m = self.meta().join(name);
+            std::fs::create_dir_all(m.parent().unwrap()).unwrap();
+            std::fs::write(m, json).unwrap();
+            if let Some(n) = data_bytes {
+                let d = self.data().join(name);
+                std::fs::create_dir_all(d.parent().unwrap()).unwrap();
+                std::fs::write(d, vec![b'x'; n]).unwrap();
+            }
+        }
+
+        fn scan(&self) -> CacheScan {
+            scan(&self.meta(), &self.data()).expect("a readable tree is not an error")
+        }
+    }
+
+    /// A closed, queued item: rclone fills in both `Size` and `Rs` on close.
+    fn closed(size: u64) -> String {
+        format!(
+            r#"{{"ModTime":"2026-08-08T00:00:00Z","ATime":"2026-08-08T00:00:00Z","Size":{size},
+                "Rs":[{{"Pos":0,"Size":{size}}}],"Fingerprint":"","Dirty":true}}"#
+        )
+    }
+
+    /// An item with a handle still open: neither field is written until close.
+    const OPEN: &str = r#"{"ModTime":"2026-08-08T00:00:00Z","ATime":"2026-08-08T00:00:00Z",
+        "Size":0,"Rs":null,"Fingerprint":"","Dirty":true}"#;
+
+    const CLEAN: &str = r#"{"ModTime":"2026-08-08T00:00:00Z","ATime":"2026-08-08T00:00:00Z",
+        "Size":1024,"Rs":[{"Pos":0,"Size":1024}],"Fingerprint":"","Dirty":false}"#;
+
+    #[test]
+    fn only_dirty_items_are_reported() {
+        // A `full` mount's cache is mostly read-cached files, which are clean. Counting
+        // cache entries rather than dirty ones is what makes a read-only media mount look
+        // permanently busy.
+        let t = Tree::new("dirty");
+        t.put("a.bin", &closed(100), Some(100));
+        t.put("read-cached.bin", CLEAN, Some(9999));
+        let s = t.scan();
+
+        assert_eq!(s.files.len(), 1);
+        assert_eq!(s.files[0].name, "a.bin");
+        assert!(s.is_complete());
+    }
+
+    #[test]
+    fn a_size_of_zero_while_open_does_not_hide_the_bytes_on_disk() {
+        // The measurement this scanner exists for (#10): `Size` stays 0 for the whole time
+        // a file is open, so `sum(Size where Dirty)` reports nothing outstanding during
+        // exactly the copy the user is watching. The data file is the honest figure.
+        let t = Tree::new("open");
+        t.put("growing.bin", OPEN, Some(7_340_032));
+        let s = t.scan();
+
+        assert_eq!(s.files.len(), 1);
+        assert_eq!(
+            s.files[0].bytes,
+            Some(7_340_032),
+            "the descriptor says 0; the data file says 7MB, and the data file is right"
+        );
+        assert!(s.files[0].still_open);
+        assert!(s.any_still_open());
+        assert_eq!(s.known_bytes(), 7_340_032);
+    }
+
+    #[test]
+    fn a_closed_item_is_not_mistaken_for_an_open_one() {
+        // The other side: `still_open` drives whether an unmount is safe, so it must not
+        // simply be true for everything dirty.
+        let t = Tree::new("closed");
+        t.put("done.bin", &closed(4096), Some(4096));
+        let s = t.scan();
+
+        assert!(!s.files[0].still_open);
+        assert!(!s.any_still_open());
+        assert_eq!(s.known_bytes(), 4096);
+    }
+
+    #[test]
+    fn names_are_vfs_relative_and_keep_their_nesting() {
+        // The tree mirrors the VFS namespace, so the path under the root is what the user
+        // sees in the mount — no decoding, and no leaking the cache root into the UI.
+        let t = Tree::new("nested");
+        t.put("sub/deep/file with spaces.bin", &closed(1), Some(1));
+        let s = t.scan();
+
+        assert_eq!(s.files[0].name, "sub/deep/file with spaces.bin");
+    }
+
+    #[test]
+    fn an_unparseable_descriptor_counts_as_unknown_rather_than_clean() {
+        // rclone rewrites descriptors in place, so a torn read is expected — but a file
+        // that might be dirty and cannot be read is not evidence of an empty queue.
+        let t = Tree::new("torn");
+        t.put("torn.bin", "", None);
+        t.put("good.bin", &closed(10), Some(10));
+        let s = t.scan();
+
+        assert_eq!(s.files.len(), 1, "the good one still counts");
+        assert_eq!(s.unreadable, 1);
+        assert!(
+            !s.is_complete(),
+            "a zero here would be 'we did not finish looking', not 'nothing to send'"
+        );
+    }
+
+    #[test]
+    fn a_missing_data_file_leaves_the_size_unknown_rather_than_zero() {
+        // The descriptor and the data file are written separately, so a walk can land
+        // between them. Reporting 0 bytes would understate the total silently.
+        let t = Tree::new("orphan");
+        t.put("no-data.bin", &closed(500), None);
+        let s = t.scan();
+
+        assert_eq!(s.files.len(), 1);
+        assert_eq!(s.files[0].bytes, None);
+        assert_eq!(s.known_bytes(), 0, "unknown contributes nothing to a total");
+    }
+
+    #[test]
+    fn a_cache_that_has_never_held_anything_is_empty_not_an_error() {
+        // rclone creates the tree lazily. A mount that has cached nothing has nothing
+        // outstanding, and that is a real answer rather than a failure to look.
+        let t = Tree::new("absent");
+        let missing = t.0.join("never-existed");
+        let s = scan(&missing, &t.data()).expect("an absent tree is not an error");
+
+        assert!(s.files.is_empty());
+        assert!(s.is_complete(), "absent is a complete answer");
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_listed_is_an_error_not_an_empty_scan() {
+        // "Could not look" and "nothing there" are the two readings this whole module
+        // exists to keep apart.
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tree::new("denied");
+        std::fs::set_permissions(t.meta(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = scan(&t.meta(), &t.data());
+        std::fs::set_permissions(t.meta(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(got.is_err(), "an unreadable root must not read as empty");
+    }
+
+    #[test]
+    fn a_fifo_is_skipped_rather_than_opened() {
+        // The roots come from an rc response. Reading whatever is found there blocks the
+        // walk forever on a FIFO — and DESIGN.md already requires treating the path as
+        // untrusted. Counted as unknown, not silently ignored.
+        let t = Tree::new("fifo");
+        let fifo = t.meta().join("pipe.bin");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a path we just built inside our own temp directory.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        t.put("real.bin", &closed(8), Some(8));
+
+        let s = t.scan();
+        assert_eq!(s.files.len(), 1, "the real entry is still found");
+        assert_eq!(s.unreadable, 1, "the FIFO is unknown, not clean");
+    }
+
+    #[test]
+    fn a_symlink_out_of_the_tree_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let t = Tree::new("link");
+        let outside = t.0.join("outside.json");
+        std::fs::write(&outside, closed(999)).unwrap();
+        symlink(&outside, t.meta().join("link.bin")).unwrap();
+
+        let s = t.scan();
+        assert!(
+            s.files.is_empty(),
+            "following the link would report a file that is not in this cache"
+        );
+        assert_eq!(s.unreadable, 1);
+    }
+}

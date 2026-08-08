@@ -300,10 +300,16 @@ pub struct QueueItem {
     /// Seconds until upload starts. **Signed** — goes negative once due.
     #[serde(default)]
     pub expiry: f64,
-    /// The configured `--vfs-write-back` delay, in seconds.
+    /// Current back-off before the next attempt, in seconds — **not** the configured
+    /// `--vfs-write-back`, though it starts there. rclone doubles it on every failure,
+    /// capped at 5 minutes: measured 3 → 6 → 12 → 24 → 48 with `--vfs-write-back 3s`.
+    /// Reset to the configured value when an upload is cancelled by the file being
+    /// modified again.
     #[serde(default)]
     pub delay: f64,
-    /// Upload attempts so far. A climbing value means repeated failure.
+    /// Upload attempts so far, counted from the moment each one starts, so an attempt in
+    /// flight already reads 1. A cancelled upload — the file was modified while queued —
+    /// also increments it without anything having gone wrong.
     #[serde(default)]
     pub tries: u64,
     /// Whether the upload is in flight right now.

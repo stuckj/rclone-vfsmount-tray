@@ -5,9 +5,10 @@
 
 use rvt_core::capabilities::{Capabilities, Tier};
 use rvt_core::config::CacheMode;
-use rvt_core::models::{CoreStats, DiskCache, VfsQueue, VfsStats};
+use rvt_core::models::{CoreStats, DiskCache, VfsMetaItem, VfsQueue, VfsStats};
 use rvt_core::rc::{RcClient, RcError};
 use rvt_core::transfer::{RateEstimator, TransferState};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Poll interval while something is outstanding.
@@ -81,10 +82,11 @@ impl MountPoller {
 
     /// One poll.
     ///
-    /// Never fails for a mount that has gone away: an unreachable rclone is the case the
-    /// on-disk tier exists for, so it degrades rather than erroring and says why. A real
-    /// fault from a live rclone is returned.
-    pub async fn poll(&mut self) -> Result<TransferState, RcError> {
+    /// Infallible, for the reason [`Self::connect`] is: a mount that produces no state at
+    /// all vanishes from the report, which is worse than one that says "cannot tell" and
+    /// why. An unreachable rclone is the case the on-disk tier exists for; a live rclone
+    /// answering with a fault is rarer but no more useful to hide.
+    pub async fn poll(&mut self) -> TransferState {
         // An empty set issues no rc calls at all, so without re-probing here a mount that
         // was down at connect stays unobservable for the life of the service. Covers both
         // the service starting before its mount units and a unit restarting after a crash.
@@ -96,12 +98,12 @@ impl MountPoller {
         if self.caps.is_empty() {
             // Say what actually happened. `probe` kept the reason; inventing one about
             // the rclone build sends the user to look in the wrong place entirely.
-            return Ok(TransferState::unmonitored(
+            return TransferState::unmonitored(
                 &self.name,
                 self.caps
                     .degraded_reason()
                     .unwrap_or("rclone reported no rc commands"),
-            ));
+            );
         }
 
         // `vfs/stats` first: it carries the cache paths and the two actionable flags, and
@@ -110,9 +112,9 @@ impl MountPoller {
             Ok(c) => c,
             Err(e) if e.is_unreachable() => {
                 self.rate.reset();
-                return Ok(self.unreachable(&e));
+                return self.unreachable(&e);
             }
-            Err(e) => return Err(e),
+            Err(e) => return self.faulted(&e),
         };
 
         let mut state = match self.fetch_queue().await {
@@ -123,34 +125,34 @@ impl MountPoller {
             Ok(queue) => TransferState::from_queue(&self.name, &queue),
             Err(e) if e.is_unreachable() => {
                 self.rate.reset();
-                return Ok(self.unreachable(&e));
+                return self.unreachable(&e);
             }
             // No `vfs/queue` on this build: counts are all there is over rc.
             Err(RcError::Failed { status: 404, .. }) => match &cache {
                 CacheProbe::Present(c, _) => TransferState::from_stats(&self.name, c),
                 CacheProbe::Absent => {
-                    return Ok(TransferState::unmonitored(
+                    return TransferState::unmonitored(
                         &self.name,
                         "this rclone registers no vfs/queue and this mount has no \
                          write-back cache, so nothing outstanding can be observed",
-                    ))
+                    )
                 }
                 CacheProbe::NotAsked => {
-                    return Ok(TransferState::unmonitored(
+                    return TransferState::unmonitored(
                         &self.name,
                         "this rclone registers neither vfs/queue nor vfs/stats, so \
                          nothing outstanding can be observed over rc",
-                    ))
+                    )
                 }
             },
-            Err(e) => return Err(e),
+            Err(e) => return self.faulted(&e),
         };
 
         // A queue that reported nothing to report is already fully described, and the
         // enrichment below would only overwrite the reason it carries.
         if !state.outstanding_known {
             self.rate.reset();
-            return Ok(state);
+            return state;
         }
 
         match &cache {
@@ -180,32 +182,43 @@ impl MountPoller {
                              whether every write reaches the queue is unknown"
                         }
                     });
-                } else if state.pending.files == 0 && c.files > 0 {
+                } else if state.pending.files == 0 {
                     // rclone enqueues a file when it is *closed*, not as it is written, so
                     // for the whole duration of a large copy the queue is empty, every
-                    // upload counter is zero and `core/stats` shows nothing — while the
-                    // cache file grows and its vfsMeta says `Dirty`. Measured on a live
-                    // `writes` mount: 8MB on disk, queue `[]`.
+                    // upload counter reads zero and `core/stats` shows nothing — while the
+                    // cache file grows. Measured on a live `writes` mount: 8MB on disk,
+                    // `vfs/queue` `[]`.
                     //
-                    // `diskCache.files` counts clean entries too — it stays at 1 for the
-                    // cache's retention window after an upload finishes — so this cannot
-                    // say anything is outstanding, only that it cannot rule it out. The
-                    // vfsMeta `Dirty` scan (#22) is what tells the two apart.
-                    state = state.partially_observed(
-                        "rclone queues a file only when it is closed, so a write still in \
-                         progress would not appear here, and its rc API cannot tell a \
-                         dirty cache file from a clean one",
-                    );
+                    // Nothing over rc distinguishes that from genuinely idle.
+                    // `diskCache.files` counts clean entries too: it stays up for the
+                    // cache's retention window after an upload finishes, and under `full`
+                    // a plain read creates one. Only the on-disk `Dirty` flag answers it.
+                    match self.any_dirty(&c.path_meta).await {
+                        Ok(true) => {
+                            state = state.partially_observed(
+                                "a file in the cache is modified and not yet uploaded; \
+                                 rclone queues a file only when it is closed, so one still \
+                                 being written does not appear in the queue",
+                            )
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            state = state.partially_observed(format!(
+                                "the queue is empty, but this mount's cache metadata could \
+                                 not be read to confirm nothing is still being written: {e}"
+                            ))
+                        }
+                    }
                 }
             }
             // Reached only on a build with no `vfs/queue`; the absent queue key above
             // catches this first otherwise.
             CacheProbe::Absent => {
-                return Ok(TransferState::unmonitored(
+                return TransferState::unmonitored(
                     &self.name,
                     "this mount has no write-back cache (--vfs-cache-mode off), so writes \
                      stream straight to the remote and nothing outstanding can be observed",
-                ))
+                )
             }
             // The queue answered, so its entries are real; only the health flags, the
             // cache path and the cache *mode* are missing. Discarding the entries would
@@ -236,7 +249,7 @@ impl MountPoller {
             }
         }
 
-        let rate = if state.is_idle() || !state.has_byte_total() {
+        let rate = if state.pending.files == 0 || !state.has_byte_total() {
             // Nothing moving, or no byte total to difference. `vfs/stats` reports counts
             // without sizes, so sampling it would yield a confident 0 B/s.
             self.rate.reset();
@@ -250,7 +263,14 @@ impl MountPoller {
                 // "moving, not measurable at this granularity", which is `None`.
                 .filter(|r| *r > 0 || state.uploading == Some(0))
         };
-        Ok(state.with_rate(rate))
+        state.with_rate(rate)
+    }
+
+    /// A live rclone that answered with a fault. Rare, and still not a reason to make the
+    /// mount disappear — the text is the only clue the user gets.
+    fn faulted(&mut self, e: &RcError) -> TransferState {
+        self.rate.reset();
+        TransferState::unmonitored(&self.name, e.to_string())
     }
 
     fn unreachable(&self, e: &RcError) -> TransferState {
@@ -258,6 +278,53 @@ impl MountPoller {
         // The on-disk scanner that could answer here is #22; until then the honest answer
         // is that we do not know.
         TransferState::unmonitored(&self.name, e.to_string())
+    }
+
+    /// Whether any cache item is modified and not yet uploaded.
+    ///
+    /// Reads `diskCache.pathMeta`, the tree rclone writes a small JSON descriptor into per
+    /// cached file. Only consulted when the queue is empty, which is also when the poll
+    /// cadence is at its slowest, so the walk costs little.
+    ///
+    /// A missing tree means nothing has been cached yet, which is clean. Anything else
+    /// that goes wrong is reported, because "could not look" is not "nothing there".
+    /// Individual files are skipped rather than failing the walk: rclone writes them
+    /// non-atomically, so a descriptor caught mid-write is expected rather than a fault.
+    async fn any_dirty(&self, path_meta: &str) -> std::io::Result<bool> {
+        if path_meta.is_empty() {
+            return Ok(false);
+        }
+        let root = PathBuf::from(path_meta);
+        tokio::task::spawn_blocking(move || {
+            let mut stack = vec![root];
+            while let Some(dir) = stack.pop() {
+                let entries = match std::fs::read_dir(&dir) {
+                    Ok(e) => e,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e),
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    match entry.file_type() {
+                        Ok(t) if t.is_dir() => stack.push(path),
+                        Ok(_) => {
+                            let Ok(raw) = std::fs::read_to_string(&path) else {
+                                continue;
+                            };
+                            if serde_json::from_str::<VfsMetaItem>(&raw)
+                                .is_ok_and(|item| item.dirty)
+                            {
+                                return Ok(true);
+                            }
+                        }
+                        Err(_) => continue,
+                    }
+                }
+            }
+            Ok(false)
+        })
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
     }
 
     async fn fetch_stats(&mut self) -> Result<CacheProbe, RcError> {
@@ -432,7 +499,7 @@ mod tests {
         .await;
 
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.expect("a live rclone is not an error");
+        let s = p.poll().await;
 
         assert_eq!(s.fidelity, Some(Tier::T2));
         assert!(s.pending.known_bytes > 0, "the queue carries a byte total");
@@ -461,6 +528,27 @@ mod tests {
         v.to_string()
     }
 
+    /// As [`stats_with`], pointing `pathMeta` at a real tree on disk.
+    fn stats_with_meta(mode: u64, cache_files: u64, path_meta: &std::path::Path) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&stats_with(mode, cache_files)).unwrap();
+        v["diskCache"]["pathMeta"] = serde_json::json!(path_meta.to_string_lossy());
+        v.to_string()
+    }
+
+    /// A `vfsMeta` tree holding one descriptor, nested as rclone nests them.
+    fn meta_tree(tag: &str, dirty: bool) -> TempDir {
+        let dir =
+            TempDir(std::env::temp_dir().join(format!("rvt-meta-{}-{tag}", std::process::id())));
+        let nested = dir.0.join("local/srv/media");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture("vfsmeta-item-dirty.json")).unwrap();
+        v["Dirty"] = serde_json::json!(dirty);
+        std::fs::write(nested.join("one.bin"), v.to_string()).unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn a_minimal_cache_mode_mount_is_never_reported_idle() {
         // `minimal` builds a cache and a queue, so `vfs/stats` and `vfs/queue` look exactly
@@ -480,7 +568,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.expect("this is not a fault");
+        let s = p.poll().await;
 
         assert!(
             !s.is_idle(),
@@ -512,7 +600,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.unwrap();
+        let s = p.poll().await;
 
         assert!(
             !s.outstanding_known,
@@ -538,7 +626,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.unwrap();
+        let s = p.poll().await;
 
         assert!(s.outstanding_known, "nothing queued and nothing cached");
         assert!(s.is_idle());
@@ -552,22 +640,19 @@ mod tests {
         // default cache mode — the queue is empty and every upload counter reads zero
         // while the cache file grows. Measured on a live `writes` mount: 8MB on disk with
         // vfsMeta `Dirty: true`, `vfs/queue` `[]`, `uploadsQueued` 0, nothing in
-        // `core/stats`. Only `diskCache.files` moved, 0 to 1.
-        //
-        // It is a one-directional signal — the count stays up for the cache's retention
-        // window after an upload finishes — so this cannot claim anything is outstanding,
-        // only refuse to claim that nothing is.
+        // `core/stats`. The on-disk flag is the only thing that sees it.
+        let meta = meta_tree("dirty", true);
         let fake = FakeRc::new(
             "openwrite",
             vec![
                 ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
                 ("vfs/queue", r#"{"queue":[]}"#.to_string()),
-                ("vfs/stats", stats_with(2, 1)),
+                ("vfs/stats", stats_with_meta(2, 1, &meta.0)),
             ],
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.unwrap();
+        let s = p.poll().await;
 
         assert!(
             !s.safe_to_unmount(),
@@ -576,7 +661,98 @@ mod tests {
         assert!(!s.outstanding_known);
         assert!(!s.is_idle());
         let why = s.degraded_reason.clone().expect("the user has to be told");
-        assert!(why.contains("closed"), "{why}");
+        assert!(why.contains("not yet uploaded"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_partially_observed_mount_still_reports_a_rate() {
+        // A `minimal` mount's queue entries are real — read-write opens go through the
+        // cache normally — the queue is only possibly incomplete. Differencing a floor is
+        // a sound rate, so refusing one here would leave the user watching "2 files,
+        // 384KB pending" with no throughput for the whole transfer. Caution has to stop
+        // at the claim it is protecting rather than swallow the working ones with it.
+        let fake = FakeRc::new(
+            "minrate",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", fixture("vfs-queue-two-items.json")),
+                ("vfs/stats", stats_with(1, 2)),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let first = p.poll().await;
+        assert!(!first.outstanding_known, "minimal is never the whole story");
+        assert!(first.pending.files > 0, "but its entries are real");
+
+        // One file left the queue between polls.
+        fake.set(
+            "vfs/queue",
+            r#"{"queue":[{"name":"two.bin","id":2,"size":131072,"tries":0,"uploading":false}]}"#
+                .to_string(),
+        );
+        let second = p.poll().await;
+        assert!(
+            second.rate_bytes_per_sec.is_some_and(|r| r > 0),
+            "256KB left the queue, got {:?}",
+            second.rate_bytes_per_sec
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_only_full_mount_is_still_reported_idle() {
+        // Under `full`, reading populates the cache: measured on a live mount, one read
+        // and no write at all leaves `diskCache.files` at 1 with the descriptor's `Dirty`
+        // false. Counting cache entries would condemn every read-mostly media mount —
+        // exactly what `full` is recommended for — to "cannot tell" for the whole of
+        // `--vfs-cache-max-age`, and to a reason claiming a write was in progress.
+        let meta = meta_tree("cleanfull", false);
+        let fake = FakeRc::new(
+            "fullread",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", stats_with_meta(3, 1, &meta.0)),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await;
+
+        assert!(
+            s.safe_to_unmount(),
+            "nothing is dirty, so the applet must be able to answer the question it exists \
+             for: {:?}",
+            s.degraded_reason
+        );
+        assert!(s.is_idle());
+        assert!(s.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_cache_metadata_tree_is_not_taken_as_clean() {
+        // "Could not look" is not "nothing there". A path that exists but cannot be
+        // listed has to read as uncertainty, not as an idle mount.
+        let dir = TempDir(std::env::temp_dir().join(format!("rvt-meta-x-{}", std::process::id())));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let fake = FakeRc::new(
+            "unreadable",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", stats_with_meta(2, 1, &dir.0)),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await;
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!s.safe_to_unmount());
+        let why = s.degraded_reason.clone().expect("say why");
+        assert!(why.contains("could not be read"), "{why}");
     }
 
     #[tokio::test]
@@ -591,18 +767,19 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.unwrap();
+        let s = p.poll().await;
 
         // `erroredFiles` and `outOfSpace` are only in vfs/stats, and the byte total is
         // only in vfs/queue. Both have to survive the merge. The flags are asserted true
         // here because both default to false: a healthy capture would pass this test
         // whether or not the merge happened at all.
         assert!(s.pending.known_bytes > 0, "the queue total survived");
-        assert!(
+        assert_eq!(
             s.out_of_space,
+            Some(true),
             "the cache is full and the user must be told"
         );
-        assert_eq!(s.errored_files, 3);
+        assert_eq!(s.errored_files, Some(3));
     }
 
     #[tokio::test]
@@ -616,7 +793,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.expect("a missing command is not a fault");
+        let s = p.poll().await;
 
         // Not asking `vfs/stats` yields no cache, exactly as a cacheless mount does. Only
         // the second is grounds for discarding the queue, and treating them alike throws
@@ -654,7 +831,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.expect("a 404 is not a fault");
+        let s = p.poll().await;
 
         assert_eq!(s.fidelity, Some(Tier::T2));
         assert_eq!(s.pending.files, 2, "the queue still answered");
@@ -679,7 +856,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.expect("a missing command is not a fault");
+        let s = p.poll().await;
 
         assert_eq!(s.fidelity, Some(Tier::T3));
         assert_eq!(
@@ -701,7 +878,7 @@ mod tests {
         let mut p = MountPoller::connect("backup", client).await;
         assert_eq!(p.tier(), Tier::T4);
 
-        let s = p.poll().await.expect("an absent rclone is not a fault");
+        let s = p.poll().await;
         assert!(!s.outstanding_known);
         // The capability tier is T4 — a disk scan could still answer. What produced *this*
         // state is nothing, and `Tier::T4.meets_the_bar()` is true, so naming any tier here
@@ -729,7 +906,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let busy = p.poll().await.unwrap();
+        let busy = p.poll().await;
         assert!(!busy.is_idle(), "the capture has a queued file");
         assert_eq!(MountPoller::interval(&busy), ACTIVE);
 
@@ -853,13 +1030,13 @@ mod tests {
         );
 
         // The write-back delay is 300s, so the file must still be queued.
-        let mut state = p.poll().await.expect("a live rclone is not a fault");
+        let mut state = p.poll().await;
         for _ in 0..40 {
             if !state.is_idle() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
-            state = p.poll().await.expect("a live rclone is not a fault");
+            state = p.poll().await;
         }
 
         assert!(
@@ -883,7 +1060,8 @@ mod tests {
             "the queued file should be named: {:?}",
             state.files.iter().map(|f| &f.name).collect::<Vec<_>>()
         );
-        assert!(!state.out_of_space && state.errored_files == 0);
+        assert_eq!(state.out_of_space, Some(false));
+        assert_eq!(state.errored_files, Some(0));
 
         let _ = child.kill().await;
     }
@@ -938,14 +1116,14 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let first = p.poll().await.unwrap();
+        let first = p.poll().await;
         assert_eq!(
             first.rate_bytes_per_sec, None,
             "one sample cannot be a rate"
         );
         assert_eq!(first.uploading, Some(1), "the capture has a file in flight");
 
-        let second = p.poll().await.unwrap();
+        let second = p.poll().await;
         assert_eq!(
             second.rate_bytes_per_sec, None,
             "nothing left the queue and a file is uploading, so 0 B/s would read as \
@@ -972,7 +1150,7 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await.expect("this is not a fault");
+        let s = p.poll().await;
 
         assert!(
             !s.outstanding_known,
@@ -1023,7 +1201,7 @@ mod tests {
         .await;
 
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let first = p.poll().await.unwrap();
+        let first = p.poll().await;
         assert!(first.has_progress, "core/stats reached the state");
         assert_eq!(
             first.rate_bytes_per_sec, None,
@@ -1032,7 +1210,7 @@ mod tests {
 
         // The queue is unchanged; only the bytes sent have grown.
         fake.set("core/stats", progressed(60_000_000));
-        let second = p.poll().await.unwrap();
+        let second = p.poll().await;
         assert_eq!(second.pending.known_bytes, first.pending.known_bytes);
         assert!(
             second.rate_bytes_per_sec.is_some_and(|r| r > 0),
@@ -1056,7 +1234,7 @@ mod tests {
 
         // Nothing listening yet.
         let mut p = MountPoller::connect("backup", RcClient::new(&socket)).await;
-        let before = p.poll().await.unwrap();
+        let before = p.poll().await;
         assert!(!before.outstanding_known, "nothing to see yet");
 
         // rclone comes up on the same socket.
@@ -1069,7 +1247,7 @@ mod tests {
         ]);
         let server = tokio::spawn(async move { serve_routes(listener, rs).await });
 
-        let after = p.poll().await.expect("the mount is back");
+        let after = p.poll().await;
         assert!(
             after.outstanding_known,
             "the poller must re-probe rather than stay blind for the session"
@@ -1099,14 +1277,14 @@ mod tests {
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
-        let before = p.poll().await.unwrap();
+        let before = p.poll().await;
         assert!(before.outstanding_known && !before.is_idle());
 
         // rclone exits: the socket is gone, the capabilities are not.
         fake.handle.abort();
         let _ = std::fs::remove_file(&fake.socket);
 
-        let after = p.poll().await.expect("a departed rclone is not a fault");
+        let after = p.poll().await;
         assert!(
             !after.outstanding_known,
             "the queue did not empty — we simply stopped being able to see it"

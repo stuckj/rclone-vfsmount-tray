@@ -23,10 +23,11 @@ pub struct TransferFile {
     pub in_flight: Option<bool>,
     /// Upload attempts, counted from the moment each one starts.
     ///
-    /// Above 1 is proof an attempt failed. **1 is ambiguous** — it is both a healthy
-    /// upload in flight and one that has already failed once and is backing off. The
-    /// signal that separates them is [`crate::models::QueueItem::delay`] having grown beyond the
-    /// configured `--vfs-write-back`; `errored_files` stays 0 through either.
+    /// On its own it cannot show a stuck file: 1 is both a healthy upload in flight and
+    /// one that has already failed once and is backing off. Pair it with
+    /// [`Self::in_flight`] — rclone sets `uploading` before it increments `tries`, so
+    /// `tries >= 1` with `in_flight == Some(false)` is exactly "an attempt has been made
+    /// and is not running now". `errored_files` stays 0 through all of it.
     pub tries: Option<u64>,
     /// Bytes already sent for this file. Supplied by `core/stats` alone, and only for the
     /// files it is currently transferring; see [`TransferState::has_progress`].
@@ -70,12 +71,15 @@ pub struct TransferState {
     pub pending: Pending,
     /// Uploads in flight. `None` where the tier cannot distinguish queued from uploading.
     pub uploading: Option<u64>,
-    /// `vfs/stats`'s errored-file count. Not the whole picture: a file rclone is still
-    /// retrying leaves this at zero however many attempts have failed, and only
-    /// [`TransferFile::tries`] above 1 reveals it.
-    pub errored_files: u64,
-    /// The cache is full. Actionable, and silently breaks uploads.
-    pub out_of_space: bool,
+    /// `vfs/stats`'s errored-file count, or `None` where `vfs/stats` could not be asked —
+    /// a bare `0` there would report a full, failing cache as healthy.
+    ///
+    /// Not the whole picture even when present: a file rclone is still retrying leaves it
+    /// at zero however many attempts have failed. See [`TransferFile::tries`].
+    pub errored_files: Option<u64>,
+    /// The cache is full. Actionable, and silently breaks uploads. `None` where
+    /// `vfs/stats` could not be asked, for the same reason as above.
+    pub out_of_space: Option<bool>,
     /// Derived by differencing totals across polls, never reported by rclone.
     pub rate_bytes_per_sec: Option<u64>,
     /// Empty where the tier reports counts but not files.
@@ -93,8 +97,8 @@ impl TransferState {
             has_progress: false,
             pending: Pending::default(),
             uploading: None,
-            errored_files: 0,
-            out_of_space: false,
+            errored_files: None,
+            out_of_space: None,
             rate_bytes_per_sec: None,
             files: Vec::new(),
             degraded_reason: None,
@@ -143,8 +147,8 @@ impl TransferState {
     pub fn from_stats(mount: &str, cache: &DiskCache) -> Self {
         let mut s = Self::empty(mount, Some(Tier::T3));
         s.uploading = Some(cache.uploads_in_progress);
-        s.errored_files = cache.errored_files;
-        s.out_of_space = cache.out_of_space;
+        s.errored_files = Some(cache.errored_files);
+        s.out_of_space = Some(cache.out_of_space);
         // Every size is unknown at this tier, which is what the third argument records.
         // `Pending::new(n, 0, 0)` would claim "n files totalling exactly zero bytes".
         let files = cache.uploads_in_progress + cache.uploads_queued;
@@ -218,8 +222,8 @@ impl TransferState {
     /// Deliberately does not touch `pending`: `vfs/stats` has no honest byte total, and
     /// overwriting a queue-derived one with its counts would lose the bytes.
     pub fn with_cache_health(mut self, cache: &DiskCache) -> Self {
-        self.errored_files = cache.errored_files;
-        self.out_of_space = cache.out_of_space;
+        self.errored_files = Some(cache.errored_files);
+        self.out_of_space = Some(cache.out_of_space);
         self
     }
 
@@ -268,8 +272,13 @@ impl TransferState {
 
     /// Whether the outstanding *byte* total means anything. `vfs/stats` reports counts
     /// with no sizes, so a rate derived from its total would be a confident zero.
+    ///
+    /// Deliberately not conditioned on [`Self::outstanding_known`]: a partially observed
+    /// mount's queue entries are real, only possibly incomplete, and differencing a floor
+    /// is a sound rate. Requiring certainty here would leave a `minimal` mount showing
+    /// "10 files, 5GB pending" and never a throughput for the whole transfer.
     pub fn has_byte_total(&self) -> bool {
-        self.outstanding_known && self.fidelity.is_some_and(|t| t != Tier::T3)
+        self.fidelity.is_some_and(|t| t != Tier::T3)
     }
 
     /// Bytes still to send, discounting what is already on the wire.
@@ -586,13 +595,25 @@ mod tests {
     fn the_actionable_flags_survive_the_merge() {
         // `erroredFiles` and `outOfSpace` are the two states #21 says the user must act
         // on, and both are only in `vfs/stats`.
-        let s = TransferState::from_queue("backup", &queue_fixture("vfs-queue-uploading.json"))
-            .with_cache_health(&unhealthy_cache());
+        let queued =
+            TransferState::from_queue("backup", &queue_fixture("vfs-queue-uploading.json"));
+        // Before the merge neither is known, and neither may read as "fine": a bare 0 and
+        // false would report a full, failing cache as healthy on any build that cannot
+        // answer `vfs/stats`.
+        assert_eq!(queued.errored_files, None);
+        assert_eq!(queued.out_of_space, None);
+
+        let s = queued.with_cache_health(&unhealthy_cache());
         assert_eq!(
-            s.errored_files, 3,
+            s.errored_files,
+            Some(3),
             "repeated upload failure must reach the user"
         );
-        assert!(s.out_of_space, "a full cache silently breaks uploads");
+        assert_eq!(
+            s.out_of_space,
+            Some(true),
+            "a full cache silently breaks uploads"
+        );
     }
 
     #[test]

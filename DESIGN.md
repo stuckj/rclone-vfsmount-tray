@@ -323,16 +323,25 @@ Every rc endpoint reports nothing outstanding while 8 MB sits dirty and unsent. 
 enters `vfs/queue` on `close()`, not as it is written — so this is the state for the whole
 duration of any large copy, not a narrow race.
 
-**`diskCache.files` is the only rc signal, and it is one-directional.** It rose 0 → 1 when
-the write began, but it also stays at 1 after the upload completes, for the cache's
-retention window (`--vfs-cache-max-age`, default 1h). So a non-zero count cannot say
-anything *is* outstanding — only that nothing can rule it out.
+**No rc field answers this.** `diskCache.files` moves with the write, but it counts clean
+entries too: it stays up for the cache's retention window (`--vfs-cache-max-age`, default
+1h) after an upload finishes, and under `full` a plain *read* creates one — measured, one
+read and no write leaves `files: 1` with the descriptor's `Dirty` false. Counting cache
+entries would condemn every read-mostly `full` mount to "cannot tell" permanently, which is
+a worse answer than the one it set out to fix.
 
-The applet therefore treats an empty queue as proof of idle **only when the cache is empty
-too**, and reports partially observed otherwise. The cost is real: for an hour after any
-write, a genuinely idle mount reads as "cannot confirm". Restoring that precision needs the
-vfsMeta `Dirty` scan — #22 — which makes **T4 strictly better than T2 for this question**,
-the one place the ladder's ordering does not hold.
+So when the queue is empty the poller reads `diskCache.pathMeta` and checks the on-disk
+`Dirty` flag, which is exact in every mode. This is a narrow predicate, not the T4 tier:
+#22 is the full scanner with a file list, sizes and inotify, and should absorb it.
+
+**T4 is therefore strictly better than T2 for this one question**, the single place the
+ladder's ordering does not hold — an on-disk scan sees an open write that `vfs/queue`
+cannot.
+
+Note the kernel is the backstop, not this check: `fusermount3 -u` on a mount with a file
+open fails with `EBUSY` (measured), and the supervisor never unmounts lazily. What the
+check buys is an honest *display* during a copy, and correctness if a forced unmount is
+ever offered.
 
 ### Two field names that mean less than they say
 

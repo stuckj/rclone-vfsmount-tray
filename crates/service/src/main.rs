@@ -134,19 +134,17 @@ async fn main() -> anyhow::Result<()> {
         let socket = sup.socket_path(&m.name);
         let mut p = poller::MountPoller::connect(&m.name, rvt_core::RcClient::new(&socket)).await;
         tracing::debug!(mount = %m.name, tier = ?p.tier(), "resolved capability tier");
-        match p.poll().await {
-            Ok(state) => tracing::info!(
-                mount = %state.mount,
-                tier = ?state.fidelity,
-                outstanding_known = state.outstanding_known,
-                pending_files = state.pending.files,
-                pending_bytes = state.pending.known_bytes,
-                degraded = ?state.degraded_reason,
-                next_poll_secs = poller::MountPoller::interval(&state).as_secs(),
-                "polled"
-            ),
-            Err(e) => tracing::warn!(mount = %m.name, error = %e, "could not poll"),
-        }
+        let state = p.poll().await;
+        tracing::info!(
+            mount = %state.mount,
+            tier = ?state.fidelity,
+            outstanding_known = state.outstanding_known,
+            pending_files = state.pending.files,
+            pending_bytes = state.pending.known_bytes,
+            degraded = ?state.degraded_reason,
+            next_poll_secs = poller::MountPoller::interval(&state).as_secs(),
+            "polled"
+        );
     }
 
     tracing::warn!("serving is not implemented yet — see issue #40");

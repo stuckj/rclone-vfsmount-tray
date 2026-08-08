@@ -646,13 +646,11 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
 /// Where a mount's rc socket lives.
 ///
-/// The service's copy of this; `RcClient::socket_path_for` is the client's, against
-/// `XDG_RUNTIME_DIR`, and the two have to agree. Configured names cannot contain `/` —
-/// `Config::validate` rejects them — but a foreign mount is named by its absolute mount
-/// point, and `Path::join` given an absolute argument discards the base: `/srv/media`
-/// would otherwise resolve to `/srv/media.sock`, anywhere on the filesystem.
+/// This service's runtime directory joined with the shared socket file name. The client
+/// resolves the same name against `XDG_RUNTIME_DIR`; `RcClient::socket_file_name` is the
+/// single definition both use, and explains why the name is escaped rather than folded.
 fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
-    runtime_dir.join(format!("{}.sock", name.replace('/', "_")))
+    runtime_dir.join(rvt_core::RcClient::socket_file_name(name))
 }
 
 /// Clear what a hard-killed rclone leaves behind, so a start can succeed.

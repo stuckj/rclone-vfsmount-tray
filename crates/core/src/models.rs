@@ -311,7 +311,7 @@ pub struct QueueItem {
     /// flight already reads 1. Writing to a file that is already queued **resets** this,
     /// along with [`Self::delay`] — rclone drops the entry and re-queues it — so a value
     /// above 1 is evidence of failure rather than of a file being re-saved. Measured
-    /// 4 → 1 across a modify.
+    /// across a modify: 4 → 0, then 1 once the next attempt ran.
     #[serde(default)]
     pub tries: u64,
     /// Whether the upload is in flight right now.

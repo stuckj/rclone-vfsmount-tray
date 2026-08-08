@@ -185,15 +185,37 @@ impl RcClient {
             .map(|v| PathBuf::from(v).join("rclone-vfsmount-tray"))
     }
 
-    /// The conventional socket path for a named mount.
+    /// The socket file name for a mount, without a directory.
     ///
-    /// A configured name cannot contain `/`, but a foreign mount is named by its absolute
-    /// mount point, and `Path::join` given an absolute argument discards the base — so
-    /// without the substitution `/srv/media` resolves to `/srv/media.sock`, anywhere on
-    /// the filesystem. The service builds the same name from its own runtime directory and
-    /// has to agree with this.
+    /// The one place this mapping lives: the service joins it onto its own runtime
+    /// directory, this joins it onto [`Self::socket_dir`], and the two must agree.
+    ///
+    /// A configured name cannot contain `/` — `Config::validate` rejects it — but a
+    /// foreign mount is named by its absolute mount point, and `Path::join` given an
+    /// absolute argument discards the base, so `/srv/media` would otherwise resolve to
+    /// `/srv/media.sock` anywhere on the filesystem.
+    ///
+    /// Escaped rather than substituted, because the mapping has to be **injective**:
+    /// `_` is legal in a configured name, so folding `/` onto it would map the foreign
+    /// mount `/srv/media` and the configured mount `_srv_media` to the same socket — and
+    /// that socket exists, is ours, and passes every check, so one mount's answer would
+    /// be served for another. `%` cannot appear in a configured name, so no escaped name
+    /// can collide with an unescaped one.
+    pub fn socket_file_name(name: &str) -> String {
+        let escaped: String = name
+            .chars()
+            .map(|c| match c {
+                '/' => "%2F".to_string(),
+                '%' => "%25".to_string(),
+                _ => c.to_string(),
+            })
+            .collect();
+        format!("{escaped}.sock")
+    }
+
+    /// The conventional socket path for a named mount.
     pub fn socket_path_for(name: &str) -> Option<PathBuf> {
-        Some(Self::socket_dir()?.join(format!("{}.sock", name.replace('/', "_"))))
+        Some(Self::socket_dir()?.join(Self::socket_file_name(name)))
     }
 
     pub fn socket(&self) -> &Path {
@@ -517,6 +539,18 @@ mod tests {
             Some(root.join("backup.sock")),
             "a configured name must keep the path it has always had"
         );
+
+        // Containment is not the whole requirement. Folding `/` onto `_` keeps every name
+        // inside the directory while mapping the foreign mount `/srv/media` onto the
+        // *configured* mount `_srv_media` — a legal name, whose socket exists, is ours and
+        // passes every check, so one mount's answer would be served for another.
+        let mut seen = std::collections::BTreeSet::new();
+        for n in ["/srv/media", "_srv_media", "%2Fsrv%2Fmedia", "a/b", "a_b"] {
+            assert!(
+                seen.insert(RcClient::socket_file_name(n)),
+                "{n:?} collides with an earlier name; one mount would answer for another"
+            );
+        }
 
         match saved {
             // SAFETY: as above.

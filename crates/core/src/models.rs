@@ -498,7 +498,10 @@ pub struct VfsMetaItem {
     /// Last access time, RFC 3339.
     #[serde(rename = "ATime", default)]
     pub atime: String,
-    /// Full size of the file in bytes.
+    /// Full size of the file in bytes — **stale while a handle is open**: 0 for a file
+    /// being created, and the *previous* size for one being rewritten, until the upload
+    /// completes. For bytes outstanding, measure the data file under `diskCache.path`, as
+    /// [`crate::scan`] does.
     #[serde(rename = "Size", default)]
     pub size: u64,
     /// Byte ranges present in the local cache. `null` when none are.
@@ -507,9 +510,14 @@ pub struct VfsMetaItem {
     /// Fingerprint of the remote object. Observed empty on the local backend.
     #[serde(rename = "Fingerprint", default)]
     pub fingerprint: String,
-    /// Modified locally and not yet uploaded. Summing sizes over dirty items gives bytes
-    /// still to send. Stays true until upload completes, so it cannot distinguish
-    /// "queued" from "uploading".
+    /// Modified locally and not yet uploaded. Set when the file is *written*, not when it
+    /// is closed — which is what lets the on-disk tier see a write the write-back queue
+    /// has not heard about yet. Stays true until the upload completes, so it cannot
+    /// distinguish "queued" from "uploading".
+    ///
+    /// Do **not** sum [`Self::size`] over dirty items for bytes still to send: that field
+    /// is stale while a handle is open. Use the data file's own size, as
+    /// [`crate::scan`] does.
     #[serde(rename = "Dirty", default)]
     pub dirty: bool,
 }

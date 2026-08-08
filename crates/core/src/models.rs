@@ -203,15 +203,32 @@ fn strip_backend_tag(fs: &str) -> &str {
 /// even with no per-file progress.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct VfsQueue {
+    /// **Absent, not `[]`, when this VFS has no write-back cache** — measured against
+    /// rclone v1.75.0, which answers a `--vfs-cache-mode off` mount with `{}` and HTTP
+    /// 200 rather than an error. Reading that as an empty queue turns "this mount cannot
+    /// be observed" into "this mount has nothing outstanding".
     #[serde(default)]
-    pub queue: Vec<QueueItem>,
+    pub queue: Option<Vec<QueueItem>>,
 }
 
 impl VfsQueue {
+    /// The queued items, or an empty slice when the key was absent.
+    pub fn items(&self) -> &[QueueItem] {
+        self.queue.as_deref().unwrap_or(&[])
+    }
+
+    /// Whether rclone reported the `queue` key at all.
+    ///
+    /// `false` means "this VFS has no write-back queue", which is not the same as
+    /// "the queue is empty".
+    pub fn reported_queue(&self) -> bool {
+        self.queue.is_some()
+    }
+
     /// What is still waiting to upload, including how much of it cannot be measured.
     pub fn pending(&self) -> Pending {
         let mut p = Pending::default();
-        for item in &self.queue {
+        for item in self.items() {
             p.files += 1;
             match u64::try_from(item.size) {
                 Ok(bytes) => p.known_bytes += bytes,
@@ -229,7 +246,7 @@ impl VfsQueue {
 
     /// Items rclone is actively uploading right now.
     pub fn uploading(&self) -> impl Iterator<Item = &QueueItem> {
-        self.queue.iter().filter(|i| i.uploading)
+        self.items().iter().filter(|i| i.uploading)
     }
 }
 
@@ -283,10 +300,18 @@ pub struct QueueItem {
     /// Seconds until upload starts. **Signed** — goes negative once due.
     #[serde(default)]
     pub expiry: f64,
-    /// The configured `--vfs-write-back` delay, in seconds.
+    /// Current back-off before the next attempt, in seconds — **not** the configured
+    /// `--vfs-write-back`, though it starts there. rclone doubles it on every failure,
+    /// capped at 5 minutes: measured 3 → 6 → 12 → 24 → 48 with `--vfs-write-back 3s`.
+    /// Reset to the configured value when an upload is cancelled by the file being
+    /// modified again.
     #[serde(default)]
     pub delay: f64,
-    /// Upload attempts so far. A climbing value means repeated failure.
+    /// Upload attempts so far, counted from the moment each one starts, so an attempt in
+    /// flight already reads 1. Writing to a file that is already queued **resets** this,
+    /// along with [`Self::delay`] — rclone drops the entry and re-queues it — so a value
+    /// above 1 is evidence of failure rather than of a file being re-saved. Measured
+    /// across a modify: 4 → 0, then 1 once the next attempt ran.
     #[serde(default)]
     pub tries: u64,
     /// Whether the upload is in flight right now.
@@ -317,6 +342,27 @@ pub struct VfsStats {
     /// typed. Anything that does should pull out the specific key it wants.
     #[serde(default)]
     pub opt: Option<serde_json::Value>,
+}
+
+impl VfsStats {
+    /// The cache mode this VFS is actually running with, from `opt.CacheMode`.
+    ///
+    /// The running mount's own answer rather than the configured one, so it holds for a
+    /// mount somebody else started. `None` when the key is absent or unrecognised, which
+    /// callers must treat as "unknown", never as `Off`.
+    ///
+    /// rclone encodes the mode as its `vfs.CacheMode` ordinal; the values below were read
+    /// back from a live rclone v1.75.0 mounted at each setting.
+    pub fn cache_mode(&self) -> Option<crate::config::CacheMode> {
+        use crate::config::CacheMode;
+        match self.opt.as_ref()?.get("CacheMode")?.as_u64()? {
+            0 => Some(CacheMode::Off),
+            1 => Some(CacheMode::Minimal),
+            2 => Some(CacheMode::Writes),
+            3 => Some(CacheMode::Full),
+            _ => None,
+        }
+    }
 }
 
 /// Disk cache portion of `vfs/stats`.
@@ -506,7 +552,7 @@ mod tests {
             r#"{"queue":[{"name":"a","id":1,"size":10,"expiry":-0.32414583,"uploading":true}]}"#,
         )
         .unwrap();
-        assert!(q.queue[0].expiry < 0.0);
+        assert!(q.items()[0].expiry < 0.0);
         assert_eq!(q.pending_bytes(), 10);
         assert_eq!(q.uploading().count(), 1);
     }

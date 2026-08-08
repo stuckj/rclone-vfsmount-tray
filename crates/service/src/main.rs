@@ -120,28 +120,34 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(name = %m.name, state = ?m.state, "found mount");
     }
 
-    // One poll per live mount, so the tier and what is outstanding are visible in the
-    // log before there is anywhere to publish them. The loop that keeps this current,
+    // One poll per mount we started, so the tier and what is outstanding are visible in
+    // the log before there is anywhere to publish them. The loop that keeps this current,
     // and the D-Bus surface that serves it, are #40.
-    for m in found.iter().filter(|m| m.state.is_live()) {
+    //
+    // `Mounted` rather than `is_live()`, which also admits `Foreign`. A foreign mount is
+    // named by its absolute mount point, and `socket_path` joins that onto the runtime
+    // directory — joining an absolute path discards the base, so `/srv/media` would send
+    // us looking for an rc socket at `/srv/media.sock`. Addressing a mount we did not
+    // start is #70.
+    for m in found
+        .iter()
+        .filter(|m| matches!(m.state, rvt_core::supervisor::MountState::Mounted))
+    {
         let socket = sup.socket_path(&m.name);
-        match poller::MountPoller::connect(&m.name, rvt_core::RcClient::new(&socket)).await {
-            Ok(mut p) => {
-                tracing::debug!(mount = %m.name, tier = ?p.tier(), "resolved capability tier");
-                match p.poll().await {
-                    Ok(state) => tracing::info!(
-                        mount = %state.mount,
-                        tier = ?state.fidelity,
-                        pending_files = state.pending.files,
-                        pending_bytes = state.pending.known_bytes,
-                        degraded = ?state.degraded_reason,
-                        next_poll_secs = poller::MountPoller::interval(&state).as_secs(),
-                        "polled"
-                    ),
-                    Err(e) => tracing::warn!(mount = %m.name, error = %e, "could not poll"),
-                }
-            }
-            Err(e) => tracing::warn!(mount = %m.name, error = %e, "could not reach rc"),
+        let mut p = poller::MountPoller::connect(&m.name, rvt_core::RcClient::new(&socket)).await;
+        tracing::debug!(mount = %m.name, tier = ?p.tier(), "resolved capability tier");
+        match p.poll().await {
+            Ok(state) => tracing::info!(
+                mount = %state.mount,
+                tier = ?state.fidelity,
+                outstanding_known = state.outstanding_known,
+                pending_files = state.pending.files,
+                pending_bytes = state.pending.known_bytes,
+                degraded = ?state.degraded_reason,
+                next_poll_secs = poller::MountPoller::interval(&state).as_secs(),
+                "polled"
+            ),
+            Err(e) => tracing::warn!(mount = %m.name, error = %e, "could not poll"),
         }
     }
 

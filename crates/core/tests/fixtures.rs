@@ -374,20 +374,20 @@ fn vfs_queue(name: &str) -> VfsQueue {
 #[test]
 fn a_multi_item_queue_carries_a_distinct_entry_per_file() {
     let q: VfsQueue = vfs_queue("vfs-queue-two-items.json");
-    assert_eq!(q.queue.len(), 2, "captured with two files queued");
+    assert_eq!(q.items().len(), 2, "captured with two files queued");
 
-    let names: Vec<_> = q.queue.iter().map(|i| i.name.as_str()).collect();
+    let names: Vec<_> = q.items().iter().map(|i| i.name.as_str()).collect();
     assert_eq!(names, vec!["one.bin", "two.bin"]);
 
-    let ids: std::collections::BTreeSet<_> = q.queue.iter().map(|i| i.id).collect();
+    let ids: std::collections::BTreeSet<_> = q.items().iter().map(|i| i.id).collect();
     assert_eq!(ids.len(), 2, "ids are what vfs/queue-set-expiry addresses");
 
     // Distinct sizes, so a test that mixed the two entries up would show it.
-    assert_eq!(q.queue[0].size, 262_144);
-    assert_eq!(q.queue[1].size, 131_072);
+    assert_eq!(q.items()[0].size, 262_144);
+    assert_eq!(q.items()[1].size, 131_072);
     assert_eq!(q.pending().known_bytes, 393_216);
     assert!(
-        q.queue.iter().all(|i| !i.uploading),
+        q.items().iter().all(|i| !i.uploading),
         "captured before upload"
     );
 }
@@ -403,18 +403,15 @@ fn a_retrying_upload_is_told_apart_from_a_healthy_one_by_tries_alone() {
     let failing: VfsQueue = vfs_queue("vfs-queue-retrying.json");
     let healthy: VfsQueue = vfs_queue("vfs-queue-uploading.json");
 
-    assert_eq!(healthy.queue[0].tries, 1, "a first attempt, going fine");
+    assert_eq!(healthy.items()[0].tries, 1, "a first attempt, going fine");
     assert!(
-        failing.queue[0].tries > 1,
+        failing.items()[0].tries > 1,
         "captured after repeated failure"
     );
-    // Neither is uploading-vs-not: the failing one is between retries, backing off, and
-    // the flag alone would read as "merely queued".
-    assert!(!failing.queue[0].uploading);
-    assert!(
-        failing.queue[0].delay > healthy.queue[0].delay,
-        "backing off"
-    );
+    // Neither is `uploading`: the failing one is between retries, backing off, so that
+    // flag alone reads as "merely queued". `tries` is the only thing that separates them.
+    assert!(!failing.items()[0].uploading);
+    assert!(healthy.items()[0].uploading);
 }
 
 #[test]
@@ -610,7 +607,7 @@ fn queue_names_join_to_transfer_names() {
     let queue: VfsQueue = vfs_queue("vfs-queue-uploading.json");
 
     let tname = &stats.transfers_slice()[0].name;
-    let qname = &queue.queue[0].name;
+    let qname = &queue.items()[0].name;
     assert_eq!(
         tname, qname,
         "the join key between core/stats and vfs/queue is an exact name match"
@@ -620,7 +617,7 @@ fn queue_names_join_to_transfer_names() {
 #[test]
 fn queue_queued_versus_uploading() {
     let queued: VfsQueue = vfs_queue("vfs-queue-queued-not-uploading.json");
-    let item = &queued.queue[0];
+    let item = &queued.items()[0];
     assert!(!item.uploading, "still waiting out --vfs-write-back");
     assert!(item.expiry > 0.0, "expiry counts down to zero");
     assert_eq!(queued.uploading().count(), 0);
@@ -633,7 +630,7 @@ fn queue_queued_versus_uploading() {
     assert!(queued.pending().is_exact());
 
     let live: VfsQueue = vfs_queue("vfs-queue-uploading.json");
-    let item = &live.queue[0];
+    let item = &live.items()[0];
     assert!(item.uploading);
     assert!(
         item.expiry < 0.0,

@@ -4,6 +4,7 @@
 //! over rc while another was started by somebody else and can only be scanned on disk.
 
 use rvt_core::capabilities::{Capabilities, Tier};
+use rvt_core::config::CacheMode;
 use rvt_core::models::{CoreStats, DiskCache, VfsQueue, VfsStats};
 use rvt_core::rc::{RcClient, RcError};
 use rvt_core::transfer::{RateEstimator, TransferState};
@@ -25,7 +26,8 @@ enum CacheProbe {
     NotAsked,
     /// Asked, and this mount has no write-back cache.
     Absent,
-    Present(DiskCache),
+    /// A cache, and the mode the VFS is running with — `None` where rclone did not say.
+    Present(DiskCache, Option<CacheMode>),
 }
 
 /// Polls one mount.
@@ -42,15 +44,22 @@ pub struct MountPoller {
 impl MountPoller {
     /// Probe what this rclone supports. Cheap enough to redo when a mount is remounted,
     /// and necessary then: it is a different process with a different socket.
-    pub async fn connect(name: &str, client: RcClient) -> Result<Self, RcError> {
-        let caps = Capabilities::probe(&client).await?;
-        Ok(Self {
+    ///
+    /// Never fails. A probe that could not answer leaves the capability set empty, and
+    /// `poll` re-probes and reports the mount unmonitored — which keeps it on screen with
+    /// a reason attached. Returning an error here instead would drop the mount from the
+    /// report altogether, the one outcome worse than saying "cannot tell".
+    pub async fn connect(name: &str, client: RcClient) -> Self {
+        let caps = Capabilities::probe(&client)
+            .await
+            .unwrap_or_else(|e| Capabilities::from_refusal(e.to_string()));
+        Self {
             name: name.to_string(),
             client,
             caps,
             rate: RateEstimator::new(),
             cache_path: None,
-        })
+        }
     }
 
     pub fn tier(&self) -> Tier {
@@ -58,14 +67,15 @@ impl MountPoller {
     }
 
     /// How long to wait before polling again.
+    ///
+    /// Driven by whether anything is known to be outstanding, not by whether the mount is
+    /// idle. A mount that cannot be observed has nothing to re-derive every second, and a
+    /// partially observed one with real entries in its queue still has to be watched.
     pub fn interval(state: &TransferState) -> Duration {
-        // A mount we cannot observe gets the slow cadence, not the fast one: `is_idle()`
-        // is false for it, but re-deriving "still cannot see it" every second is a busy
-        // loop over a fact that cannot change until the mount is restarted.
-        if state.is_idle() || !state.outstanding_known {
-            IDLE
-        } else {
+        if state.pending.files > 0 {
             ACTIVE
+        } else {
+            IDLE
         }
     }
 
@@ -75,11 +85,9 @@ impl MountPoller {
     /// on-disk tier exists for, so it degrades rather than erroring and says why. A real
     /// fault from a live rclone is returned.
     pub async fn poll(&mut self) -> Result<TransferState, RcError> {
-        // Capabilities are latched at connect, and an rclone that was down then leaves
-        // them empty — after which nothing here would issue another rc call, so the mount
-        // would report as unobservable for the life of the service even once rclone came
-        // back. Re-probing while they are empty is what lets a mount that starts after
-        // the service, or restarts after a crash, recover.
+        // An empty set issues no rc calls at all, so without re-probing here a mount that
+        // was down at connect stays unobservable for the life of the service. Covers both
+        // the service starting before its mount units and a unit restarting after a crash.
         if self.caps.is_empty() {
             if let Ok(caps) = Capabilities::probe(&self.client).await {
                 self.caps = caps;
@@ -108,6 +116,16 @@ impl MountPoller {
         };
 
         let mut state = match self.fetch_queue().await {
+            // rclone answers a cacheless VFS with `{}` and HTTP 200, so the *absence* of
+            // the key — not an empty list — is what says there is no queue to read. This
+            // is the one signal that does not depend on `vfs/stats` being registered.
+            Ok(queue) if !queue.reported_queue() => {
+                return Ok(TransferState::unmonitored(
+                    &self.name,
+                    "this mount has no write-back queue (--vfs-cache-mode off), so writes \
+                     stream straight to the remote and nothing outstanding can be observed",
+                ))
+            }
             Ok(queue) => TransferState::from_queue(&self.name, &queue),
             Err(e) if e.is_unreachable() => {
                 self.rate.reset();
@@ -115,7 +133,7 @@ impl MountPoller {
             }
             // No `vfs/queue` on this build: counts are all there is over rc.
             Err(RcError::Failed { status: 404, .. }) => match &cache {
-                CacheProbe::Present(c) => TransferState::from_stats(&self.name, c),
+                CacheProbe::Present(c, _) => TransferState::from_stats(&self.name, c),
                 CacheProbe::Absent => {
                     return Ok(TransferState::unmonitored(
                         &self.name,
@@ -135,11 +153,22 @@ impl MountPoller {
         };
 
         match &cache {
-            CacheProbe::Present(c) => state = state.with_cache_health(c),
-            // rclone answers `vfs/queue` with `{}` for a cacheless mount rather than an
-            // error, so the queue-derived state above is an empty one. Reporting it as-is
-            // would be a confident, non-degraded zero for a mount whose writes stream
-            // straight to the remote where nothing can see them.
+            CacheProbe::Present(c, mode) => {
+                state = state.with_cache_health(c);
+                // `minimal` builds a cache and a queue, so nothing above this point can
+                // tell it from `writes` — but a write-only open of an uncached file
+                // streams past both. Its queue is a floor, and an empty one is not proof
+                // the mount is idle. Only a mode rclone actually named is trusted here;
+                // an unrecognised one must not be read as "all writes are queued".
+                if mode.is_some_and(|m| !m.all_writes_queued()) {
+                    state = state.partially_observed(
+                        "this mount's cache mode is minimal, so a file opened write-only \
+                         streams straight to the remote without entering the queue",
+                    );
+                }
+            }
+            // Reached only on a build with no `vfs/queue`; the absent queue key above
+            // catches this first otherwise.
             CacheProbe::Absent => {
                 return Ok(TransferState::unmonitored(
                     &self.name,
@@ -161,12 +190,11 @@ impl MountPoller {
         // Per-file progress, where the build has `core/stats` and the transfers can be
         // attributed to this mount. Without the cache path a transfer cannot be told from
         // another mount's, so the lift is skipped rather than guessed at.
-        if self.caps.has("core/stats") && self.cache_path.is_some() {
+        if let (true, Some(cache)) = (self.caps.has("core/stats"), self.cache_path.clone()) {
             match self.client.call::<CoreStats>("core/stats", empty()).await {
                 Ok(stats) => {
                     // Both conditions, per DESIGN.md: the `global_stats` group alone admits
                     // cache *downloads*, which would then be counted as pending uploads.
-                    let cache = self.cache_path.clone().unwrap_or_default();
                     let mine: Vec<_> = stats.writeback_uploads(&cache).cloned().collect();
                     state = state.with_progress(&mine);
                 }
@@ -205,13 +233,14 @@ impl MountPoller {
             return Ok(CacheProbe::NotAsked);
         }
         let stats: VfsStats = self.client.call("vfs/stats", empty()).await?;
+        let mode = stats.cache_mode();
         let Some(cache) = stats.disk_cache else {
             return Ok(CacheProbe::Absent);
         };
         if !cache.path.is_empty() {
             self.cache_path = Some(cache.path.clone());
         }
-        Ok(CacheProbe::Present(cache))
+        Ok(CacheProbe::Present(cache, mode))
     }
 
     async fn fetch_queue(&self) -> Result<VfsQueue, RcError> {
@@ -362,7 +391,7 @@ mod tests {
         )
         .await;
 
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let s = p.poll().await.expect("a live rclone is not an error");
 
         assert_eq!(s.fidelity, Some(Tier::T2));
@@ -381,6 +410,68 @@ mod tests {
         v.to_string()
     }
 
+    /// The captured `vfs/stats` re-stamped with a cache mode. rclone's own encoding:
+    /// 0 off, 1 minimal, 2 writes, 3 full. The capture is a `writes` mount, so every
+    /// other mode has to be synthesised.
+    fn stats_with_cache_mode(mode: u64) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
+        v["opt"]["CacheMode"] = serde_json::json!(mode);
+        v.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_minimal_cache_mode_mount_is_never_reported_idle() {
+        // `minimal` builds a cache and a queue, so `vfs/stats` and `vfs/queue` look exactly
+        // like a `writes` mount — but a write-only open of an uncached file streams past
+        // both. Measured on a live FUSE mount: 8s into a 20MB write, `vfs/queue` was `[]`,
+        // `diskCache` was present with every counter zero, and the transfer appeared only
+        // in `core/stats` with no `srcFs`, so the attribution filter drops it too.
+        //
+        // Reporting that as idle is what lets an unmount truncate the file being written.
+        let fake = FakeRc::new(
+            "minimal",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", stats_with_cache_mode(1)),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await.expect("this is not a fault");
+
+        assert!(
+            !s.is_idle(),
+            "an empty queue on a minimal mount is not proof the mount is idle"
+        );
+        assert!(!s.outstanding_known);
+        let why = s.degraded_reason.clone().expect("the user has to be told");
+        assert!(why.contains("minimal"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn a_writes_cache_mode_mount_is_still_trusted() {
+        // The other side of the check above: `writes` queues every write, so an empty
+        // queue there really does mean idle. Without this, "never trust the queue" would
+        // pass the minimal test while making every healthy mount permanently unknown.
+        let fake = FakeRc::new(
+            "writes",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", stats_with_cache_mode(2)),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await.unwrap();
+
+        assert!(s.outstanding_known, "a writes mount queues everything");
+        assert!(s.is_idle());
+        assert!(s.degraded_reason.is_none());
+    }
+
     #[tokio::test]
     async fn the_actionable_flags_come_from_stats_without_losing_the_queue_total() {
         let fake = FakeRc::new(
@@ -392,7 +483,7 @@ mod tests {
             ],
         )
         .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let s = p.poll().await.unwrap();
 
         // `erroredFiles` and `outOfSpace` are only in vfs/stats, and the byte total is
@@ -417,7 +508,7 @@ mod tests {
             ],
         )
         .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let s = p.poll().await.expect("a missing command is not a fault");
 
         // Not asking `vfs/stats` yields no cache, exactly as a cacheless mount does. Only
@@ -455,7 +546,7 @@ mod tests {
             ],
         )
         .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let s = p.poll().await.expect("a missing command is not a fault");
 
         assert_eq!(s.fidelity, Some(Tier::T3));
@@ -475,7 +566,7 @@ mod tests {
         let client = RcClient::new(&missing);
 
         // `connect` degrades to no capabilities rather than erroring.
-        let mut p = MountPoller::connect("backup", client).await.unwrap();
+        let mut p = MountPoller::connect("backup", client).await;
         assert_eq!(p.tier(), Tier::T4);
 
         let s = p.poll().await.expect("an absent rclone is not a fault");
@@ -505,7 +596,7 @@ mod tests {
             ],
         )
         .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let busy = p.poll().await.unwrap();
         assert!(!busy.is_idle(), "the capture has a queued file");
         assert_eq!(MountPoller::interval(&busy), ACTIVE);
@@ -613,9 +704,7 @@ mod tests {
             let _ = stream.read(&mut buf).await;
         }
 
-        let mut p = MountPoller::connect("live", RcClient::new(&socket))
-            .await
-            .expect("a live rclone answers rc/list");
+        let mut p = MountPoller::connect("live", RcClient::new(&socket)).await;
         assert!(
             matches!(p.tier(), Tier::T1 | Tier::T2),
             "rclone 1.75 registers core/stats and vfs/queue, got {:?}",
@@ -707,7 +796,7 @@ mod tests {
             ],
         )
         .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let first = p.poll().await.unwrap();
         assert_eq!(
             first.rate_bytes_per_sec, None,
@@ -730,20 +819,18 @@ mod tests {
         // confident zero. Verified against real rclone v1.75.0. This is also the one
         // configuration where an interrupted write is genuinely lost, since nothing on
         // disk is holding it.
+        // `vfs/stats` is deliberately not registered here. The absent `queue` key is the
+        // signal on its own; leaning on the absent `diskCache` would leave the safety
+        // property resting on a second endpoint that a build need not provide.
         let fake = FakeRc::new(
             "cacheoff",
             vec![
-                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("rc/list", rc_list(&["rc/list", "vfs/queue"])),
                 ("vfs/queue", "{}".to_string()),
-                // No `diskCache` key, exactly as rclone reports with cache mode off.
-                (
-                    "vfs/stats",
-                    r#"{"fs":"/src","inUse":1,"metadataCache":{"dirs":1,"files":0}}"#.to_string(),
-                ),
             ],
         )
         .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let s = p.poll().await.expect("this is not a fault");
 
         assert!(
@@ -794,7 +881,7 @@ mod tests {
         )
         .await;
 
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let first = p.poll().await.unwrap();
         assert!(first.has_progress, "core/stats reached the state");
         assert_eq!(
@@ -827,9 +914,7 @@ mod tests {
         let socket = dir.join("rc.sock");
 
         // Nothing listening yet.
-        let mut p = MountPoller::connect("backup", RcClient::new(&socket))
-            .await
-            .expect("an absent rclone is not a fault");
+        let mut p = MountPoller::connect("backup", RcClient::new(&socket)).await;
         let before = p.poll().await.unwrap();
         assert!(!before.outstanding_known, "nothing to see yet");
 
@@ -872,7 +957,7 @@ mod tests {
             ],
         )
         .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await.unwrap();
+        let mut p = MountPoller::connect("backup", fake.client()).await;
         let before = p.poll().await.unwrap();
         assert!(before.outstanding_known && !before.is_idle());
 

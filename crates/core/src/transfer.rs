@@ -32,27 +32,34 @@ pub struct TransferFile {
 /// What is outstanding for one mount.
 ///
 /// Built through the per-tier constructors rather than by struct literal, so a tier
-/// cannot populate a field it has no data for. `#[non_exhaustive]` enforces that from
-/// outside the crate; the constructors are the only way in from inside it.
+/// cannot populate a field it has no data for.
+///
+/// `#[non_exhaustive]` only blocks *construction* by literal from outside the crate. The
+/// fields are `pub`, so it does not stop a caller assigning to one afterwards, and the
+/// combinations below are a convention the constructors keep rather than a guarantee the
+/// type makes. Code that rebuilds a state from the wire — #40 — has to re-establish them
+/// deliberately; `fidelity: None` with `outstanding_known: true` is nonsense the compiler
+/// will not catch.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct TransferState {
     pub mount: String,
-    /// Which source produced the *outstanding total*, and therefore what may be claimed
-    /// about it. Deliberately not "the richest endpoint this rclone has": per-file
-    /// progress is an enrichment on top, reported by [`Self::has_progress`], and folding
-    /// the two together would label a `vfs/queue` total with a tier that cannot answer
-    /// what the total is for.
+    /// Which source produced the *outstanding total*, not "the richest endpoint this
+    /// rclone has". Per-file progress is an enrichment on top, reported separately by
+    /// [`Self::has_progress`].
     ///
-    /// `None` when no source produced a total. Naming a tier there would let a caller ask
-    /// [`Tier::meets_the_bar`] and be told yes about figures nothing stands behind.
+    /// `None` when no source produced a total, so that a caller asking
+    /// [`Tier::meets_the_bar`] cannot be told yes about figures nothing stands behind.
     pub fidelity: Option<Tier>,
-    /// Whether the figures below reflect reality at all.
+    /// Whether the figures below are the whole story.
     ///
-    /// False when rclone could not be reached, and when the mount has no write-back cache
-    /// to observe — a `--vfs-cache-mode off` mount streams writes straight to the remote,
-    /// where nothing can see them. Zero outstanding then means "we cannot tell", not
-    /// "nothing to send", and the difference decides whether unmounting is safe.
+    /// False when rclone could not be reached; when the mount has no write-back cache at
+    /// all, because a `--vfs-cache-mode off` mount streams writes straight to the remote
+    /// where nothing can see them; and when only *some* writes reach the queue, which is
+    /// `minimal` — there the entries present are real but a write-only open bypasses them.
+    ///
+    /// In every case a zero means "we cannot tell", not "nothing to send", and the
+    /// difference decides whether unmounting is safe.
     pub outstanding_known: bool,
     /// Whether any file carries byte progress. Only `core/stats` supplies it.
     pub has_progress: bool,
@@ -95,9 +102,9 @@ impl TransferState {
     pub fn from_queue(mount: &str, queue: &VfsQueue) -> Self {
         let mut s = Self::empty(mount, Some(Tier::T2));
         s.pending = queue.pending();
-        s.uploading = Some(queue.queue.iter().filter(|i| i.uploading).count() as u64);
+        s.uploading = Some(queue.items().iter().filter(|i| i.uploading).count() as u64);
         s.files = queue
-            .queue
+            .items()
             .iter()
             .map(|i| TransferFile {
                 name: i.name.clone(),
@@ -150,11 +157,11 @@ impl TransferState {
     /// A mount whose outstanding work cannot be observed at all.
     ///
     /// Two causes, both of which must read as "unknown" rather than "nothing": rclone is
-    /// unreachable, or the mount has no write-back cache because its cache mode is `off`
-    /// (or `minimal` for write-only opens). In the second case writes stream straight to
-    /// the remote, so there is genuinely nothing on disk holding them — the one situation
-    /// where an interrupted write really is lost, and the one where reporting "idle" is
-    /// most harmful.
+    /// unreachable, or the mount's cache mode is `off`. In the second case writes stream
+    /// straight to the remote, so there is genuinely nothing on disk holding them — the
+    /// one situation where an interrupted write really is lost, and the one where
+    /// reporting "idle" is most harmful. A `minimal` mount, whose queue is real but
+    /// incomplete, is [`Self::partially_observed`] instead.
     pub fn unmonitored(mount: &str, reason: impl Into<String>) -> Self {
         let mut s = Self::empty(mount, None);
         s.outstanding_known = false;
@@ -178,11 +185,7 @@ impl TransferState {
                 any |= f.bytes_sent.is_some();
             }
         }
-        // `fidelity` stays T2: the queue produced the total, and the queue is what can
-        // answer whether unmounting is safe. Promoting to T1 here would relabel an exact
-        // total with the one tier that cannot vouch for it, and would claim per-file
-        // progress for the whole `--vfs-write-back` window, during which `transferring[]`
-        // is empty and no file has any.
+        // `fidelity` deliberately stays T2: the queue produced the total.
         self.has_progress = any;
         self
     }
@@ -194,6 +197,18 @@ impl TransferState {
     pub fn with_cache_health(mut self, cache: &DiskCache) -> Self {
         self.errored_files = cache.errored_files;
         self.out_of_space = cache.out_of_space;
+        self
+    }
+
+    /// Keep what was observed, but stop it being read as exhaustive.
+    ///
+    /// For a `minimal` mount: a read-write open goes through the write-back cache and
+    /// appears in the queue, while a write-only open of an uncached file streams straight
+    /// past it. The entries are real and worth showing; an empty queue still cannot be
+    /// read as "nothing outstanding", which is the reading that gets a file truncated.
+    pub fn partially_observed(mut self, reason: impl Into<String>) -> Self {
+        self.outstanding_known = false;
+        self.degraded_reason = Some(reason.into());
         self
     }
 
@@ -209,12 +224,23 @@ impl TransferState {
         self
     }
 
-    /// Whether anything is outstanding.
+    /// Whether nothing is outstanding, and that is known rather than assumed.
     ///
-    /// False when the answer is unknown: a mount we cannot observe is not an idle one,
-    /// and this is what an unmount check and the poll cadence both read.
+    /// False when the answer is unknown: a mount we cannot observe is not an idle one.
+    /// [`Self::safe_to_unmount`] is the name to reach for when that is the question.
     pub fn is_idle(&self) -> bool {
         self.outstanding_known && self.pending.files == 0
+    }
+
+    /// Whether it is safe to unmount now.
+    ///
+    /// The single answer to that question. [`Tier::meets_the_bar`] asks only whether a
+    /// byte *total* can be trusted, and the two disagree: a T3 reading has no byte total
+    /// yet its counts answer this perfectly well, while an unobserved mount has no counts
+    /// worth anything at any tier. Reading the tier predicate here would refuse to ever
+    /// offer unmount on a `vfs/stats`-only build.
+    pub fn safe_to_unmount(&self) -> bool {
+        self.is_idle()
     }
 
     /// Whether the outstanding *byte* total means anything. `vfs/stats` reports counts
@@ -380,7 +406,7 @@ mod tests {
         // Two entries, captured from a live rclone, because with one the "everything
         // else stays unmeasured" assertion never executes and the join key is unguarded.
         let q = queue_fixture("vfs-queue-two-items.json");
-        assert!(q.queue.len() >= 2, "this test needs a multi-item queue");
+        assert!(q.items().len() >= 2, "this test needs a multi-item queue");
         let s = TransferState::from_queue("backup", &q);
         let known = s.files[0].name.clone();
         let other = s.files[1].name.clone();

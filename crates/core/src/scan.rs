@@ -27,12 +27,9 @@ use std::path::Path;
 /// OOM this process.
 const MAX_DESCRIPTOR: u64 = 64 * 1024;
 
-/// How many entries a single scan will look at before giving up. Reported as
-/// [`CacheScan::truncated`].
-///
-/// A cache holding a media library runs to hundreds of thousands of files, and a scan is
-/// on the path that answers "can I unmount". Stopping and saying so beats an unbounded
-/// walk that blocks for seconds.
+/// How many entries a single scan will look at before giving up, reported as
+/// [`CacheScan::truncated`]. See DESIGN.md for why a bounded walk is preferred to an
+/// unbounded one here.
 const MAX_ENTRIES: usize = 50_000;
 
 /// One file the cache is holding that has not reached the remote.
@@ -127,9 +124,8 @@ pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
                 }
                 return Err(e);
             }
-            // Counted, never skipped: a non-empty directory that goes missing was
-            // renamed, and its dirty items went with it. Passing over one silently turns
-            // an arbitrarily large subtree into a confident zero.
+            // Counted, never skipped: a directory that goes missing was renamed, and
+            // its dirty items went with it.
             Err(_) => {
                 out.unreadable += 1;
                 continue;

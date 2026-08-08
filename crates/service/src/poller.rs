@@ -386,10 +386,12 @@ impl MountPoller {
         let Some(cache) = stats.disk_cache else {
             return Ok(CacheProbe::Absent);
         };
-        if !cache.path.is_empty() {
+        // Together or not at all. Latched separately, a response carrying one and not the
+        // other pairs a fresh root with a stale one — and a stale metadata tree that still
+        // exists and is empty reads as "nothing outstanding" for a cache that has a
+        // backlog. rclone sets both whenever `diskCache` is present, so this costs nothing.
+        if !cache.path.is_empty() && !cache.path_meta.is_empty() {
             self.cache_path = Some(cache.path.clone());
-        }
-        if !cache.path_meta.is_empty() {
             self.meta_path = Some(cache.path_meta.clone());
         }
         Ok(CacheProbe::Present(cache, self.mode))
@@ -1545,6 +1547,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_two_cache_roots_are_latched_together_or_not_at_all() {
+        // They name halves of one tree. Taking a fresh `path` while keeping a stale
+        // `pathMeta` scans one mount's descriptors against another's data files, so every
+        // size reads unknown — and had the staleness gone the other way, an empty old
+        // metadata tree would have reported a backlogged cache as idle. rclone sets both
+        // whenever `diskCache` is present, so this is a guard rather than a fix.
+        let old =
+            TempDir(std::env::temp_dir().join(format!("rvt-rootpair-a-{}", std::process::id())));
+        let new =
+            TempDir(std::env::temp_dir().join(format!("rvt-rootpair-b-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&old.0);
+        let _ = std::fs::remove_dir_all(&new.0);
+        dirty_entry(&old.0, "waiting.bin", 2048);
+        std::fs::create_dir_all(new.0.join("vfs")).unwrap();
+
+        let good = stats_pointing_at(&old.0.join("vfsMeta"), &old.0.join("vfs"));
+        // A response naming a data root but no metadata root.
+        let mut half: serde_json::Value = serde_json::from_str(&good).unwrap();
+        half["diskCache"]["path"] = serde_json::json!(new.0.join("vfs").to_string_lossy());
+        half["diskCache"]["pathMeta"] = serde_json::json!("");
+
+        let fake = FakeRc::new(
+            "rootpair",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", good),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let _ = p.poll().await;
+
+        fake.set("vfs/stats", half.to_string());
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
+        assert_eq!(after.pending.files, 1, "the backlog is still found");
+        assert_eq!(
+            after.pending.known_bytes, 2048,
+            "and measured, which needs the data root that matches the metadata root"
+        );
+    }
+
+    #[tokio::test]
     async fn a_fallback_that_could_not_read_everything_says_which_part_it_missed() {
         // Otherwise the state reads not-known with nothing in the text to explain it, and
         // the rc failure takes the blame for a cache that was only half read — sending the
@@ -1619,6 +1669,18 @@ mod tests {
         assert!(!after.is_idle());
         assert_eq!(after.pending.files, 0);
         assert_eq!(after.rate_bytes_per_sec, None);
-        assert!(after.degraded_reason.is_some());
+        // `from_scan` alone would give all of the above, so assert what this branch adds:
+        // no tier, because no scan of a cache happened, and a reason that says which of
+        // the two absences it was. Otherwise the user is told a scan returned zero.
+        assert_eq!(
+            after.fidelity, None,
+            "there was no cache to scan, so no tier produced this"
+        );
+        let why = after.degraded_reason.clone().expect("say why");
+        assert!(
+            why.contains("no longer on disk"),
+            "'read 0 pending files from the cache' would be a claim about a cache that \
+             is not there: {why}"
+        );
     }
 }

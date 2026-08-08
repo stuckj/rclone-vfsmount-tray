@@ -99,7 +99,20 @@ impl TransferState {
 
     /// From `vfs/queue` — the minimum bar. Per-file sizes and an in-flight flag, no
     /// per-file byte progress.
+    ///
+    /// [`Self::unmonitored`] when rclone reported no `queue` key at all, which is how a
+    /// VFS with no write-back cache answers. The decision belongs here rather than at the
+    /// call site: a `VfsQueue` whose key was absent is indistinguishable from an empty one
+    /// once it reaches this function, and reading it as empty yields an exact,
+    /// bar-meeting, safe-to-unmount zero for a mount whose writes nothing can see.
     pub fn from_queue(mount: &str, queue: &VfsQueue) -> Self {
+        if !queue.reported_queue() {
+            return Self::unmonitored(
+                mount,
+                "this mount has no write-back queue (--vfs-cache-mode off), so writes \
+                 stream straight to the remote and nothing outstanding can be observed",
+            );
+        }
         let mut s = Self::empty(mount, Some(Tier::T2));
         s.pending = queue.pending();
         s.uploading = Some(queue.items().iter().filter(|i| i.uploading).count() as u64);
@@ -180,7 +193,13 @@ impl TransferState {
         }
         let mut any = false;
         for f in &mut self.files {
-            if let Some(t) = transferring.iter().find(|t| t.name == f.name) {
+            // `has_accounting` matters as much as the name: `bytes` defaults to 0, so a
+            // transfer rclone has not yet attached accounting to would set `Some(0)` and
+            // draw a 0% bar for a file that is in fact part-way sent.
+            if let Some(t) = transferring
+                .iter()
+                .find(|t| t.name == f.name && t.has_accounting())
+            {
                 f.bytes_sent = u64::try_from(t.bytes).ok();
                 any |= f.bytes_sent.is_some();
             }
@@ -415,6 +434,7 @@ mod tests {
             name: known.clone(),
             size: 1_000,
             bytes: 400,
+            group: Some(crate::models::GLOBAL_STATS_GROUP.into()),
             ..Default::default()
         }];
         let lifted = s.with_progress(&transferring);
@@ -456,6 +476,7 @@ mod tests {
             name: "one.bin".into(),
             size: 262_144,
             bytes: 1_000,
+            group: Some(crate::models::GLOBAL_STATS_GROUP.into()),
             ..Default::default()
         }]);
 
@@ -480,6 +501,25 @@ mod tests {
     }
 
     #[test]
+    fn a_transfer_without_accounting_yet_is_not_progress() {
+        // rclone lists a transfer before attaching accounting to it: no `group`, and no
+        // `bytes` on the wire. `bytes` is `#[serde(default)]`, so it arrives as 0 —
+        // indistinguishable from "nothing sent yet" unless the group is checked. The file
+        // really is mid-flight, so a 0% bar there is a claim rather than a reading.
+        let t: Transfer = serde_json::from_str(r#"{"name":"one.bin","size":262144}"#).unwrap();
+        assert!(!t.has_accounting());
+        assert_eq!(t.bytes, 0);
+
+        let s = TransferState::from_queue("backup", &queue_fixture("vfs-queue-two-items.json"))
+            .with_progress(&[t]);
+        assert!(
+            !s.has_progress,
+            "0 bytes from an unaccounted transfer is not progress"
+        );
+        assert!(s.files.iter().all(|f| f.bytes_sent.is_none()));
+    }
+
+    #[test]
     fn progress_on_an_unsized_file_does_not_eat_into_the_known_total() {
         // rclone reports `-1` for a size it does not know, so that file contributes
         // nothing to `known_bytes`. Subtracting its progress from a total it was never
@@ -497,11 +537,13 @@ mod tests {
             Transfer {
                 name: "sized.bin".into(),
                 bytes: 400,
+                group: Some(crate::models::GLOBAL_STATS_GROUP.into()),
                 ..Default::default()
             },
             Transfer {
                 name: "unsized.bin".into(),
                 bytes: 300,
+                group: Some(crate::models::GLOBAL_STATS_GROUP.into()),
                 ..Default::default()
             },
         ]);
@@ -517,6 +559,7 @@ mod tests {
             name: "a.bin".into(),
             size: 10,
             bytes: 5,
+            group: Some(crate::models::GLOBAL_STATS_GROUP.into()),
             ..Default::default()
         }]);
         assert_eq!(lifted.fidelity, Some(Tier::T4));
@@ -600,6 +643,16 @@ mod tests {
         assert!(
             after_growth < rate,
             "a growing queue should decay the rate toward zero, not invert it: {after_growth}"
+        );
+
+        // The reported figure alone does not prove the clamp: dropping `saturating_sub`
+        // for a signed subtraction still reports 0 here, because `f64 as u64` saturates.
+        // What it leaves behind is a negative *smoothed* value, which only shows up on
+        // the next poll — 1000 bytes really moving must read as throughput, not a stall.
+        let recovered = r.sample_at(t0 + Duration::from_secs(5), 4_000).unwrap();
+        assert!(
+            recovered > 0,
+            "a real transfer after a queue grew must not read as stalled: {recovered}"
         );
     }
 

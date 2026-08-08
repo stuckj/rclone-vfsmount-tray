@@ -8,6 +8,7 @@
 //! *dropped* must match `ignored`. Swaps between same-typed fields need value
 //! assertions; the key set cannot see them.
 
+use rvt_core::config::CacheMode;
 use rvt_core::models::*;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -278,6 +279,21 @@ const VFS_STATS_SPEC: FixtureSpec<'static> = FixtureSpec {
     opaque: &["opt"],
 };
 
+/// A VFS with no write-back cache: `diskCache` is absent, everything else is as usual.
+const VFS_STATS_CACHELESS_SPEC: FixtureSpec<'static> = FixtureSpec {
+    keys: &[
+        "fs",
+        "inUse",
+        "metadataCache",
+        "metadataCache.dirs",
+        "metadataCache.files",
+        "opt",
+    ],
+    optional: &[],
+    ignored: &[],
+    opaque: &["opt"],
+};
+
 const VFS_QUEUE_SPEC: FixtureSpec<'static> = FixtureSpec {
     keys: &[
         "queue",
@@ -289,6 +305,14 @@ const VFS_QUEUE_SPEC: FixtureSpec<'static> = FixtureSpec {
         "queue.[].tries",
         "queue.[].uploading",
     ],
+    optional: &[],
+    ignored: &[],
+    opaque: &[],
+};
+
+/// A VFS with no write-back cache answers `{}` — no `queue` key, not an empty list.
+const VFS_QUEUE_CACHELESS_SPEC: FixtureSpec<'static> = FixtureSpec {
+    keys: &[],
     optional: &[],
     ignored: &[],
     opaque: &[],
@@ -390,6 +414,54 @@ fn a_multi_item_queue_carries_a_distinct_entry_per_file() {
         q.items().iter().all(|i| !i.uploading),
         "captured before upload"
     );
+}
+
+/// The three cache modes, each captured from its own live rclone v1.75.0 FUSE mount.
+///
+/// Two facts the unmount-safety decision rests on, and neither is inferable from the
+/// others. `off` answers `vfs/queue` with `{}` — no key — while `minimal` and `writes`
+/// both answer `{"queue":[]}` and both carry a `diskCache`, so the *only* thing that
+/// separates a mount whose queue is the whole story from one where writes stream past it
+/// is `opt.CacheMode`.
+///
+/// `opt` is opaque to the key-set machinery, so a rename or a re-encode of `CacheMode`
+/// would go unnoticed there. This reads it through the accessor instead.
+#[test]
+fn each_cache_mode_reports_itself_and_its_queue_differently() {
+    let cacheless: VfsStats = parse_fixture("vfs-stats-cacheless.json", &VFS_STATS_CACHELESS_SPEC);
+    let minimal: VfsStats = vfs_stats("vfs-stats-minimal.json");
+    let writes: VfsStats = vfs_stats("vfs-stats-upload-in-progress.json");
+
+    assert_eq!(cacheless.cache_mode(), Some(CacheMode::Off));
+    assert_eq!(minimal.cache_mode(), Some(CacheMode::Minimal));
+    assert_eq!(writes.cache_mode(), Some(CacheMode::Writes));
+
+    // Only `off` lacks a cache. `minimal` has one, which is exactly why its queue cannot
+    // be told from a `writes` queue without the mode above.
+    assert!(cacheless.disk_cache.is_none());
+    assert!(minimal.disk_cache.is_some());
+    assert!(writes.disk_cache.is_some());
+
+    // And only `off` omits the queue key.
+    let q: VfsQueue = parse_fixture("vfs-queue-cacheless.json", &VFS_QUEUE_CACHELESS_SPEC);
+    assert!(
+        !q.reported_queue(),
+        "a cacheless VFS reports no queue at all; reading it as empty is a false idle"
+    );
+    assert!(q.items().is_empty());
+    assert!(
+        vfs_queue("vfs-queue-uploading.json").reported_queue(),
+        "a cached VFS does report one"
+    );
+}
+
+/// Only `minimal` and `writes` can be confused, and only the mode tells them apart.
+#[test]
+fn only_the_modes_that_queue_every_write_may_be_trusted_on_an_empty_queue() {
+    assert!(!CacheMode::Off.all_writes_queued());
+    assert!(!CacheMode::Minimal.all_writes_queued());
+    assert!(CacheMode::Writes.all_writes_queued());
+    assert!(CacheMode::Full.all_writes_queued());
 }
 
 /// A file rclone has failed to upload several times, captured from a live rclone v1.75.0
@@ -533,11 +605,14 @@ const PINNED_FIXTURES: &[&str] = &[
     "core-version.json",
     "rc-list-v1.75.0.json",
     "vfs-list.json",
+    "vfs-queue-cacheless.json",
     "vfs-queue-queued-not-uploading.json",
     "vfs-queue-retrying.json",
     "vfs-queue-two-items.json",
     "vfs-queue-uploading.json",
+    "vfs-stats-cacheless.json",
     "vfs-stats-idle.json",
+    "vfs-stats-minimal.json",
     "vfs-stats-upload-in-progress.json",
     "vfsmeta-item-dirty.json",
 ];

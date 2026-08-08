@@ -99,15 +99,8 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     }
 
     /// The rc socket for a mount.
-    ///
-    /// Configured names cannot contain `/` — `Config::validate` rejects them — but a
-    /// foreign mount is named by its absolute mount point, and `Path::join` given an
-    /// absolute argument discards the base. `/srv/media` would otherwise resolve to
-    /// `/srv/media.sock`, sending the service looking for an rc socket anywhere on the
-    /// filesystem. The result stays inside the runtime directory whatever it is given.
     pub fn socket_path(&self, name: &str) -> PathBuf {
-        self.runtime_dir
-            .join(format!("{}.sock", name.replace('/', "_")))
+        rc_socket_path(&self.runtime_dir, name)
     }
 
     /// The `ExecStartPre` that clears leftovers before rclone is exec'd.
@@ -648,6 +641,17 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
     }
 }
 
+/// Where a mount's rc socket lives.
+///
+/// The one place this is computed, because two of them drifting is how the sanitisation
+/// below gets applied to only one. Configured names cannot contain `/` —
+/// `Config::validate` rejects them — but a foreign mount is named by its absolute mount
+/// point, and `Path::join` given an absolute argument discards the base: `/srv/media`
+/// would otherwise resolve to `/srv/media.sock`, anywhere on the filesystem.
+fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
+    runtime_dir.join(format!("{}.sock", name.replace('/', "_")))
+}
+
 /// Clear what a hard-killed rclone leaves behind, so a start can succeed.
 ///
 /// Runs from `ExecStartPre`, so it covers systemd's automatic restarts. Talks to nothing
@@ -666,7 +670,7 @@ pub async fn prepare_for_start(
         .find(|m| m.name == name)
         .ok_or_else(|| SupervisorError::UnknownMount(name.to_string()))?;
 
-    let socket = runtime_dir.join(format!("{name}.sock"));
+    let socket = rc_socket_path(runtime_dir, name);
     if socket.exists() {
         let _ = std::fs::remove_file(&socket);
     }

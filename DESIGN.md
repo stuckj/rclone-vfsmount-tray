@@ -270,10 +270,10 @@ in #38.
 - ⏱ `transferring[]` lags `vfs/queue` by `--vfs-write-back`. That window is "queued", not "0%".
 - `vfs/stats` `diskCache.bytesUsed` read **0** throughout a 128 MiB upload. It is not pending
   bytes and not reliably cache size either. Do not show it.
-### One limit that is not from #9
+### Writes that never enter the write-back cache
 
-Read from rclone's source rather than measured, and not covered by a test. Recorded here because it changes what the applet may claim, and flagged
-as unverified so nobody treats it as established.
+Measured against rclone v1.75.0 on live FUSE mounts (#21), having previously been read from
+rclone's source and recorded here as unverified. Every claim below held.
 
 Not every write through a mount enters the write-back cache:
 
@@ -281,15 +281,39 @@ Not every write through a mount enters the write-back cache:
 - Under `minimal`, only *write-only* opens stream. Read-write opens, and any file already in
   the cache, go through it normally and are fully visible to T2/T3/T4.
 
-A streamed write is **visible but unattributable**: `Rcat` accounts the transfer, so it does
-appear in `core/stats` `transferring[]` with `name`, `dstFs`, `group` and byte progress — but
-`size` is `-1` and there is **no `srcFs`**, which is the field that ties a transfer to a
-mount's cache. So it cannot be attributed to a mount, and `vfs/queue` never knows about it.
+A streamed write is **visible but unattributable**. Eight seconds into a 20 MB write on a
+`minimal` mount: `vfs/queue` was `[]`, every `diskCache` counter was `0`, and the transfer
+appeared in `core/stats` `transferring[]` with `name`, `dstFs`, `group` and byte progress —
+but `size: -1` and **no `srcFs`**, which is the field that ties a transfer to a mount's
+cache. So it cannot be attributed to a mount, and `vfs/queue` never knows about it.
 
-The consequence for the UI: on a mount configured `off` (or `minimal` with write-only
-opens), "nothing pending" does not mean "nothing in flight". The applet should say the mount
-is unmonitored rather than imply it is idle — and the T1 data is rich enough to show the
-transfer, just not to attribute it, so an "unattributed transfers" line is implementable.
+What distinguishes the three modes over rc:
+
+| `--vfs-cache-mode` | `opt.CacheMode` | `vfs/queue` | `diskCache` | the queue is |
+|---|---|---|---|---|
+| `off` | 0 | `{}` — **no key** | absent | nothing |
+| `minimal` | 1 | `{"queue":[]}` | present | a **floor** |
+| `writes` / `full` | 2 / 3 | `{"queue":[…]}` | present | the whole story |
+
+`minimal` builds a cache *and* a queue, so it is identical to `writes` at every endpoint
+except `opt.CacheMode`. That ordinal is therefore load-bearing, and code reading it must
+fail **closed**: a mode it cannot parse has to be treated as "writes may be streaming",
+never as "all writes are queued".
+
+The consequence for the UI: on a mount configured `off` or `minimal`, "nothing pending" does
+not mean "nothing in flight". The applet says the mount is unmonitored (`off`) or partially
+observed (`minimal`) rather than implying it is idle — and the T1 data is rich enough to show
+the transfer, just not to attribute it, so an "unattributed transfers" line is implementable.
+
+### Two field names that mean less than they say
+
+Also measured against rclone v1.75.0 (#21), and pinned by `testdata/vfs-queue-retrying.json`:
+
+- **`tries` counts attempts, not failures.** It increments when an attempt *starts*, so a
+  healthy in-flight upload reports `tries: 1`. Only a value above 1 is evidence of failure.
+- **`erroredFiles` stays 0 while a file is failing.** A file refused on every attempt for
+  four minutes, backing off to a 64 s delay and reaching `tries: 7`, left
+  `diskCache.erroredFiles` at 0 throughout. `tries` is the only signal that a file is stuck.
 
 ## Security
 

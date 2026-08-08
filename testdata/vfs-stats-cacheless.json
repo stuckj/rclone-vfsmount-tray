@@ -1,0 +1,43 @@
+{
+  "fs": ":local:/home/claude/.claude/jobs/f70669bc/tmp/capfix/off/remote",
+  "inUse": 1,
+  "metadataCache": {
+    "dirs": 1,
+    "files": 0
+  },
+  "opt": {
+    "BlockNormDupes": false,
+    "CacheMaxAge": 3600000000000,
+    "CacheMaxSize": -1,
+    "CacheMinFreeSpace": -1,
+    "CacheMode": 0,
+    "CachePollInterval": 60000000000,
+    "CaseInsensitive": false,
+    "ChunkSize": 134217728,
+    "ChunkSizeLimit": -1,
+    "ChunkStreams": 0,
+    "DirCacheTime": 300000000000,
+    "DirPerms": 2147484157,
+    "DiskSpaceTotalSize": -1,
+    "FastFingerprint": false,
+    "FilePerms": 436,
+    "GID": 1001,
+    "HandleCaching": 5000000000,
+    "LinkPerms": 134218164,
+    "Links": false,
+    "MetadataExtension": "",
+    "NoChecksum": false,
+    "NoModTime": false,
+    "NoSeek": false,
+    "PollInterval": 60000000000,
+    "ReadAhead": 0,
+    "ReadOnly": false,
+    "ReadWait": 20000000,
+    "Refresh": false,
+    "UID": 1001,
+    "Umask": 2,
+    "UsedIsSize": false,
+    "WriteBack": 5000000000,
+    "WriteWait": 1000000000
+  }
+}

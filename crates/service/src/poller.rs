@@ -116,16 +116,10 @@ impl MountPoller {
         };
 
         let mut state = match self.fetch_queue().await {
-            // rclone answers a cacheless VFS with `{}` and HTTP 200, so the *absence* of
-            // the key — not an empty list — is what says there is no queue to read. This
-            // is the one signal that does not depend on `vfs/stats` being registered.
-            Ok(queue) if !queue.reported_queue() => {
-                return Ok(TransferState::unmonitored(
-                    &self.name,
-                    "this mount has no write-back queue (--vfs-cache-mode off), so writes \
-                     stream straight to the remote and nothing outstanding can be observed",
-                ))
-            }
+            // A cacheless VFS answers `{}` with HTTP 200, so the *absence* of the key —
+            // not an empty list — is what says there is no queue. `from_queue` makes that
+            // call and returns an unmonitored state; this is the one signal that does not
+            // depend on `vfs/stats` being registered too.
             Ok(queue) => TransferState::from_queue(&self.name, &queue),
             Err(e) if e.is_unreachable() => {
                 self.rate.reset();
@@ -152,19 +146,36 @@ impl MountPoller {
             Err(e) => return Err(e),
         };
 
+        // A queue that reported nothing to report is already fully described, and the
+        // enrichment below would only overwrite the reason it carries.
+        if !state.outstanding_known {
+            self.rate.reset();
+            return Ok(state);
+        }
+
         match &cache {
             CacheProbe::Present(c, mode) => {
                 state = state.with_cache_health(c);
                 // `minimal` builds a cache and a queue, so nothing above this point can
                 // tell it from `writes` — but a write-only open of an uncached file
-                // streams past both. Its queue is a floor, and an empty one is not proof
-                // the mount is idle. Only a mode rclone actually named is trusted here;
-                // an unrecognised one must not be read as "all writes are queued".
-                if mode.is_some_and(|m| !m.all_writes_queued()) {
-                    state = state.partially_observed(
-                        "this mount's cache mode is minimal, so a file opened write-only \
-                         streams straight to the remote without entering the queue",
-                    );
+                // streams past both, leaving its queue a floor rather than a total.
+                //
+                // Written to fail closed. An unrecognised mode reaches the same branch as
+                // `minimal`: rclone renaming `opt.CacheMode` or encoding it as a string
+                // would otherwise silently restore "an empty queue means idle" on every
+                // mount, which is the claim that gets a file truncated.
+                if !mode.is_some_and(CacheMode::all_writes_queued) {
+                    state = state.partially_observed(match mode {
+                        Some(_) => {
+                            "this mount's cache mode is minimal, so a file opened \
+                             write-only streams straight to the remote without entering \
+                             the queue"
+                        }
+                        None => {
+                            "this rclone did not report a recognised cache mode, so \
+                             whether every write reaches the queue is unknown"
+                        }
+                    });
                 }
             }
             // Reached only on a build with no `vfs/queue`; the absent queue key above
@@ -176,13 +187,14 @@ impl MountPoller {
                      stream straight to the remote and nothing outstanding can be observed",
                 ))
             }
-            // The queue answered, so what is outstanding is known; only the two health
-            // flags and the cache path are missing. Downgrading to unmonitored here would
-            // discard a working answer over an enrichment that never arrived.
+            // The queue answered, so its entries are real; only the health flags, the
+            // cache path and the cache *mode* are missing. Discarding the entries would
+            // throw away a working answer, but without the mode this cannot be told from
+            // a `minimal` mount either — so the entries stand as a floor, same as one.
             CacheProbe::NotAsked => {
-                state = state.degraded(
-                    "this rclone registers no vfs/stats, so cache errors and a full cache \
-                     cannot be reported",
+                state = state.partially_observed(
+                    "this rclone registers no vfs/stats, so cache errors, a full cache \
+                     and whether every write reaches the queue cannot be reported",
                 )
             }
         }
@@ -451,6 +463,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cache_mode_rclone_did_not_name_is_not_assumed_safe() {
+        // `opt.CacheMode` is an untyped ordinal in a block rclone reshapes between
+        // releases. Giving `vfs.CacheMode` a `MarshalJSON` — it already has a `String()` —
+        // would turn it into `"minimal"`, and every mount would parse as mode-unknown. If
+        // unknown were read as "all writes are queued", that one upstream change would
+        // silently restore the truncation bug on every minimal mount at once.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
+        v["opt"]["CacheMode"] = serde_json::json!("minimal");
+
+        let fake = FakeRc::new(
+            "unknownmode",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", v.to_string()),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await.unwrap();
+
+        assert!(
+            !s.outstanding_known,
+            "an unparseable cache mode must fail closed, not open"
+        );
+        assert!(!s.is_idle());
+        assert!(s.degraded_reason.is_some());
+    }
+
+    #[tokio::test]
     async fn a_writes_cache_mode_mount_is_still_trusted() {
         // The other side of the check above: `writes` queues every write, so an empty
         // queue there really does mean idle. Without this, "never trust the queue" would
@@ -512,27 +555,21 @@ mod tests {
         let s = p.poll().await.expect("a missing command is not a fault");
 
         // Not asking `vfs/stats` yields no cache, exactly as a cacheless mount does. Only
-        // the second is grounds for reporting the mount unobservable; treating them alike
-        // throws away a queue that answered in full.
-        assert!(
-            s.outstanding_known,
-            "the queue answered, so what is outstanding is known"
-        );
+        // the second is grounds for discarding the queue, and treating them alike throws
+        // away an answer that arrived in full.
         assert_eq!(s.fidelity, Some(Tier::T2));
-        assert_eq!(s.pending.files, 2);
+        assert_eq!(s.pending.files, 2, "the queue's entries survived");
         assert_eq!(s.pending.known_bytes, 393_216);
+        assert_eq!(s.files.len(), 2);
+        // They are a floor rather than a total, though: without `vfs/stats` there is no
+        // cache mode either, so this cannot be told from a `minimal` mount.
+        assert!(!s.outstanding_known);
         assert!(
             s.degraded_reason
                 .as_deref()
                 .is_some_and(|r| r.contains("vfs/stats")),
-            "the missing health flags are still worth saying, got {:?}",
+            "the reason must name the endpoint that is missing, got {:?}",
             s.degraded_reason
-        );
-        assert!(
-            !s.degraded_reason
-                .as_deref()
-                .is_some_and(|r| r.contains("cache-mode")),
-            "the cache mode is not what is wrong here"
         );
     }
 
@@ -601,12 +638,21 @@ mod tests {
         assert!(!busy.is_idle(), "the capture has a queued file");
         assert_eq!(MountPoller::interval(&busy), ACTIVE);
 
-        let empty = TransferState::from_queue("backup", &VfsQueue::default());
+        // An empty queue rclone actually reported. `VfsQueue::default()` is not that: its
+        // key is absent, which is how a cacheless VFS answers and is not idle at all.
+        let reported_empty: VfsQueue = serde_json::from_str(r#"{"queue":[]}"#).unwrap();
+        let empty = TransferState::from_queue("backup", &reported_empty);
         assert!(empty.is_idle());
         assert_eq!(
             MountPoller::interval(&empty),
             IDLE,
             "an idle mount must not be polled every second"
+        );
+
+        let unreported = TransferState::from_queue("backup", &VfsQueue::default());
+        assert!(
+            !unreported.is_idle(),
+            "no queue key means no queue, which is the opposite of an empty one"
         );
     }
 

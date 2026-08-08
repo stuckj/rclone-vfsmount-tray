@@ -88,9 +88,6 @@ impl MountPoller {
     /// A disk-derived (T4) state is always the slow cadence however much it found: each
     /// poll behind it is a full walk of the metadata tree.
     pub fn interval(state: &TransferState) -> Duration {
-        // A disk-derived state is never the fast case. The walk behind it costs a full
-        // read of the metadata tree — DESIGN.md measures ~0.7s over 50k descriptors — and
-        // re-deriving that every second is the shape that document says not to use.
         if state.fidelity == Some(Tier::T4) {
             return IDLE;
         }
@@ -381,10 +378,11 @@ impl MountPoller {
             Err(RcError::Failed { status: 404, .. }) => return Ok(CacheProbe::NotAsked),
             Err(e) => return Err(e),
         };
-        let mode = stats.cache_mode();
-        if mode.is_some() {
-            self.mode = mode;
-        }
+        // Unconditional. Every path where rclone did not answer returns before this, so
+        // the latch still survives an unreachable poll — but a `vfs/stats` that *did*
+        // answer with a mode this build does not recognise must clear it, or the disk
+        // fallback keeps using the old one and trusts a write path it can no longer read.
+        self.mode = stats.cache_mode();
         let Some(cache) = stats.disk_cache else {
             return Ok(CacheProbe::Absent);
         };
@@ -394,7 +392,7 @@ impl MountPoller {
         if !cache.path_meta.is_empty() {
             self.meta_path = Some(cache.path_meta.clone());
         }
-        Ok(CacheProbe::Present(cache, mode))
+        Ok(CacheProbe::Present(cache, self.mode))
     }
 
     async fn fetch_queue(&self) -> Result<VfsQueue, RcError> {
@@ -1450,6 +1448,12 @@ mod tests {
             "an empty cache on a minimal mount says nothing about a streaming write"
         );
         assert!(!after.outstanding_known);
+        let why = after.degraded_reason.clone().expect("say why");
+        assert!(
+            why.contains("does not put every write through the cache"),
+            "the mode was reported and is known to stream, which is a different thing to \
+             say than 'unknown': {why}"
+        );
     }
 
     #[tokio::test]
@@ -1488,6 +1492,56 @@ mod tests {
             after.degraded_reason
         );
         assert_eq!(after.fidelity, Some(Tier::T4));
+    }
+
+    #[tokio::test]
+    async fn a_cache_mode_that_stops_being_recognised_clears_the_latched_one() {
+        // The latch exists so the disk fallback still knows the mode once rclone is gone.
+        // But `vfs/stats` answering with a mode this build cannot read is not the same as
+        // it not answering: keeping the previous value there has the fallback trust a
+        // write path it can no longer see, undoing the fail-closed default on the live
+        // path. The replacement-on-the-same-socket case is one the poller already handles
+        // elsewhere, so it is not hypothetical.
+        let cache =
+            TempDir(std::env::temp_dir().join(format!("rvt-modelatch-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&cache.0);
+        std::fs::create_dir_all(cache.0.join("vfsMeta")).unwrap();
+        std::fs::create_dir_all(cache.0.join("vfs")).unwrap();
+
+        let good = stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs"));
+        let mut odd: serde_json::Value = serde_json::from_str(&good).unwrap();
+        odd["opt"]["CacheMode"] = serde_json::json!(9);
+
+        let fake = FakeRc::new(
+            "modelatch",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", good),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        assert!(p.poll().await.safe_to_unmount(), "a writes mount, latched");
+
+        // Same socket, a build whose cache mode this one cannot read.
+        fake.set("vfs/stats", odd.to_string());
+        let live = p.poll().await;
+        assert!(!live.outstanding_known, "the live path fails closed on it");
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
+        assert!(
+            !after.safe_to_unmount(),
+            "and so must the fallback — the stale Writes would have said yes"
+        );
+        let why = after.degraded_reason.clone().expect("say why");
+        assert!(
+            why.contains("recognised cache mode"),
+            "an unknown mode is not the same claim as a known non-queueing one: {why}"
+        );
     }
 
     #[tokio::test]

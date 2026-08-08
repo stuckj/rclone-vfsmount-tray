@@ -79,9 +79,8 @@ pub struct CacheScan {
 impl CacheScan {
     /// Bytes known to be waiting, counting only files whose size could be measured.
     pub fn known_bytes(&self) -> u64 {
-        // Saturating, because the sizes come from a tree named by an rc response: enough
-        // sparse files with large apparent sizes overflow, which panics in debug and wraps
-        // to a small number in release — and a wrapped total is a confident wrong answer.
+        // Saturating: the sizes come from an untrusted tree, and a wrapped total is a
+        // confident wrong answer.
         self.files
             .iter()
             .filter_map(|f| f.bytes)
@@ -128,12 +127,9 @@ pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
                 }
                 return Err(e);
             }
-            // A subdirectory that cannot be listed is counted, never skipped. Eviction
-            // removes items — each already counted where it was listed — and then purges
-            // directories that are empty, which lose nothing. A *non-empty* one going
-            // missing means it was renamed, and every dirty item beneath it went with it,
-            // so passing over it silently turns an arbitrarily large subtree into a
-            // confident zero.
+            // Counted, never skipped: a non-empty directory that goes missing was
+            // renamed, and its dirty items went with it. Passing over one silently turns
+            // an arbitrarily large subtree into a confident zero.
             Err(_) => {
                 out.unreadable += 1;
                 continue;
@@ -426,6 +422,50 @@ mod tests {
     }
 
     #[test]
+    fn a_total_that_would_overflow_saturates_rather_than_wrapping() {
+        // The sizes come from a tree named by an rc response. Sparse files can report
+        // enormous apparent sizes, and a plain sum panics in debug — inside a poll — and
+        // wraps to a small number in release, which is a confident wrong total.
+        let s = CacheScan {
+            files: vec![
+                DirtyFile {
+                    name: "a".into(),
+                    bytes: Some(u64::MAX),
+                },
+                DirtyFile {
+                    name: "b".into(),
+                    bytes: Some(u64::MAX),
+                },
+            ],
+            unreadable: 0,
+            truncated: false,
+            root_present: true,
+        };
+        assert_eq!(s.known_bytes(), u64::MAX);
+    }
+
+    #[test]
+    fn a_data_file_that_is_a_symlink_is_not_measured_through_it() {
+        // The data root comes from the same untrusted response as the metadata root, so a
+        // size must not be read through a link out of the tree — that reports somebody
+        // else's file as this mount's backlog.
+        use std::os::unix::fs::symlink;
+        let t = Tree::new("datalink");
+        t.put("linked.bin", &closed(10), None);
+        let outside = t.0.join("elsewhere.bin");
+        std::fs::write(&outside, vec![b'x'; 4096]).unwrap();
+        std::fs::create_dir_all(t.data()).unwrap();
+        symlink(&outside, t.data().join("linked.bin")).unwrap();
+
+        let s = t.scan();
+        assert_eq!(s.files.len(), 1);
+        assert_eq!(
+            s.files[0].bytes, None,
+            "a symlinked data file is unmeasured, not 4096 bytes of someone else's data"
+        );
+    }
+
+    #[test]
     fn a_missing_data_file_leaves_the_size_unknown_rather_than_zero() {
         // The descriptor and the data file are written separately, so a walk can land
         // between them. Reporting 0 bytes would understate the total silently.
@@ -492,12 +532,15 @@ mod tests {
         let s = t.scan();
 
         assert!(s.truncated, "the walk stopped early and has to say so");
+        // Exactly the cap, not merely "at most": every entry in a flat all-dirty tree is
+        // one visit and one file, so a cap moved to any other value shows up here. Without
+        // this the test passes with the cap at 10.
+        assert_eq!(s.files.len(), MAX_ENTRIES);
         assert!(
             !s.is_complete(),
             "what it found is a floor, not a total — reporting it as one is the false \
              idle this tier exists to prevent"
         );
-        assert!(s.files.len() <= MAX_ENTRIES);
     }
 
     #[test]

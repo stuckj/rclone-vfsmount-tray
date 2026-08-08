@@ -89,7 +89,9 @@ impl Capabilities {
     ///
     /// An unreachable socket resolves to no commands and so to [`Tier::T4`], which is
     /// what the on-disk scan is for — though only for a mount that answered once, since
-    /// the cache roots the scan needs come from `vfs/stats`. The reason is kept: "not running" and "running but
+    /// the cache roots the scan needs come from `vfs/stats`.
+    ///
+    /// The reason is kept: "not running" and "running but
     /// refused" both land on T4, and only the second is a misconfiguration to report.
     pub async fn probe(client: &RcClient) -> Result<Self, RcError> {
         match client

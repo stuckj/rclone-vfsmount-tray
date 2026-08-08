@@ -357,8 +357,8 @@ read and refuses to call the result complete, so a walk that lost a race says so
 than voting "clean". What remains is the cost, which is why the walk runs only when rclone
 is unreachable, and at the idle cadence even then. Note "unreachable" also covers a timeout
 or a transport fault, which a live and busy rclone can produce — so this is a cheaper place
-to walk, not a guarantee that nothing is moving. Making it cheap enough to run continuously is what inotify
-is for, in the rest of #22.
+to walk, not a guarantee that nothing is moving. Making it cheap enough to run
+continuously is what inotify is for, in the rest of #22.
 
 **T4 is therefore strictly better than T2 for this one question**: the single place the
 ladder's ordering does not hold.

@@ -436,6 +436,20 @@ fn each_cache_mode_reports_itself_and_its_queue_differently() {
     assert_eq!(minimal.cache_mode(), Some(CacheMode::Minimal));
     assert_eq!(writes.cache_mode(), Some(CacheMode::Writes));
 
+    // An ordinal rclone has not defined yet must read as unknown, which the poller fails
+    // closed on. Defaulting instead would let a fifth cache mode — one whose writes do not
+    // all reach the queue — report as `writes` and be called safe to unmount. The sibling
+    // case, `CacheMode` arriving as a string, exits earlier at `as_u64` and is covered in
+    // the poller; this is the other half of the same rule.
+    let mut future = serde_json::to_value(&writes).unwrap();
+    future["opt"]["CacheMode"] = serde_json::json!(4);
+    let future: VfsStats = serde_json::from_value(future).unwrap();
+    assert_eq!(
+        future.cache_mode(),
+        None,
+        "an unrecognised mode is unknown, never a guess"
+    );
+
     // Only `off` lacks a cache. `minimal` has one, which is exactly why its queue cannot
     // be told from a `writes` queue without the mode above.
     assert!(cacheless.disk_cache.is_none());

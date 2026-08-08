@@ -282,7 +282,8 @@ Not every write through a mount enters the write-back cache:
   the cache, go through it normally — visible to T4 immediately, and to T2/T3 once closed.
 
 A streamed write is **visible but unattributable**. Eight seconds into a 20 MB write on a
-`minimal` mount: `vfs/queue` was `[]`, every `diskCache` counter was `0`, and the transfer
+`minimal` mount: `vfs/queue` was `[]`, every `diskCache` *upload* counter was `0` (`files`
+was 1, since the count tracks cache entries rather than pending work), and the transfer
 appeared in `core/stats` `transferring[]` with `name`, `dstFs`, `group` and byte progress —
 but `size: -1` and **no `srcFs`**, which is the field that ties a transfer to a mount's
 cache. So it cannot be attributed to a mount, and `vfs/queue` never knows about it.
@@ -369,7 +370,9 @@ Also measured against rclone v1.75.0 (#21). `tries` is pinned by
 pinned, since it needs a capture taken while a remote is refusing writes:
 
 - **`tries` counts attempts, not failures.** It increments when an attempt *starts*, so a
-  healthy in-flight upload reports `tries: 1`. Only a value above 1 is evidence of failure.
+  healthy in-flight upload reports `tries: 1`, and so does one that has already failed once
+  and is backing off. Above 1 is proof; 1 is ambiguous, and `uploading: false` alongside it
+  is what separates the two.
 - **`erroredFiles` stays 0 while a file is failing.** A file refused on every attempt for
   four minutes, backing off to a 64 s delay and reaching `tries: 7`, left
   `diskCache.erroredFiles` at 0 throughout. `tries` is the only signal that a file is stuck.

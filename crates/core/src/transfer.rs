@@ -65,6 +65,9 @@ pub struct TransferState {
     ///
     /// In every case a zero means "we cannot tell", not "nothing to send", and the
     /// difference decides whether unmounting is safe.
+    ///
+    /// `true` is still not a guarantee that nothing is being written — see
+    /// [`Self::safe_to_unmount`] for the one case no rc endpoint can see.
     pub outstanding_known: bool,
     /// Whether any file carries byte progress. Only `core/stats` supplies it.
     pub has_progress: bool,
@@ -177,12 +180,13 @@ impl TransferState {
 
     /// A mount whose outstanding work cannot be observed at all.
     ///
-    /// Two causes, both of which must read as "unknown" rather than "nothing": rclone is
-    /// unreachable, or the mount's cache mode is `off`. In the second case writes stream
-    /// straight to the remote, so there is genuinely nothing on disk holding them — the
-    /// one situation where an interrupted write really is lost, and the one where
-    /// reporting "idle" is most harmful. A `minimal` mount, whose queue is real but
-    /// incomplete, is [`Self::partially_observed`] instead.
+    /// Several causes, all of which must read as "unknown" rather than "nothing": rclone
+    /// is unreachable, it answered with a fault, it registers neither endpoint, or the
+    /// mount's cache mode is `off`. In that last case writes stream straight to the
+    /// remote, so there is genuinely nothing on disk holding them — the one situation
+    /// where an interrupted write really is lost, and the one where reporting "idle" is
+    /// most harmful. A `minimal` mount, whose queue is real but incomplete, is
+    /// [`Self::partially_observed`] instead.
     pub fn unmonitored(mount: &str, reason: impl Into<String>) -> Self {
         let mut s = Self::empty(mount, None);
         s.outstanding_known = false;
@@ -251,10 +255,12 @@ impl TransferState {
         self
     }
 
-    /// Whether nothing is outstanding, and that is known rather than assumed.
+    /// Whether nothing *observable* is outstanding, and that is known rather than
+    /// assumed.
     ///
     /// False when the answer is unknown: a mount we cannot observe is not an idle one.
-    /// [`Self::safe_to_unmount`] is the name to reach for when that is the question.
+    /// [`Self::safe_to_unmount`] is the name to reach for when that is the question, and
+    /// carries the caveat that applies to both.
     pub fn is_idle(&self) -> bool {
         self.outstanding_known && self.pending.files == 0
     }

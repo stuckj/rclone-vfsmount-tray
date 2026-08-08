@@ -90,9 +90,14 @@ impl MountPoller {
         // was down at connect stays unobservable for the life of the service. Covers both
         // the service starting before its mount units and a unit restarting after a crash.
         if self.caps.is_empty() {
-            if let Ok(caps) = Capabilities::probe(&self.client).await {
-                self.caps = caps;
-            }
+            // Keep whatever the re-probe learned, including a *new* refusal: `probe`
+            // returns `Ok` only for unreachable-class errors, so dropping the `Err` would
+            // leave the connect-time reason — "no rc socket at …" — on a mount whose
+            // socket is now present and answering with a fault.
+            self.caps = match Capabilities::probe(&self.client).await {
+                Ok(caps) => caps,
+                Err(e) => Capabilities::from_refusal(e.to_string()),
+            };
         }
         if self.caps.is_empty() {
             // Say what actually happened. `probe` kept the reason; inventing one about
@@ -147,11 +152,22 @@ impl MountPoller {
             Err(e) => return self.faulted(&e),
         };
 
-        // A queue that reported nothing to report is already fully described, and the
-        // enrichment below would only overwrite the reason it carries.
+        // Reached only when `vfs/queue` omitted the key, which is how a cacheless VFS
+        // answers. Usually the whole story — but if `vfs/stats` contradicts it by
+        // reporting a cache, believe the endpoint that answered rather than the one that
+        // did not: its counts are the only reading left, and naming a cache mode the
+        // other endpoint just denied sends the user somewhere there is nothing to find.
+        // The mirror of this, a queue with no cache, is kept for the same reason below.
         if !state.outstanding_known {
             self.rate.reset();
-            return state;
+            return match &cache {
+                CacheProbe::Present(c, _) => TransferState::from_stats(&self.name, c)
+                    .partially_observed(
+                        "this rclone reports a write-back cache but no queue, so only its \
+                         counts can be read",
+                    ),
+                _ => state,
+            };
         }
 
         match &cache {
@@ -190,7 +206,7 @@ impl MountPoller {
             CacheProbe::Absent => {
                 state = state.partially_observed(
                     "this rclone reports a write-back queue but no cache to hold it, so \
-                     what is outstanding cannot be established",
+                     what is queued is a floor rather than the whole story",
                 )
             }
             // The queue answered, so its entries are real; only the health flags, the
@@ -543,6 +559,38 @@ mod tests {
         assert!(s.is_idle());
         assert!(s.safe_to_unmount());
         assert!(s.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_cache_without_a_queue_keeps_its_counts() {
+        // The mirror of the test below, and the same rule: when the two endpoints
+        // disagree, believe the one that answered. rclone 1.75 omits the `queue` key and
+        // `diskCache` together, so neither case is reachable against it — but resolving
+        // them in opposite directions would be the bug, not the unreachability.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
+        v["diskCache"]["uploadsQueued"] = serde_json::json!(5);
+
+        let fake = FakeRc::new(
+            "cachenoqueue",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", "{}".to_string()),
+                ("vfs/stats", v.to_string()),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await;
+
+        assert_eq!(s.fidelity, Some(Tier::T3), "the counts are what is left");
+        assert_eq!(s.pending.files, 6, "5 queued plus the 1 in progress");
+        assert!(!s.outstanding_known);
+        let why = s.degraded_reason.clone().expect("say why");
+        assert!(
+            !why.contains("cache-mode off") && !why.contains("--vfs-cache-mode off"),
+            "vfs/stats just reported a cache; blaming the cache mode is a wrong lead: {why}"
+        );
     }
 
     #[tokio::test]
@@ -1100,6 +1148,42 @@ mod tests {
             "40MB moved between polls, got {:?}",
             second.rate_bytes_per_sec
         );
+    }
+
+    #[tokio::test]
+    async fn a_reason_latched_at_connect_does_not_outlive_what_caused_it() {
+        // `probe` returns `Ok` with a reason only for unreachable-class errors; anything
+        // else is `Err`. Dropping that `Err` leaves the connect-time reason in place, so a
+        // mount whose socket is now present and answering keeps reporting "no rc socket at
+        // …" — sending the user to look for a missing file that exists.
+        let dir = TempDir(std::env::temp_dir().join(format!("rvt-relatch-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&dir.0);
+        std::fs::create_dir_all(&dir.0).unwrap();
+        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.0.join("rc.sock");
+
+        let mut p = MountPoller::connect("backup", RcClient::new(&socket)).await;
+        let before = p.poll().await;
+        let first = before
+            .degraded_reason
+            .clone()
+            .expect("nothing listening yet");
+
+        // Something is listening now, but `rc/list` is not registered — a 404, which
+        // `probe` surfaces as an error rather than as a refusal.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let rs = routes(vec![("core/version", fixture("core-version.json"))]);
+        let server = tokio::spawn(async move { serve_routes(listener, rs).await });
+
+        let after = p.poll().await;
+        let second = after.degraded_reason.clone().expect("still cannot be read");
+        assert_ne!(
+            second, first,
+            "the socket exists and answers now, so a reason naming its absence is stale"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

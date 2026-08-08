@@ -41,16 +41,49 @@ fn which_rclone() -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Where rclone puts this remote's cache: `<cache-dir>/<tree>/:local/<remote path>`.
+/// Where rclone puts this remote's cache: `<cache-dir>/<tree>/<backend>/<remote path>`.
 ///
-/// Composed rather than discovered. An earlier version walked down while a directory had
-/// a single child, which descends straight *past* the VFS root into the first
-/// subdirectory — so every name came out relative to the wrong place. Composing states
-/// the layout being relied on, and the caller asserts the result exists, so a change in
-/// rclone fails loudly instead of silently scanning an empty directory.
-fn cache_root(cache: &Path, tree: &str, remote: &Path) -> PathBuf {
+/// The backend segment is read from disk rather than assumed, because it is not a fixed
+/// string: a bare path gives `local`, while a connection string gives `:local{hash}` with
+/// a hash of the string. The rest is composed, so the layout being relied on is stated —
+/// an earlier version walked down while a directory had one child, which descends past
+/// the VFS root into the first subdirectory and made every name relative to the wrong
+/// place.
+fn cache_root(cache: &Path, tree: &str, remote: &Path) -> Option<PathBuf> {
+    let base = cache.join(tree);
+    let mut backends: Vec<_> = std::fs::read_dir(&base).ok()?.flatten().collect();
+    let backend = match backends.len() {
+        1 => backends.pop().unwrap().path(),
+        // One serve, one backend. Anything else means this test no longer knows what it
+        // is looking at, which is worse than failing.
+        _ => return None,
+    };
     let rel = remote.strip_prefix("/").expect("an absolute remote path");
-    cache.join(tree).join(":local").join(rel)
+    Some(backend.join(rel))
+}
+
+/// Wait for the scan to see `expect_files`, or give up.
+///
+/// rclone writes the data file and its descriptor separately and after the PUT returns,
+/// so a scan immediately afterwards is a race rather than a bug in the scanner.
+fn scan_until(cache: &Path, remote: &Path, expect_files: usize) -> scan::CacheScan {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut last = None;
+    while std::time::Instant::now() < deadline {
+        if let (Some(meta), Some(data)) = (
+            cache_root(cache, "vfsMeta", remote),
+            cache_root(cache, "vfs", remote),
+        ) {
+            if let Ok(found) = scan::scan(&meta, &data) {
+                if found.files.len() == expect_files {
+                    return found;
+                }
+                last = Some(found);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("cache never settled to {expect_files} dirty file(s); last saw {last:?}");
 }
 
 #[test]
@@ -100,14 +133,7 @@ fn a_real_rclone_cache_reads_back_as_one_dirty_file() {
     mkcol(port, "sub");
     put(port, "sub/queued.bin", &body);
 
-    let meta = cache_root(&cache, "vfsMeta", &src);
-    let data = cache_root(&cache, "vfs", &src);
-    assert!(
-        meta.is_dir() && data.is_dir(),
-        "rclone did not lay the cache out where expected — scanning the wrong directory \
-         would make every assertion below vacuous: {meta:?} {data:?}"
-    );
-    let found = scan::scan(&meta, &data).expect("a cache rclone just wrote is readable");
+    let found = scan_until(&cache, &src, 1);
 
     assert!(
         found.is_complete(),

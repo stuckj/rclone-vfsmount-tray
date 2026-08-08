@@ -183,13 +183,14 @@ impl MountPoller {
                     });
                 }
             }
-            // Reached only on a build with no `vfs/queue`; the absent queue key above
-            // catches this first otherwise.
+            // `vfs/queue` answered with a key and `vfs/stats` reports no cache — a
+            // contradiction rclone 1.75 does not produce, since a cacheless VFS omits
+            // both. If some build does, the queue is the one that answered, so its
+            // entries stand as a floor rather than being thrown away.
             CacheProbe::Absent => {
-                return TransferState::unmonitored(
-                    &self.name,
-                    "this mount has no write-back cache (--vfs-cache-mode off), so writes \
-                     stream straight to the remote and nothing outstanding can be observed",
+                state = state.partially_observed(
+                    "this rclone reports a write-back queue but no cache to hold it, so \
+                     what is outstanding cannot be established",
                 )
             }
             // The queue answered, so its entries are real; only the health flags, the
@@ -523,9 +524,9 @@ mod tests {
         // unable to call anything safe to unmount — useless rather than cautious.
         //
         // What this does not cover is a file still open: rclone enqueues on close, so
-        // nothing over rc sees it. DESIGN.md records the blind spot, `fusermount3` refuses
-        // a non-lazy unmount while the file is open, and #22's watcher is what will show
-        // it.
+        // nothing over rc sees it, and stopping the mount then truncates the object at the
+        // remote — measured, #73. `safe_to_unmount()` is necessary and not sufficient, and
+        // its rustdoc says so.
         let fake = FakeRc::new(
             "writes",
             vec![
@@ -542,6 +543,37 @@ mod tests {
         assert!(s.is_idle());
         assert!(s.safe_to_unmount());
         assert!(s.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_queue_without_a_cache_keeps_its_entries() {
+        // rclone 1.75 never answers this way — a cacheless VFS omits the `queue` key and
+        // `diskCache` together — so this pins the handling rather than a live behaviour.
+        // The point is that the queue is what answered: discarding two real entries
+        // because the *other* endpoint came back empty is the mistake already fixed for a
+        // missing `vfs/stats`, and it should not survive in the sibling branch.
+        let fake = FakeRc::new(
+            "queuenocache",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", fixture("vfs-queue-two-items.json")),
+                (
+                    "vfs/stats",
+                    r#"{"fs":"/src","inUse":1,"metadataCache":{"dirs":1,"files":0}}"#.to_string(),
+                ),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await;
+
+        assert_eq!(s.pending.files, 2, "the queue answered; keep what it said");
+        assert_eq!(s.pending.known_bytes, 393_216);
+        assert!(
+            !s.outstanding_known,
+            "but a queue with no cache is not a total"
+        );
+        assert!(s.degraded_reason.is_some());
     }
 
     #[tokio::test]

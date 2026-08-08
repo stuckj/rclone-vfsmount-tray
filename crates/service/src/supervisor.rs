@@ -541,9 +541,12 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 return Ok(());
             }
 
-            // The pending-upload check lands with the rc client (#12, #21, #23), and is
-            // a warning rather than a refusal (#19) — so proceeding while the answer is
-            // unknown is the default, not a gap.
+            // The pending-upload check lands in #73, and is a warning rather than a
+            // refusal (#19) — so proceeding while the answer is unknown is the default,
+            // not a gap. #73 rather than the rc client, because the poller cannot see a
+            // file that is still open: rclone queues on close, so `safe_to_unmount()` is
+            // necessary and not sufficient, and the `StopUnit` below reaches rclone before
+            // the kernel ever gets to refuse a busy mount.
 
             if ours {
                 // `StopUnit` only enqueues a job, so the unit reaches `failed` — on a

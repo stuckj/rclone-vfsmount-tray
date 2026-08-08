@@ -164,8 +164,9 @@ impl CacheMode {
     ///
     /// `true` does not mean the queue is the whole story at any given instant: rclone
     /// enqueues a file when it is **closed**, so an open write sits dirty in the cache and
-    /// absent from the queue for as long as it takes to write. An empty queue proves
-    /// nothing is outstanding only when the cache is empty too.
+    /// absent from the queue for as long as it takes to write. Nothing over rc sees that —
+    /// a non-empty cache does not imply it, since a clean entry lingers for
+    /// `--vfs-cache-max-age` and under `full` a plain read creates one. See DESIGN.md.
     pub fn all_writes_queued(self) -> bool {
         matches!(self, CacheMode::Writes | CacheMode::Full)
     }

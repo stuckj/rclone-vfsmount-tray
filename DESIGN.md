@@ -344,12 +344,22 @@ the wrong shape and is deliberately not done here:**
 ladder's ordering does not hold — and #22 is where it belongs, because inotify maintains
 the answer incrementally instead of re-deriving it.
 
-Until then the queue is taken at its word and the blind spot is accepted, because the
-consequence is a display inaccuracy rather than data loss: `fusermount3 -u` on a mount with
-a file open fails with `EBUSY` (measured), and no call site passes `lazy`. So the window in
-which the applet wrongly reads "idle" is exactly the window in which an unmount would be
-refused anyway. If a forced unmount is ever offered, this stops being cosmetic and #22
-becomes a prerequisite for it.
+Until then the queue is taken at its word, and **the blind spot can lose data** — the
+kernel does not save us. Measured end to end on rclone v1.75.0, `--vfs-cache-mode writes`,
+15 MB written to a file still open:
+
+1. `fusermount3 -u` does refuse: exit 1, `Device or resource busy`.
+2. But `unmount()` does not start there. It calls `StopUnit` first, and with `KillMode=mixed`
+   that is a SIGTERM. rclone logs `Failed to unmount: … Device or resource busy` and **exits
+   anyway**, in under a second. The mount goes `ENOTCONN` and the writer is severed.
+3. On the next mount with the same `--cache-dir`, rclone uploads the dirty cache item as it
+   stands. The remote received `held.bin` at 15728640 bytes — a truncated object presented
+   as complete.
+
+So `TransferState::safe_to_unmount()` must **not** be the only gate on the pending-upload
+check: it cannot see an open write, and the unmount path does not fail closed on one. Until
+#22 lands, an unmount that matters should probe with a non-lazy `fusermount3 -u` *before*
+stopping the unit, so the kernel's refusal is consulted while it still means something.
 
 ### Two field names that mean less than they say
 

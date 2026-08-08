@@ -259,13 +259,19 @@ impl TransferState {
         self.outstanding_known && self.pending.files == 0
     }
 
-    /// Whether it is safe to unmount now.
+    /// Whether anything *observable* is still outstanding.
     ///
-    /// The single answer to that question. [`Tier::meets_the_bar`] asks only whether a
-    /// byte *total* can be trusted, and the two disagree: a T3 reading has no byte total
-    /// yet its counts answer this perfectly well, while an unobserved mount has no counts
+    /// The single answer to that much. [`Tier::meets_the_bar`] asks only whether a byte
+    /// *total* can be trusted, and the two disagree: a T3 reading has no byte total yet
+    /// its counts answer this perfectly well, while an unobserved mount has no counts
     /// worth anything at any tier. Reading the tier predicate here would refuse to ever
     /// offer unmount on a `vfs/stats`-only build.
+    ///
+    /// **Necessary, not sufficient.** rclone enqueues a file when it is closed, so a write
+    /// still in progress is invisible to every rc endpoint and this returns `true` while
+    /// it runs. Stopping the mount then truncates the object at the remote — measured; see
+    /// DESIGN.md and #73. A caller that actually unmounts has to consult the kernel too, and
+    /// #22 is what will make this predicate whole.
     pub fn safe_to_unmount(&self) -> bool {
         self.is_idle()
     }

@@ -166,16 +166,36 @@ impl MountPoller {
                 // mount, which is the claim that gets a file truncated.
                 if !mode.is_some_and(CacheMode::all_writes_queued) {
                     state = state.partially_observed(match mode {
-                        Some(_) => {
+                        Some(CacheMode::Minimal) => {
                             "this mount's cache mode is minimal, so a file opened \
                              write-only streams straight to the remote without entering \
                              the queue"
+                        }
+                        Some(_) => {
+                            "this mount's cache mode does not put every write through the \
+                             queue, so some may not be visible here"
                         }
                         None => {
                             "this rclone did not report a recognised cache mode, so \
                              whether every write reaches the queue is unknown"
                         }
                     });
+                } else if state.pending.files == 0 && c.files > 0 {
+                    // rclone enqueues a file when it is *closed*, not as it is written, so
+                    // for the whole duration of a large copy the queue is empty, every
+                    // upload counter is zero and `core/stats` shows nothing — while the
+                    // cache file grows and its vfsMeta says `Dirty`. Measured on a live
+                    // `writes` mount: 8MB on disk, queue `[]`.
+                    //
+                    // `diskCache.files` counts clean entries too — it stays at 1 for the
+                    // cache's retention window after an upload finishes — so this cannot
+                    // say anything is outstanding, only that it cannot rule it out. The
+                    // vfsMeta `Dirty` scan (#22) is what tells the two apart.
+                    state = state.partially_observed(
+                        "rclone queues a file only when it is closed, so a write still in \
+                         progress would not appear here, and its rc API cannot tell a \
+                         dirty cache file from a clean one",
+                    );
                 }
             }
             // Reached only on a build with no `vfs/queue`; the absent queue key above
@@ -244,7 +264,15 @@ impl MountPoller {
         if !self.caps.has("vfs/stats") {
             return Ok(CacheProbe::NotAsked);
         }
-        let stats: VfsStats = self.client.call("vfs/stats", empty()).await?;
+        let stats: VfsStats = match self.client.call("vfs/stats", empty()).await {
+            Ok(s) => s,
+            // Capabilities were latched at connect. If the rclone behind this socket has
+            // been replaced by one that does not register `vfs/stats`, faulting here would
+            // discard the T2 answer `vfs/queue` can still give — the same 404 is already
+            // handled that way for the queue.
+            Err(RcError::Failed { status: 404, .. }) => return Ok(CacheProbe::NotAsked),
+            Err(e) => return Err(e),
+        };
         let mode = stats.cache_mode();
         let Some(cache) = stats.disk_cache else {
             return Ok(CacheProbe::Absent);
@@ -422,13 +450,14 @@ mod tests {
         v.to_string()
     }
 
-    /// The captured `vfs/stats` re-stamped with a cache mode. rclone's own encoding:
-    /// 0 off, 1 minimal, 2 writes, 3 full. The capture is a `writes` mount, so every
-    /// other mode has to be synthesised.
-    fn stats_with_cache_mode(mode: u64) -> String {
+    /// The captured `vfs/stats` re-stamped with a cache mode and a cache-file count.
+    /// rclone's own encoding: 0 off, 1 minimal, 2 writes, 3 full. The capture is a
+    /// `writes` mount holding one file, so every other combination is synthesised.
+    fn stats_with(mode: u64, cache_files: u64) -> String {
         let mut v: serde_json::Value =
             serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
         v["opt"]["CacheMode"] = serde_json::json!(mode);
+        v["diskCache"]["files"] = serde_json::json!(cache_files);
         v.to_string()
     }
 
@@ -446,7 +475,7 @@ mod tests {
             vec![
                 ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
                 ("vfs/queue", r#"{"queue":[]}"#.to_string()),
-                ("vfs/stats", stats_with_cache_mode(1)),
+                ("vfs/stats", stats_with(1, 1)),
             ],
         )
         .await;
@@ -494,25 +523,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_writes_cache_mode_mount_is_still_trusted() {
-        // The other side of the check above: `writes` queues every write, so an empty
-        // queue there really does mean idle. Without this, "never trust the queue" would
-        // pass the minimal test while making every healthy mount permanently unknown.
+    async fn a_writes_cache_mode_mount_with_an_empty_cache_is_trusted() {
+        // The other side of the checks above: with the queue empty *and* the cache empty
+        // there is nothing left to be uncertain about. Without this, "never trust the
+        // queue" would pass every other test here while making every mount permanently
+        // unknown, which is useless rather than merely cautious.
         let fake = FakeRc::new(
             "writes",
             vec![
                 ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
                 ("vfs/queue", r#"{"queue":[]}"#.to_string()),
-                ("vfs/stats", stats_with_cache_mode(2)),
+                ("vfs/stats", stats_with(2, 0)),
             ],
         )
         .await;
         let mut p = MountPoller::connect("backup", fake.client()).await;
         let s = p.poll().await.unwrap();
 
-        assert!(s.outstanding_known, "a writes mount queues everything");
+        assert!(s.outstanding_known, "nothing queued and nothing cached");
         assert!(s.is_idle());
+        assert!(s.safe_to_unmount());
         assert!(s.degraded_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_open_write_is_not_reported_idle_merely_because_the_queue_is_empty() {
+        // rclone enqueues a file when it is *closed*, so throughout a large copy — on the
+        // default cache mode — the queue is empty and every upload counter reads zero
+        // while the cache file grows. Measured on a live `writes` mount: 8MB on disk with
+        // vfsMeta `Dirty: true`, `vfs/queue` `[]`, `uploadsQueued` 0, nothing in
+        // `core/stats`. Only `diskCache.files` moved, 0 to 1.
+        //
+        // It is a one-directional signal — the count stays up for the cache's retention
+        // window after an upload finishes — so this cannot claim anything is outstanding,
+        // only refuse to claim that nothing is.
+        let fake = FakeRc::new(
+            "openwrite",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", stats_with(2, 1)),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await.unwrap();
+
+        assert!(
+            !s.safe_to_unmount(),
+            "a dirty cache file the queue cannot see must not read as safe to unmount"
+        );
+        assert!(!s.outstanding_known);
+        assert!(!s.is_idle());
+        let why = s.degraded_reason.clone().expect("the user has to be told");
+        assert!(why.contains("closed"), "{why}");
     }
 
     #[tokio::test]
@@ -574,12 +638,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_vfs_stats_that_stops_answering_does_not_fault_the_whole_poll() {
+        // Capabilities are latched at connect. If the rclone behind this socket is
+        // replaced by one that no longer registers `vfs/stats`, the advertised set is
+        // stale and the call 404s — the same 404 `vfs/queue` degrades on. Faulting here
+        // instead loses the T2 answer the queue still gives, and `main` logs "could not
+        // poll" and reports no state at all for the mount.
+        let fake = FakeRc::new(
+            "statsgone",
+            vec![
+                // Advertised, but no route is served for it, so the fake answers 404.
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", fixture("vfs-queue-two-items.json")),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let s = p.poll().await.expect("a 404 is not a fault");
+
+        assert_eq!(s.fidelity, Some(Tier::T2));
+        assert_eq!(s.pending.files, 2, "the queue still answered");
+        assert_eq!(s.pending.known_bytes, 393_216);
+    }
+
+    #[tokio::test]
     async fn a_build_without_vfs_queue_falls_to_counts_rather_than_failing() {
+        // `bytesUsed` is non-zero here on purpose. The capture reads 0, so an assertion
+        // against it would pass whether or not the code wrongly surfaced it as a pending
+        // total — which is the exact mistake the assertion below is named for.
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
+        v["diskCache"]["bytesUsed"] = serde_json::json!(999_999);
+
         let fake = FakeRc::new(
             "noqueue",
             vec![
                 ("rc/list", rc_list(&["rc/list", "vfs/stats"])),
-                ("vfs/stats", fixture("vfs-stats-upload-in-progress.json")),
+                ("vfs/stats", v.to_string()),
             ],
         )
         .await;

@@ -124,11 +124,9 @@ async fn main() -> anyhow::Result<()> {
     // the log before there is anywhere to publish them. The loop that keeps this current,
     // and the D-Bus surface that serves it, are #40.
     //
-    // `Mounted` rather than `is_live()`, which also admits `Foreign`. A foreign mount is
-    // named by its absolute mount point, and `socket_path` joins that onto the runtime
-    // directory — joining an absolute path discards the base, so `/srv/media` would send
-    // us looking for an rc socket at `/srv/media.sock`. Addressing a mount we did not
-    // start is #70.
+    // `Mounted` rather than `is_live()`, which also admits `Foreign`. We did not start a
+    // foreign mount, so none of our rc sockets addresses it and its own is unknown by
+    // definition. Reaching it at all is #70.
     for m in found
         .iter()
         .filter(|m| matches!(m.state, rvt_core::supervisor::MountState::Mounted))

@@ -279,7 +279,7 @@ Not every write through a mount enters the write-back cache:
 
 - Under `--vfs-cache-mode off`, writes stream straight to the remote via `operations.Rcat`.
 - Under `minimal`, only *write-only* opens stream. Read-write opens, and any file already in
-  the cache, go through it normally and are fully visible to T2/T3/T4.
+  the cache, go through it normally — visible to T4 immediately, and to T2/T3 once closed.
 
 A streamed write is **visible but unattributable**. Eight seconds into a 20 MB write on a
 `minimal` mount: `vfs/queue` was `[]`, every `diskCache` counter was `0`, and the transfer
@@ -293,7 +293,7 @@ What distinguishes the three modes over rc:
 |---|---|---|---|---|
 | `off` | 0 | `{}` — **no key** | absent | nothing |
 | `minimal` | 1 | `{"queue":[]}` | present | a **floor** |
-| `writes` / `full` | 2 / 3 | `{"queue":[…]}` | present | the whole story |
+| `writes` / `full` | 2 / 3 | `{"queue":[…]}` | present | a floor **while any file is open** |
 
 `minimal` builds a cache *and* a queue, so it is identical to `writes` at every endpoint
 except `opt.CacheMode`. That ordinal is therefore load-bearing, and code reading it must
@@ -305,9 +305,40 @@ not mean "nothing in flight". The applet says the mount is unmonitored (`off`) o
 observed (`minimal`) rather than implying it is idle — and the T1 data is rich enough to show
 the transfer, just not to attribute it, so an "unattributed transfers" line is implementable.
 
+### rclone enqueues on close, so an empty queue is not an idle mount
+
+Measured on a live `--vfs-cache-mode writes` mount (#21), the default mode. With a 12 MB file
+open and 8 MB written but not yet closed:
+
+```
+vfs/queue                    []
+diskCache.uploadsInProgress  0        diskCache.uploadsQueued  0
+diskCache.bytesUsed          0        diskCache.files          1
+core/stats.transferring      absent
+cache file on disk           8388608
+vfsMeta                      "Dirty": true
+```
+
+Every rc endpoint reports nothing outstanding while 8 MB sits dirty and unsent. The item
+enters `vfs/queue` on `close()`, not as it is written — so this is the state for the whole
+duration of any large copy, not a narrow race.
+
+**`diskCache.files` is the only rc signal, and it is one-directional.** It rose 0 → 1 when
+the write began, but it also stays at 1 after the upload completes, for the cache's
+retention window (`--vfs-cache-max-age`, default 1h). So a non-zero count cannot say
+anything *is* outstanding — only that nothing can rule it out.
+
+The applet therefore treats an empty queue as proof of idle **only when the cache is empty
+too**, and reports partially observed otherwise. The cost is real: for an hour after any
+write, a genuinely idle mount reads as "cannot confirm". Restoring that precision needs the
+vfsMeta `Dirty` scan — #22 — which makes **T4 strictly better than T2 for this question**,
+the one place the ladder's ordering does not hold.
+
 ### Two field names that mean less than they say
 
-Also measured against rclone v1.75.0 (#21), and pinned by `testdata/vfs-queue-retrying.json`:
+Also measured against rclone v1.75.0 (#21). `tries` is pinned by
+`testdata/vfs-queue-retrying.json`; the `erroredFiles` behaviour is measured but **not**
+pinned, since it needs a capture taken while a remote is refusing writes:
 
 - **`tries` counts attempts, not failures.** It increments when an attempt *starts*, so a
   healthy in-flight upload reports `tries: 1`. Only a value above 1 is evidence of failure.

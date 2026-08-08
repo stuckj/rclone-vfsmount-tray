@@ -21,8 +21,12 @@ pub struct TransferFile {
     pub size: Option<u64>,
     /// Whether this file is uploading right now, as opposed to merely queued.
     pub in_flight: Option<bool>,
-    /// Upload attempts, counted from the moment each one starts. A healthy upload reports
-    /// 1 while it is in flight, so only a value above 1 means an attempt has failed.
+    /// Upload attempts, counted from the moment each one starts.
+    ///
+    /// Above 1 is proof an attempt failed. **1 is ambiguous** — it is both a healthy
+    /// upload in flight and one that has already failed once and is backing off. The
+    /// signal that separates them is [`crate::models::QueueItem::delay`] having grown beyond the
+    /// configured `--vfs-write-back`; `errored_files` stays 0 through either.
     pub tries: Option<u64>,
     /// Bytes already sent for this file. Supplied by `core/stats` alone, and only for the
     /// files it is currently transferring; see [`TransferState::has_progress`].

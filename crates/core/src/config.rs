@@ -157,10 +157,15 @@ impl CacheMode {
         !matches!(self, CacheMode::Off)
     }
 
-    /// Whether *every* write reaches that queue.
+    /// Whether every write reaches that queue *eventually*.
     ///
     /// Under `minimal` only write-only opens of uncached files stream past it, so `false`
     /// means "may also have writes we cannot see", not "has no queue".
+    ///
+    /// `true` does not mean the queue is the whole story at any given instant: rclone
+    /// enqueues a file when it is **closed**, so an open write sits dirty in the cache and
+    /// absent from the queue for as long as it takes to write. An empty queue proves
+    /// nothing is outstanding only when the cache is empty too.
     pub fn all_writes_queued(self) -> bool {
         matches!(self, CacheMode::Writes | CacheMode::Full)
     }

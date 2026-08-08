@@ -105,6 +105,15 @@ impl CacheScan {
 /// has never cached anything genuinely has nothing outstanding. Anything else that goes
 /// wrong at the root is an error, because "could not look" is not "nothing there".
 pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
+    scan_bounded(meta_root, data_root, MAX_ENTRIES)
+}
+
+/// As [`scan`], with the entry cap supplied.
+///
+/// Exists so the cap's behaviour can be tested at a size that does not matter. Building
+/// `MAX_ENTRIES` files to prove the walk stops is a RAM spike wherever the temp directory
+/// is tmpfs, and it is a test that gets run in a loop.
+fn scan_bounded(meta_root: &Path, data_root: &Path, max_entries: usize) -> io::Result<CacheScan> {
     let mut out = CacheScan {
         root_present: true,
         ..CacheScan::default()
@@ -137,7 +146,7 @@ pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
                 out.unreadable += 1;
                 continue;
             };
-            if visited >= MAX_ENTRIES {
+            if visited >= max_entries {
                 out.truncated = true;
                 return Ok(out);
             }
@@ -521,17 +530,23 @@ mod tests {
         // The cap is the only thing standing between a media-sized cache and a partial
         // walk presented as a total. Under `full` every read-cached file is an entry, so
         // this is reachable on a mount nobody has written to in hours.
+        //
+        // At a cap of 12 rather than the real one: building 50,000 files to prove the walk
+        // stops is a RAM spike wherever the temp directory is tmpfs, which is a poor trade
+        // for a mechanism that does not care what the number is.
         let t = Tree::new("capped");
-        for i in 0..(MAX_ENTRIES + 10) {
+        for i in 0..20 {
             t.put(&format!("f{i}.bin"), &closed(1), None);
         }
-        let s = t.scan();
+        let s = scan_bounded(&t.meta(), &t.data(), 12).unwrap();
 
         assert!(s.truncated, "the walk stopped early and has to say so");
         // Exactly the cap, not merely "at most": every entry in a flat all-dirty tree is
-        // one visit and one file, so a cap moved to any other value shows up here. Without
-        // this the test passes with the cap at 10.
-        assert_eq!(s.files.len(), MAX_ENTRIES);
+        // one visit and one file, so a cap that is off by one shows up here.
+        assert_eq!(s.files.len(), 12);
+        // And the public entry point uses the real cap — asserted rather than exercised,
+        // for the reason above.
+        assert_eq!(MAX_ENTRIES, 50_000);
         assert!(
             !s.is_complete(),
             "what it found is a floor, not a total — reporting it as one is the false \

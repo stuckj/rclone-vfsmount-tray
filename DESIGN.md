@@ -357,9 +357,10 @@ kernel does not save us. Measured end to end on rclone v1.75.0, `--vfs-cache-mod
    as complete.
 
 So `TransferState::safe_to_unmount()` must **not** be the only gate on the pending-upload
-check: it cannot see an open write, and the unmount path does not fail closed on one. Until
-#22 lands, an unmount that matters should probe with a non-lazy `fusermount3 -u` *before*
-stopping the unit, so the kernel's refusal is consulted while it still means something.
+check: it cannot see an open write, and the unmount path does not fail closed on one.
+Until #22 lands, an unmount that matters should probe with a non-lazy `fusermount3 -u`
+*before* stopping the unit, so the kernel's refusal is consulted while it still means
+something. Tracked as #73.
 
 ### Two field names that mean less than they say
 

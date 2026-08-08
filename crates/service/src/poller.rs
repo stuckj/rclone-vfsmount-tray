@@ -84,6 +84,9 @@ impl MountPoller {
     /// Driven by whether anything is known to be outstanding, not by whether the mount is
     /// idle. A mount that cannot be observed has nothing to re-derive every second, and a
     /// partially observed one with real entries in its queue still has to be watched.
+    ///
+    /// A disk-derived (T4) state is always the slow cadence however much it found: each
+    /// poll behind it is a full walk of the metadata tree.
     pub fn interval(state: &TransferState) -> Duration {
         // A disk-derived state is never the fast case. The walk behind it costs a full
         // read of the metadata tree — DESIGN.md measures ~0.7s over 50k descriptors — and
@@ -333,11 +336,21 @@ impl MountPoller {
                 // flight. An unrecognised or unseen mode fails closed here too.
                 let all_queued = self.mode.is_some_and(CacheMode::all_writes_queued);
                 if !all_queued {
-                    let _ = write!(
-                        why,
-                        "; and this mount's cache mode does not put every write through the \
-                         cache, so what is on disk is a floor"
-                    );
+                    // Three cases, as the live path distinguishes them: an unknown mode is
+                    // not the same claim as a known one that streams past the cache, and
+                    // saying so anyway states a fact about the mount nothing measured.
+                    let _ = match self.mode {
+                        Some(_) => write!(
+                            why,
+                            "; and this mount's cache mode does not put every write through \
+                             the cache, so what is on disk is a floor"
+                        ),
+                        None => write!(
+                            why,
+                            "; and this rclone never reported a recognised cache mode, so \
+                             whether every write reaches the cache is unknown"
+                        ),
+                    };
                 }
 
                 let state = TransferState::from_scan(&self.name, &found);
@@ -1475,6 +1488,46 @@ mod tests {
             after.degraded_reason
         );
         assert_eq!(after.fidelity, Some(Tier::T4));
+    }
+
+    #[tokio::test]
+    async fn a_fallback_that_could_not_read_everything_says_which_part_it_missed() {
+        // Otherwise the state reads not-known with nothing in the text to explain it, and
+        // the rc failure takes the blame for a cache that was only half read — sending the
+        // user to look at rclone when the thing to look at is the cache directory.
+        let cache =
+            TempDir(std::env::temp_dir().join(format!("rvt-partial-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&cache.0);
+        dirty_entry(&cache.0, "readable.bin", 32);
+        // A descriptor that exists and does not parse. rclone rewrites these in place, so
+        // a torn read looks exactly like this.
+        std::fs::write(cache.0.join("vfsMeta").join("torn.bin"), "").unwrap();
+
+        let fake = FakeRc::new(
+            "partialscan",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", fixture("vfs-queue-uploading.json")),
+                (
+                    "vfs/stats",
+                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                ),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
+        assert!(!after.outstanding_known, "one entry went unread");
+        let why = after.degraded_reason.clone().expect("say why");
+        assert!(
+            why.contains("could not be read"),
+            "the reason has to name the unread entries, not just the rc failure: {why}"
+        );
     }
 
     #[tokio::test]

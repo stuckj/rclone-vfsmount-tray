@@ -204,7 +204,7 @@ not by comparing version numbers, which only guesses.
 | **T1** | `core/stats` `transferring[]` | `{name, size}` always; `{bytes, percentage, speed, speedAvg, eta, group}` once rclone attaches accounting; `srcFs`/`dstFs` when a source/destination exists | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). **Does not meet the bar**, despite being the most detailed tier: it shows transfers that have *started*, and lags `vfs/queue` by `--vfs-write-back`, so a total taken from it reads zero while gigabytes sit queued — wrong in the unsafe direction. Mixes directions — see below. Treat every field but `name` and `size` as optional. |
 | **T2** | `vfs/queue` (per-fs) | `{name, id, size, expiry, tries, delay, uploading}` | **The minimum bar.** `sum(size)` = bytes to send; `uploading` = in flight. `vfs/queue-set-expiry` forces an upload. |
 | **T3** | `vfs/stats` (per-fs) | `diskCache{uploadsInProgress, uploadsQueued, erroredFiles, outOfSpace, path, pathMeta}` | Counts only. Does not meet the bar alone, but hands over the cache paths for T4. |
-| **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` plus the data file's own size | Bytes to send is the **data file's** size summed over dirty items — the descriptor's `Size` is stale while a handle is open — 0 for a new file, the previous size for a rewrite (#10), so summing it reports nothing during exactly the copy the user is watching. **Meets the bar with no rc at all**, survives an rclone crash, and is the only tier that sees a write before it is closed. |
+| **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` plus the data file's own size | Bytes to send is the **data file's** size summed over dirty items — the descriptor's `Size` is stale while a handle is open — 0 for a new file, the previous size for a rewrite (#10), so summing it reports nothing during exactly the copy the user is watching. Survives an rclone crash, and is the only tier that sees a write before it is closed. **Meets the bar with no rc at all in principle** — but as implemented the cache roots come only from `vfs/stats`, so a mount that has never answered has nowhere to scan; composing them from `rclone config paths` is the rest of #22. |
 
 T4 is a first-class tier, not a fallback of last resort. It is the only tier that works when
 the rclone process is unreachable, and the only one that survives a crash, because the rc
@@ -214,6 +214,12 @@ Its honest limits: no per-file upload progress (the cached file reflects what th
 wrote, not what was uploaded); no in-flight flag (`Dirty` stays true until upload completes,
 so "queued" and "uploading" are indistinguishable); and the aggregate rate must be derived by
 differencing total dirty bytes as files drop out, so large files stall then jump.
+
+Two more that come from walking rather than watching. A walk is bounded at 50 000 entries,
+and under `full` every *read* file is one — so on a large media cache it reports itself
+incomplete rather than pretending to a total. And the roots come from `vfs/stats`, so a mount
+that has never answered has nowhere to scan. Both are what the inotify half of #22 removes:
+watching the tree costs nothing per poll, and a watcher has to resolve the root once anyway.
 
 ### The rule that follows
 

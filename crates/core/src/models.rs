@@ -498,7 +498,10 @@ pub struct VfsMetaItem {
     /// Last access time, RFC 3339.
     #[serde(rename = "ATime", default)]
     pub atime: String,
-    /// Full size of the file in bytes.
+    /// Full size of the file in bytes — **stale while a handle is open**: 0 for a file
+    /// being created, and the *previous* size for one being rewritten, until the upload
+    /// completes. For bytes outstanding, measure the data file under `diskCache.path`, as
+    /// [`crate::scan`] does.
     #[serde(rename = "Size", default)]
     pub size: u64,
     /// Byte ranges present in the local cache. `null` when none are.

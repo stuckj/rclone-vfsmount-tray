@@ -79,7 +79,13 @@ pub struct CacheScan {
 impl CacheScan {
     /// Bytes known to be waiting, counting only files whose size could be measured.
     pub fn known_bytes(&self) -> u64 {
-        self.files.iter().filter_map(|f| f.bytes).sum()
+        // Saturating, because the sizes come from a tree named by an rc response: enough
+        // sparse files with large apparent sizes overflow, which panics in debug and wraps
+        // to a small number in release — and a wrapped total is a confident wrong answer.
+        self.files
+            .iter()
+            .filter_map(|f| f.bytes)
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Whether this scan is the whole story.
@@ -113,16 +119,25 @@ pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
-            // Only at the root, and only for absence. A subdirectory that vanished
-            // mid-walk is a cache eviction racing us, which is not this scan's problem.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if dir == meta_root {
+            // The root is the caller's question: absent means "no cache here", and
+            // anything else means the caller was pointed somewhere unusable.
+            Err(e) if dir == meta_root => {
+                if e.kind() == io::ErrorKind::NotFound {
                     out.root_present = false;
                     return Ok(out);
                 }
+                return Err(e);
+            }
+            // A subdirectory that cannot be listed is counted, never skipped. Eviction
+            // removes items — each already counted where it was listed — and then purges
+            // directories that are empty, which lose nothing. A *non-empty* one going
+            // missing means it was renamed, and every dirty item beneath it went with it,
+            // so passing over it silently turns an arbitrarily large subtree into a
+            // confident zero.
+            Err(_) => {
+                out.unreadable += 1;
                 continue;
             }
-            Err(e) => return Err(e),
         };
 
         for entry in entries {
@@ -438,6 +453,51 @@ mod tests {
             "the caller has to be able to tell 'never cached anything' from 'the cache \
              it told us about has gone'"
         );
+    }
+
+    #[test]
+    fn a_subdirectory_that_cannot_be_listed_is_counted_not_skipped() {
+        // A directory can hide an arbitrarily large subtree, so passing over one silently
+        // turns it into a confident zero. The live case is a rename: eviction removes
+        // items, each counted where it was listed, and then purges directories that are
+        // already empty — but a *non-empty* directory going missing mid-walk means it
+        // moved, and its dirty items moved with it.
+        use std::os::unix::fs::PermissionsExt;
+        let t = Tree::new("subdir");
+        t.put("visible.bin", &closed(64), Some(64));
+        t.put("hidden/big.bin", &closed(1_000_000), Some(1_000_000));
+        let hidden = t.meta().join("hidden");
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let s = t.scan();
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(s.files.len(), 1, "only the entry it could reach");
+        assert_eq!(s.unreadable, 1, "and the directory it could not");
+        assert!(
+            !s.is_complete(),
+            "a subtree went unlooked-at, so this zero is not an answer"
+        );
+    }
+
+    #[test]
+    fn a_walk_that_hits_its_cap_says_so_rather_than_reporting_what_it_reached() {
+        // The cap is the only thing standing between a media-sized cache and a partial
+        // walk presented as a total. Under `full` every read-cached file is an entry, so
+        // this is reachable on a mount nobody has written to in hours.
+        let t = Tree::new("capped");
+        for i in 0..(MAX_ENTRIES + 10) {
+            t.put(&format!("f{i}.bin"), &closed(1), None);
+        }
+        let s = t.scan();
+
+        assert!(s.truncated, "the walk stopped early and has to say so");
+        assert!(
+            !s.is_complete(),
+            "what it found is a floor, not a total — reporting it as one is the false \
+             idle this tier exists to prevent"
+        );
+        assert!(s.files.len() <= MAX_ENTRIES);
     }
 
     #[test]

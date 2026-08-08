@@ -224,7 +224,11 @@ fn a_write_still_in_flight_is_dirty_on_disk_before_it_reaches_the_queue() {
     stream.write_all(&vec![b'q'; 1024 * 1024]).unwrap();
     stream.flush().unwrap();
 
-    let found = scan_until(&cache, &src, 1);
+    // Wait for bytes, not just for the entry: the descriptor can appear before the data
+    // file has anything in it, and bytes are what this test is about.
+    let found = scan_until(&cache, &src, "a partly-written dirty file", |f| {
+        f.files.len() == 1 && f.known_bytes() > 0
+    });
     assert_eq!(
         found
             .files

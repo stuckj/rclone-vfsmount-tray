@@ -37,8 +37,12 @@ pub struct MountPoller {
     caps: Capabilities,
     rate: RateEstimator,
     /// Cache path from `vfs/stats`, which is what attributes a `core/stats` transfer to
-    /// this mount and what the on-disk tier would scan.
+    /// this mount and what the on-disk tier scans for sizes.
     cache_path: Option<String>,
+    /// `vfs/stats` `diskCache.pathMeta`. Latched for the same reason as the path above:
+    /// the on-disk tier exists to answer once rclone can no longer be asked, so the roots
+    /// have to be remembered from when it could.
+    meta_path: Option<String>,
 }
 
 impl MountPoller {
@@ -59,6 +63,7 @@ impl MountPoller {
             caps,
             rate: RateEstimator::new(),
             cache_path: None,
+            meta_path: None,
         }
     }
 
@@ -116,7 +121,7 @@ impl MountPoller {
             Ok(c) => c,
             Err(e) if e.is_unreachable() => {
                 self.rate.reset();
-                return self.unreachable(&e);
+                return self.unreachable(&e).await;
             }
             Err(e) => return self.faulted(&e),
         };
@@ -129,7 +134,7 @@ impl MountPoller {
             Ok(queue) => TransferState::from_queue(&self.name, &queue),
             Err(e) if e.is_unreachable() => {
                 self.rate.reset();
-                return self.unreachable(&e);
+                return self.unreachable(&e).await;
             }
             // No `vfs/queue` on this build: counts are all there is over rc.
             Err(RcError::Failed { status: 404, .. }) => match &cache {
@@ -258,11 +263,43 @@ impl MountPoller {
         TransferState::unmonitored(&self.name, e.to_string())
     }
 
-    fn unreachable(&self, e: &RcError) -> TransferState {
-        // Not an empty scan: that reports zero outstanding, exactly, which is a claim.
-        // The on-disk scanner that could answer here is #22; until then the honest answer
-        // is that we do not know.
-        TransferState::unmonitored(&self.name, e.to_string())
+    /// rclone cannot be asked. Fall to the disk, which still has the answer.
+    ///
+    /// The case this tier exists for: dirty items outlive the process that queued them, so
+    /// a crashed or restarting rclone makes its backlog unaskable rather than unknowable.
+    /// The roots were latched from a poll that succeeded, so a mount that never answered
+    /// has nowhere to look and stays unmonitored — an empty scan there would be a claim.
+    ///
+    /// A scan that fails is not folded into the rc failure. "rclone is unreachable" alone
+    /// would hide that the fallback was tried and could not read the cache either, which
+    /// is a different thing to go and look at.
+    async fn unreachable(&mut self, e: &RcError) -> TransferState {
+        let (Some(meta), Some(data)) = (self.meta_path.clone(), self.cache_path.clone()) else {
+            return TransferState::unmonitored(&self.name, e.to_string());
+        };
+
+        let scanned = tokio::task::spawn_blocking(move || {
+            rvt_core::scan::scan(std::path::Path::new(&meta), std::path::Path::new(&data))
+        })
+        .await;
+
+        match scanned {
+            // The tree `vfs/stats` told us about is gone. A cache directory disappearing
+            // is not evidence the queue drained, so this is not an empty scan.
+            Ok(Ok(found)) if !found.root_present => TransferState::unmonitored(
+                &self.name,
+                format!("{e}; and the cache it reported is no longer on disk"),
+            ),
+            Ok(Ok(found)) => TransferState::from_scan(&self.name, &found).degraded(format!(
+                "{e}; read {} pending file(s) from the cache on disk instead",
+                found.files.len()
+            )),
+            Ok(Err(scan_err)) => TransferState::unmonitored(
+                &self.name,
+                format!("{e}; and its cache could not be read either: {scan_err}"),
+            ),
+            Err(join) => TransferState::unmonitored(&self.name, format!("{e}; {join}")),
+        }
     }
 
     async fn fetch_stats(&mut self) -> Result<CacheProbe, RcError> {
@@ -284,6 +321,9 @@ impl MountPoller {
         };
         if !cache.path.is_empty() {
             self.cache_path = Some(cache.path.clone());
+        }
+        if !cache.path_meta.is_empty() {
+            self.meta_path = Some(cache.path_meta.clone());
         }
         Ok(CacheProbe::Present(cache, mode))
     }
@@ -1222,20 +1262,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A `vfs/stats` whose cache paths point at a tree this test controls.
+    ///
+    /// The captured fixture names the machine the capture was taken on, so a test relying
+    /// on it is really asserting against whatever happens to be at that path — which on
+    /// this machine is sometimes a real directory.
+    fn stats_pointing_at(meta: &std::path::Path, data: &std::path::Path) -> String {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
+        v["diskCache"]["pathMeta"] = serde_json::json!(meta.to_string_lossy());
+        v["diskCache"]["path"] = serde_json::json!(data.to_string_lossy());
+        v.to_string()
+    }
+
+    /// Write one dirty descriptor and its data file, as rclone lays them out.
+    fn dirty_entry(root: &std::path::Path, name: &str, bytes: usize) {
+        let meta = root.join("vfsMeta");
+        let data = root.join("vfs");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(
+            meta.join(name),
+            format!(
+                r#"{{"ModTime":"2026-08-08T00:00:00Z","ATime":"2026-08-08T00:00:00Z",
+                    "Size":{bytes},"Rs":[{{"Pos":0,"Size":{bytes}}}],"Fingerprint":"","Dirty":true}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(data.join(name), vec![b'x'; bytes]).unwrap();
+    }
+
     #[tokio::test]
-    async fn an_rclone_that_dies_after_connecting_does_not_report_an_exact_zero() {
-        // The path that matters: capabilities were probed successfully, so the poller
-        // knows this mount *has* a queue — and then rclone goes away. A mount with 12GB
-        // queued must not flip to "nothing outstanding, exactly".
-        //
-        // Connecting to a socket that never existed takes a different branch (no
-        // capabilities, so no cache), which is why that case cannot stand in for this one.
+    async fn an_rclone_that_dies_after_connecting_falls_to_the_disk() {
+        // Capabilities were probed successfully, so the poller knows this mount has a
+        // queue — and then rclone goes away. The backlog does not: dirty items outlive the
+        // process that queued them, which is the whole reason this tier exists. Before
+        // #22 the honest answer here was "cannot tell"; now it is the answer itself.
+        let cache = TempDir(std::env::temp_dir().join(format!("rvt-died-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&cache.0);
+        dirty_entry(&cache.0, "left-behind.bin", 4096);
+
         let fake = FakeRc::new(
             "died",
             vec![
                 ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
                 ("vfs/queue", fixture("vfs-queue-uploading.json")),
-                ("vfs/stats", fixture("vfs-stats-upload-in-progress.json")),
+                (
+                    "vfs/stats",
+                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                ),
             ],
         )
         .await;
@@ -1248,18 +1323,49 @@ mod tests {
         let _ = std::fs::remove_file(&fake.socket);
 
         let after = p.poll().await;
+        assert_eq!(after.fidelity, Some(Tier::T4), "read off disk, not over rc");
+        assert_eq!(after.pending.files, 1, "the backlog is still there");
+        assert_eq!(after.pending.known_bytes, 4096);
+        assert!(!after.is_idle());
+        assert!(
+            after.degraded_reason.is_some(),
+            "this is a fallback, and the user should be told which one"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_rclone_that_dies_with_its_cache_gone_reports_unknown_not_zero() {
+        // The other half. An empty scan and an absent tree both find no dirty files, but
+        // a cache directory disappearing is not evidence the queue drained — and this is
+        // the mount that must never flip to "nothing outstanding, exactly".
+        let cache =
+            TempDir(std::env::temp_dir().join(format!("rvt-nocache-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&cache.0);
+
+        let fake = FakeRc::new(
+            "diednocache",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", fixture("vfs-queue-uploading.json")),
+                (
+                    "vfs/stats",
+                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                ),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
         assert!(
             !after.outstanding_known,
-            "the queue did not empty — we simply stopped being able to see it"
+            "the queue did not empty — the cache we were told about is simply not there"
         );
-        assert!(
-            !after.is_idle(),
-            "'idle' is a claim we cannot make about a mount we cannot observe"
-        );
-        // `pending` itself cannot express "unknown" — zero files is vacuously exact, and
-        // inventing an unknown-size file to say otherwise would be worse. That is what
-        // `outstanding_known` is for, and why `is_idle()` consults it rather than the
-        // count alone.
+        assert!(!after.is_idle());
         assert_eq!(after.pending.files, 0);
         assert_eq!(after.rate_bytes_per_sec, None);
         assert!(after.degraded_reason.is_some());

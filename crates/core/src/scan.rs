@@ -67,6 +67,14 @@ pub struct CacheScan {
     pub unreadable: u64,
     /// Whether the walk hit its entry cap with entries left unvisited.
     pub truncated: bool,
+    /// Whether the metadata root was there at all.
+    ///
+    /// `false` is not "nothing outstanding". rclone creates the tree lazily, so a mount
+    /// that has never cached anything genuinely has none — but a caller that took this
+    /// path *from a `vfs/stats` that reported a cache* is looking at a tree that has since
+    /// gone, and the queue draining is not the only way that happens. Only the caller
+    /// knows which of the two it is in.
+    pub root_present: bool,
 }
 
 impl CacheScan {
@@ -79,6 +87,9 @@ impl CacheScan {
     ///
     /// False when something could not be read or the walk was cut short — in which case a
     /// zero here means "we did not finish looking", not "nothing to send".
+    ///
+    /// Says nothing about [`Self::root_present`]: an absent tree is completely read, and
+    /// whether that counts as an answer depends on why the caller expected one.
     pub fn is_complete(&self) -> bool {
         self.unreadable == 0 && !self.truncated
     }
@@ -98,7 +109,10 @@ impl CacheScan {
 /// has never cached anything genuinely has nothing outstanding. Anything else that goes
 /// wrong at the root is an error, because "could not look" is not "nothing there".
 pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
-    let mut out = CacheScan::default();
+    let mut out = CacheScan {
+        root_present: true,
+        ..CacheScan::default()
+    };
     let mut stack = vec![meta_root.to_path_buf()];
     let mut visited = 0usize;
 
@@ -109,6 +123,7 @@ pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
             // mid-walk is a cache eviction racing us, which is not this scan's problem.
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 if dir == meta_root {
+                    out.root_present = false;
                     return Ok(out);
                 }
                 continue;
@@ -356,7 +371,12 @@ mod tests {
         let s = scan(&missing, &t.data()).expect("an absent tree is not an error");
 
         assert!(s.files.is_empty());
-        assert!(s.is_complete(), "absent is a complete answer");
+        assert!(s.is_complete(), "there was nothing to fail to read");
+        assert!(
+            !s.root_present,
+            "the caller has to be able to tell 'never cached anything' from 'the cache \
+             it told us about has gone'"
+        );
     }
 
     #[test]

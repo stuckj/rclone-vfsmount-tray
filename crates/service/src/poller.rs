@@ -5,10 +5,9 @@
 
 use rvt_core::capabilities::{Capabilities, Tier};
 use rvt_core::config::CacheMode;
-use rvt_core::models::{CoreStats, DiskCache, VfsMetaItem, VfsQueue, VfsStats};
+use rvt_core::models::{CoreStats, DiskCache, VfsQueue, VfsStats};
 use rvt_core::rc::{RcClient, RcError};
 use rvt_core::transfer::{RateEstimator, TransferState};
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Poll interval while something is outstanding.
@@ -182,33 +181,6 @@ impl MountPoller {
                              whether every write reaches the queue is unknown"
                         }
                     });
-                } else if state.pending.files == 0 {
-                    // rclone enqueues a file when it is *closed*, not as it is written, so
-                    // for the whole duration of a large copy the queue is empty, every
-                    // upload counter reads zero and `core/stats` shows nothing — while the
-                    // cache file grows. Measured on a live `writes` mount: 8MB on disk,
-                    // `vfs/queue` `[]`.
-                    //
-                    // Nothing over rc distinguishes that from genuinely idle.
-                    // `diskCache.files` counts clean entries too: it stays up for the
-                    // cache's retention window after an upload finishes, and under `full`
-                    // a plain read creates one. Only the on-disk `Dirty` flag answers it.
-                    match self.any_dirty(&c.path_meta).await {
-                        Ok(true) => {
-                            state = state.partially_observed(
-                                "a file in the cache is modified and not yet uploaded; \
-                                 rclone queues a file only when it is closed, so one still \
-                                 being written does not appear in the queue",
-                            )
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            state = state.partially_observed(format!(
-                                "the queue is empty, but this mount's cache metadata could \
-                                 not be read to confirm nothing is still being written: {e}"
-                            ))
-                        }
-                    }
                 }
             }
             // Reached only on a build with no `vfs/queue`; the absent queue key above
@@ -278,53 +250,6 @@ impl MountPoller {
         // The on-disk scanner that could answer here is #22; until then the honest answer
         // is that we do not know.
         TransferState::unmonitored(&self.name, e.to_string())
-    }
-
-    /// Whether any cache item is modified and not yet uploaded.
-    ///
-    /// Reads `diskCache.pathMeta`, the tree rclone writes a small JSON descriptor into per
-    /// cached file. Only consulted when the queue is empty, which is also when the poll
-    /// cadence is at its slowest, so the walk costs little.
-    ///
-    /// A missing tree means nothing has been cached yet, which is clean. Anything else
-    /// that goes wrong is reported, because "could not look" is not "nothing there".
-    /// Individual files are skipped rather than failing the walk: rclone writes them
-    /// non-atomically, so a descriptor caught mid-write is expected rather than a fault.
-    async fn any_dirty(&self, path_meta: &str) -> std::io::Result<bool> {
-        if path_meta.is_empty() {
-            return Ok(false);
-        }
-        let root = PathBuf::from(path_meta);
-        tokio::task::spawn_blocking(move || {
-            let mut stack = vec![root];
-            while let Some(dir) = stack.pop() {
-                let entries = match std::fs::read_dir(&dir) {
-                    Ok(e) => e,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(e) => return Err(e),
-                };
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    match entry.file_type() {
-                        Ok(t) if t.is_dir() => stack.push(path),
-                        Ok(_) => {
-                            let Ok(raw) = std::fs::read_to_string(&path) else {
-                                continue;
-                            };
-                            if serde_json::from_str::<VfsMetaItem>(&raw)
-                                .is_ok_and(|item| item.dirty)
-                            {
-                                return Ok(true);
-                            }
-                        }
-                        Err(_) => continue,
-                    }
-                }
-            }
-            Ok(false)
-        })
-        .await
-        .unwrap_or_else(|e| Err(std::io::Error::other(e)))
     }
 
     async fn fetch_stats(&mut self) -> Result<CacheProbe, RcError> {
@@ -528,27 +453,6 @@ mod tests {
         v.to_string()
     }
 
-    /// As [`stats_with`], pointing `pathMeta` at a real tree on disk.
-    fn stats_with_meta(mode: u64, cache_files: u64, path_meta: &std::path::Path) -> String {
-        let mut v: serde_json::Value =
-            serde_json::from_str(&stats_with(mode, cache_files)).unwrap();
-        v["diskCache"]["pathMeta"] = serde_json::json!(path_meta.to_string_lossy());
-        v.to_string()
-    }
-
-    /// A `vfsMeta` tree holding one descriptor, nested as rclone nests them.
-    fn meta_tree(tag: &str, dirty: bool) -> TempDir {
-        let dir =
-            TempDir(std::env::temp_dir().join(format!("rvt-meta-{}-{tag}", std::process::id())));
-        let nested = dir.0.join("local/srv/media");
-        std::fs::create_dir_all(&nested).unwrap();
-        let mut v: serde_json::Value =
-            serde_json::from_str(&fixture("vfsmeta-item-dirty.json")).unwrap();
-        v["Dirty"] = serde_json::json!(dirty);
-        std::fs::write(nested.join("one.bin"), v.to_string()).unwrap();
-        dir
-    }
-
     #[tokio::test]
     async fn a_minimal_cache_mode_mount_is_never_reported_idle() {
         // `minimal` builds a cache and a queue, so `vfs/stats` and `vfs/queue` look exactly
@@ -611,11 +515,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_writes_cache_mode_mount_with_an_empty_cache_is_trusted() {
-        // The other side of the checks above: with the queue empty *and* the cache empty
-        // there is nothing left to be uncertain about. Without this, "never trust the
-        // queue" would pass every other test here while making every mount permanently
-        // unknown, which is useless rather than merely cautious.
+    async fn a_writes_cache_mode_mount_with_an_empty_queue_is_trusted() {
+        // The other side of the checks above. `writes` and `full` put every *closed* write
+        // through the queue, so an empty one is an answer rather than an absence, and this
+        // is the case that has to stay confident. Without it, "never trust the queue"
+        // would pass every other test in this file while leaving the applet permanently
+        // unable to call anything safe to unmount — useless rather than cautious.
+        //
+        // What this does not cover is a file still open: rclone enqueues on close, so
+        // nothing over rc sees it. DESIGN.md records the blind spot, `fusermount3` refuses
+        // a non-lazy unmount while the file is open, and #22's watcher is what will show
+        // it.
         let fake = FakeRc::new(
             "writes",
             vec![
@@ -628,26 +538,25 @@ mod tests {
         let mut p = MountPoller::connect("backup", fake.client()).await;
         let s = p.poll().await;
 
-        assert!(s.outstanding_known, "nothing queued and nothing cached");
+        assert!(s.outstanding_known, "every closed write reaches this queue");
         assert!(s.is_idle());
         assert!(s.safe_to_unmount());
         assert!(s.degraded_reason.is_none());
     }
 
     #[tokio::test]
-    async fn an_open_write_is_not_reported_idle_merely_because_the_queue_is_empty() {
-        // rclone enqueues a file when it is *closed*, so throughout a large copy — on the
-        // default cache mode — the queue is empty and every upload counter reads zero
-        // while the cache file grows. Measured on a live `writes` mount: 8MB on disk with
-        // vfsMeta `Dirty: true`, `vfs/queue` `[]`, `uploadsQueued` 0, nothing in
-        // `core/stats`. The on-disk flag is the only thing that sees it.
-        let meta = meta_tree("dirty", true);
+    async fn a_read_mostly_full_mount_is_trusted_too() {
+        // `full` queues every closed write as well, and is the mode recommended for
+        // read-heavy media mounts. Anything keyed on the *cache* being empty rather than
+        // the queue would condemn those permanently: measured on a live mount, one read
+        // and no write at all leaves `diskCache.files` at 1, and it stays up for
+        // `--vfs-cache-max-age`.
         let fake = FakeRc::new(
-            "openwrite",
+            "fullread",
             vec![
                 ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
                 ("vfs/queue", r#"{"queue":[]}"#.to_string()),
-                ("vfs/stats", stats_with_meta(2, 1, &meta.0)),
+                ("vfs/stats", stats_with(3, 400)),
             ],
         )
         .await;
@@ -655,13 +564,11 @@ mod tests {
         let s = p.poll().await;
 
         assert!(
-            !s.safe_to_unmount(),
-            "a dirty cache file the queue cannot see must not read as safe to unmount"
+            s.safe_to_unmount(),
+            "400 read-cached files are not outstanding work: {:?}",
+            s.degraded_reason
         );
-        assert!(!s.outstanding_known);
-        assert!(!s.is_idle());
-        let why = s.degraded_reason.clone().expect("the user has to be told");
-        assert!(why.contains("not yet uploaded"), "{why}");
+        assert!(s.degraded_reason.is_none());
     }
 
     #[tokio::test]
@@ -697,62 +604,6 @@ mod tests {
             "256KB left the queue, got {:?}",
             second.rate_bytes_per_sec
         );
-    }
-
-    #[tokio::test]
-    async fn a_read_only_full_mount_is_still_reported_idle() {
-        // Under `full`, reading populates the cache: measured on a live mount, one read
-        // and no write at all leaves `diskCache.files` at 1 with the descriptor's `Dirty`
-        // false. Counting cache entries would condemn every read-mostly media mount —
-        // exactly what `full` is recommended for — to "cannot tell" for the whole of
-        // `--vfs-cache-max-age`, and to a reason claiming a write was in progress.
-        let meta = meta_tree("cleanfull", false);
-        let fake = FakeRc::new(
-            "fullread",
-            vec![
-                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
-                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
-                ("vfs/stats", stats_with_meta(3, 1, &meta.0)),
-            ],
-        )
-        .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await;
-
-        assert!(
-            s.safe_to_unmount(),
-            "nothing is dirty, so the applet must be able to answer the question it exists \
-             for: {:?}",
-            s.degraded_reason
-        );
-        assert!(s.is_idle());
-        assert!(s.degraded_reason.is_none());
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_cache_metadata_tree_is_not_taken_as_clean() {
-        // "Could not look" is not "nothing there". A path that exists but cannot be
-        // listed has to read as uncertainty, not as an idle mount.
-        let dir = TempDir(std::env::temp_dir().join(format!("rvt-meta-x-{}", std::process::id())));
-        std::fs::create_dir_all(&dir.0).unwrap();
-        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o000)).unwrap();
-
-        let fake = FakeRc::new(
-            "unreadable",
-            vec![
-                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
-                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
-                ("vfs/stats", stats_with_meta(2, 1, &dir.0)),
-            ],
-        )
-        .await;
-        let mut p = MountPoller::connect("backup", fake.client()).await;
-        let s = p.poll().await;
-        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        assert!(!s.safe_to_unmount());
-        let why = s.degraded_reason.clone().expect("say why");
-        assert!(why.contains("could not be read"), "{why}");
     }
 
     #[tokio::test]

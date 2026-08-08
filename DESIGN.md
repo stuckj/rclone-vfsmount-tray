@@ -327,21 +327,29 @@ duration of any large copy, not a narrow race.
 entries too: it stays up for the cache's retention window (`--vfs-cache-max-age`, default
 1h) after an upload finishes, and under `full` a plain *read* creates one — measured, one
 read and no write leaves `files: 1` with the descriptor's `Dirty` false. Counting cache
-entries would condemn every read-mostly `full` mount to "cannot tell" permanently, which is
-a worse answer than the one it set out to fix.
+entries would condemn every read-mostly `full` mount, which is what `full` is recommended
+for, to a permanent "cannot tell".
 
-So when the queue is empty the poller reads `diskCache.pathMeta` and checks the on-disk
-`Dirty` flag, which is exact in every mode. This is a narrow predicate, not the T4 tier:
-#22 is the full scanner with a file list, sizes and inotify, and should absorb it.
+Only the on-disk `Dirty` flag under `diskCache.pathMeta` is exact. **Reading it per poll is
+the wrong shape and is deliberately not done here:**
 
-**T4 is therefore strictly better than T2 for this one question**, the single place the
-ladder's ordering does not hold — an on-disk scan sees an open write that `vfs/queue`
-cannot.
+- rclone rewrites descriptors non-atomically — 260 zero-length reads in 291,614 while a
+  mount was under load — so a single-shot read votes "clean" for a file that is dirty.
+- A clean tree is read in full every time, and "queue empty" is the *permanent* state of a
+  read-mostly mount: ~0.7 s per 15 s poll over 50k descriptors, ~7 s over 500k.
+- The path comes from an rc response, so walking it needs the untrusted-input handling this
+  document already requires below.
 
-Note the kernel is the backstop, not this check: `fusermount3 -u` on a mount with a file
-open fails with `EBUSY` (measured), and the supervisor never unmounts lazily. What the
-check buys is an honest *display* during a copy, and correctness if a forced unmount is
-ever offered.
+**T4 is therefore strictly better than T2 for this one question** — the single place the
+ladder's ordering does not hold — and #22 is where it belongs, because inotify maintains
+the answer incrementally instead of re-deriving it.
+
+Until then the queue is taken at its word and the blind spot is accepted, because the
+consequence is a display inaccuracy rather than data loss: `fusermount3 -u` on a mount with
+a file open fails with `EBUSY` (measured), and no call site passes `lazy`. So the window in
+which the applet wrongly reads "idle" is exactly the window in which an unmount would be
+refused anyway. If a forced unmount is ever offered, this stops being cosmetic and #22
+becomes a prerequisite for it.
 
 ### Two field names that mean less than they say
 

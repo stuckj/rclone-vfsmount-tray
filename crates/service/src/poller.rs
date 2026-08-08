@@ -153,11 +153,8 @@ impl MountPoller {
         };
 
         // Reached only when `vfs/queue` omitted the key, which is how a cacheless VFS
-        // answers. Usually the whole story — but if `vfs/stats` contradicts it by
-        // reporting a cache, believe the endpoint that answered rather than the one that
-        // did not: its counts are the only reading left, and naming a cache mode the
-        // other endpoint just denied sends the user somewhere there is nothing to find.
-        // The mirror of this, a queue with no cache, is kept for the same reason below.
+        // answers. If `vfs/stats` contradicts that by reporting a cache, believe the
+        // endpoint that answered — as the mirror case below does.
         if !state.outstanding_known {
             self.rate.reset();
             return match &cache {
@@ -173,14 +170,10 @@ impl MountPoller {
         match &cache {
             CacheProbe::Present(c, mode) => {
                 state = state.with_cache_health(c);
-                // `minimal` builds a cache and a queue, so nothing above this point can
-                // tell it from `writes` — but a write-only open of an uncached file
-                // streams past both, leaving its queue a floor rather than a total.
-                //
-                // Written to fail closed. An unrecognised mode reaches the same branch as
-                // `minimal`: rclone renaming `opt.CacheMode` or encoding it as a string
-                // would otherwise silently restore "an empty queue means idle" on every
-                // mount, which is the claim that gets a file truncated.
+                // `minimal` is indistinguishable from `writes` at every endpoint but
+                // this one, and a write-only open streams past its queue. Fails closed:
+                // an unrecognised mode takes the same branch, so renaming `opt.CacheMode`
+                // upstream cannot silently restore "an empty queue means idle".
                 if !mode.is_some_and(CacheMode::all_writes_queued) {
                     state = state.partially_observed(match mode {
                         Some(CacheMode::Minimal) => {
@@ -221,10 +214,13 @@ impl MountPoller {
             }
         }
 
-        // Per-file progress, where the build has `core/stats` and the transfers can be
-        // attributed to this mount. Without the cache path a transfer cannot be told from
-        // another mount's, so the lift is skipped rather than guessed at.
-        if let (true, Some(cache)) = (self.caps.has("core/stats"), self.cache_path.clone()) {
+        // Per-file progress, where the build has `core/stats`, the transfers can be
+        // attributed to this mount, and there is a queue-derived state to attach them to.
+        // Without the cache path a transfer cannot be told from another mount's, so the
+        // lift is skipped rather than guessed at; without T2 `with_progress` discards the
+        // answer, so asking for it is a wasted round-trip every second.
+        let liftable = self.caps.has("core/stats") && state.fidelity == Some(Tier::T2);
+        if let (true, Some(cache)) = (liftable, self.cache_path.clone()) {
             match self.client.call::<CoreStats>("core/stats", empty()).await {
                 Ok(stats) => {
                     // Both conditions, per DESIGN.md: the `global_stats` group alone admits

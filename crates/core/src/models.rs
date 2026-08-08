@@ -308,8 +308,10 @@ pub struct QueueItem {
     #[serde(default)]
     pub delay: f64,
     /// Upload attempts so far, counted from the moment each one starts, so an attempt in
-    /// flight already reads 1. A cancelled upload — the file was modified while queued —
-    /// also increments it without anything having gone wrong.
+    /// flight already reads 1. Writing to a file that is already queued **resets** this,
+    /// along with [`Self::delay`] — rclone drops the entry and re-queues it — so a value
+    /// above 1 is evidence of failure rather than of a file being re-saved. Measured
+    /// 4 → 1 across a modify.
     #[serde(default)]
     pub tries: u64,
     /// Whether the upload is in flight right now.

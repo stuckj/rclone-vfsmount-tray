@@ -186,8 +186,14 @@ impl RcClient {
     }
 
     /// The conventional socket path for a named mount.
+    ///
+    /// A configured name cannot contain `/`, but a foreign mount is named by its absolute
+    /// mount point, and `Path::join` given an absolute argument discards the base — so
+    /// without the substitution `/srv/media` resolves to `/srv/media.sock`, anywhere on
+    /// the filesystem. The service builds the same name from its own runtime directory and
+    /// has to agree with this.
     pub fn socket_path_for(name: &str) -> Option<PathBuf> {
-        Some(Self::socket_dir()?.join(format!("{name}.sock")))
+        Some(Self::socket_dir()?.join(format!("{}.sock", name.replace('/', "_"))))
     }
 
     pub fn socket(&self) -> &Path {
@@ -486,6 +492,38 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_conventional_socket_path_never_escapes_the_runtime_directory() {
+        // The client's half of the rule the service enforces in `rc_socket_path`. A
+        // foreign mount is named by its absolute mount point, and `Path::join` given an
+        // absolute path throws the base away — so a client resolving `/srv/media` by name
+        // would look for an rc socket at `/srv/media.sock` and, finding any user-owned
+        // socket in a private directory there, POST `rc/list` at an unrelated daemon.
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        // SAFETY: single-threaded test; restored before returning.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
+
+        let root = RcClient::socket_dir().expect("set above");
+        for name in ["/srv/media", "/", "../../etc/passwd", "a/b"] {
+            let p = RcClient::socket_path_for(name).expect("set above");
+            assert!(
+                p.starts_with(&root),
+                "{name:?} produced {p:?}, outside {root:?}"
+            );
+        }
+        assert_eq!(
+            RcClient::socket_path_for("backup"),
+            Some(root.join("backup.sock")),
+            "a configured name must keep the path it has always had"
+        );
+
+        match saved {
+            // SAFETY: as above.
+            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+    }
 
     /// A stand-in rc server: accepts one connection, reads the request, and replies with
     /// exactly the bytes given. Raw HTTP rather than a server library, because the point

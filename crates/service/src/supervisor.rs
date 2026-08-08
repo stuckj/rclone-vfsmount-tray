@@ -646,8 +646,8 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
 /// Where a mount's rc socket lives.
 ///
-/// The one place this is computed, because two of them drifting is how the sanitisation
-/// below gets applied to only one. Configured names cannot contain `/` —
+/// The service's copy of this; `RcClient::socket_path_for` is the client's, against
+/// `XDG_RUNTIME_DIR`, and the two have to agree. Configured names cannot contain `/` —
 /// `Config::validate` rejects them — but a foreign mount is named by its absolute mount
 /// point, and `Path::join` given an absolute argument discards the base: `/srv/media`
 /// would otherwise resolve to `/srv/media.sock`, anywhere on the filesystem.

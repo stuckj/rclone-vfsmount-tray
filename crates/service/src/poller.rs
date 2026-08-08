@@ -8,6 +8,7 @@ use rvt_core::config::CacheMode;
 use rvt_core::models::{CoreStats, DiskCache, VfsQueue, VfsStats};
 use rvt_core::rc::{RcClient, RcError};
 use rvt_core::transfer::{RateEstimator, TransferState};
+use std::fmt::Write as _;
 use std::time::Duration;
 
 /// Poll interval while something is outstanding.
@@ -84,11 +85,9 @@ impl MountPoller {
     /// idle. A mount that cannot be observed has nothing to re-derive every second, and a
     /// partially observed one with real entries in its queue still has to be watched.
     pub fn interval(state: &TransferState) -> Duration {
-        // A disk-derived state is never the fast case, however much it found: rclone is
-        // not answering, so nothing is uploading and the figures cannot move — and the
-        // walk behind it costs a full read of the metadata tree, which DESIGN.md measures
-        // at ~0.7s over 50k descriptors. Re-deriving that every second would be the shape
-        // that document says not to use.
+        // A disk-derived state is never the fast case. The walk behind it costs a full
+        // read of the metadata tree — DESIGN.md measures ~0.7s over 50k descriptors — and
+        // re-deriving that every second is the shape that document says not to use.
         if state.fidelity == Some(Tier::T4) {
             return IDLE;
         }
@@ -288,7 +287,7 @@ impl MountPoller {
     /// A scan that fails is not folded into the rc failure. "rclone is unreachable" alone
     /// would hide that the fallback was tried and could not read the cache either, which
     /// is a different thing to go and look at.
-    async fn unreachable(&mut self, e: &RcError) -> TransferState {
+    async fn unreachable(&self, e: &RcError) -> TransferState {
         let (Some(meta), Some(data)) = (self.meta_path.clone(), self.cache_path.clone()) else {
             return TransferState::unmonitored(&self.name, e.to_string());
         };
@@ -306,21 +305,46 @@ impl MountPoller {
                 format!("{e}; and the cache it reported is no longer on disk"),
             ),
             Ok(Ok(found)) => {
-                let state = TransferState::from_scan(&self.name, &found).degraded(format!(
+                // One message, built once. `degraded` and `partially_observed` both own
+                // `degraded_reason`, so layering them drops whichever ran first — and the
+                // one that would be lost is the only mention that a disk scan happened at
+                // all.
+                let mut why = format!(
                     "{e}; read {} pending file(s) from the cache on disk instead",
                     found.files.len()
-                ));
+                );
+                if found.unreadable > 0 {
+                    // Otherwise the state reads not-known with nothing in the text to
+                    // explain it, and the rc failure takes the blame for the cache being
+                    // half-read.
+                    let _ = write!(
+                        why,
+                        "; {} entries there could not be read",
+                        found.unreadable
+                    );
+                }
+                if found.truncated {
+                    let _ = write!(why, "; and the cache was too large to finish walking");
+                }
+
                 // The same rule the live path applies, and for the same reason: under
-                // `minimal` a write-only open never enters the cache, so a scan that
-                // finds nothing has not established that nothing is in flight. An
-                // unrecognised or unseen mode fails closed here too.
-                if self.mode.is_some_and(CacheMode::all_writes_queued) {
-                    state
+                // `minimal` a write-only open never enters the cache — which is what this
+                // scan reads — so finding nothing has not established that nothing is in
+                // flight. An unrecognised or unseen mode fails closed here too.
+                let all_queued = self.mode.is_some_and(CacheMode::all_writes_queued);
+                if !all_queued {
+                    let _ = write!(
+                        why,
+                        "; and this mount's cache mode does not put every write through the \
+                         cache, so what is on disk is a floor"
+                    );
+                }
+
+                let state = TransferState::from_scan(&self.name, &found);
+                if all_queued {
+                    state.degraded(why)
                 } else {
-                    state.partially_observed(format!(
-                        "{e}; and this mount's cache mode does not put every write through \
-                         the cache, so what is on disk is a floor"
-                    ))
+                    state.partially_observed(why)
                 }
             }
             Ok(Err(scan_err)) => TransferState::unmonitored(
@@ -1362,6 +1386,12 @@ mod tests {
         assert!(
             after.degraded_reason.is_some(),
             "this is a fallback, and the user should be told which one"
+        );
+        assert_eq!(
+            MountPoller::interval(&after),
+            IDLE,
+            "a disk-derived state has files outstanding but must not drive the 1s cadence \
+             — each poll behind it is a full walk of the metadata tree"
         );
     }
 

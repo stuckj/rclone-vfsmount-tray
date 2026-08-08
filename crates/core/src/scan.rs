@@ -10,8 +10,11 @@
 //! mid-write. See DESIGN.md.
 //!
 //! The paths come from an rc response (`vfs/stats` `diskCache.path` and `pathMeta`), so
-//! they are untrusted input: the walk stays on regular files inside the root it was given
-//! and never follows a link out of it.
+//! they are untrusted input: the walk reads only regular files, and refuses a descriptor
+//! that turns into a symlink or a FIFO between being listed and being opened. It does not
+//! defend the *directory* steps the same way — a directory swapped for a symlink between
+//! the listing and the descent is followed — which bounds what this is: protection against
+//! a wedged or runaway read, not isolation from a hostile filesystem.
 
 use crate::models::VfsMetaItem;
 use std::io;
@@ -44,8 +47,9 @@ pub struct DirtyFile {
     pub name: String,
     /// Bytes held for this file, taken from the **data file**, not from the descriptor.
     ///
-    /// `Size` in the descriptor is 0 for the whole time a file is open, so summing it
-    /// reports nothing outstanding during exactly the copy a user is watching (#10).
+    /// The descriptor's own `Size` is stale for as long as a handle is open: 0 for a file
+    /// being created, and the *previous* size for one being rewritten. Summing it reports
+    /// nothing outstanding during exactly the copy a user is watching (#10).
     /// `None` when the data file is missing or could not be measured.
     pub bytes: Option<u64>,
 }
@@ -302,6 +306,68 @@ mod tests {
             "the descriptor says 0; the data file says 7MB, and the data file is right"
         );
         assert_eq!(s.known_bytes(), 7_340_032);
+    }
+
+    #[test]
+    fn a_rewrite_in_progress_is_measured_from_the_data_file_not_the_stale_size() {
+        // The shape neither other fixture has: `Size` non-zero, and *wrong*. Rewriting an
+        // already-uploaded file leaves the descriptor's previous size and ranges in place
+        // while the data file grows — measured on a live mount. "Trust the descriptor when
+        // it says something, fall back to the data file when it says 0" passes every other
+        // test here and under-reports this by every byte written past the old size.
+        let t = Tree::new("rewrite");
+        t.put(
+            "grown.bin",
+            r#"{"ModTime":"2026-08-08T00:00:00Z","ATime":"2026-08-08T00:00:00Z",
+                "Size":4194304,"Rs":[{"Pos":0,"Size":4194304}],"Fingerprint":"","Dirty":true}"#,
+            Some(8_388_608),
+        );
+        let s = t.scan();
+
+        assert_eq!(
+            s.files[0].bytes,
+            Some(8_388_608),
+            "the descriptor is stale at 4MB; the data file has 8MB and is the honest one"
+        );
+        assert_eq!(s.known_bytes(), 8_388_608);
+    }
+
+    #[test]
+    fn a_descriptor_swapped_for_a_fifo_after_listing_does_not_block_the_walk() {
+        // The walk's type check is a separate stat, so it is a filter rather than a
+        // guarantee. `read_item` is what has to hold when the swap wins the race, and it
+        // is reached directly here because the walk would otherwise filter the FIFO out
+        // before it ever got there.
+        let t = Tree::new("swap");
+        let path = t.meta().join("swapped.bin");
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a path inside this test's own temp directory.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        // On a bounded wait rather than directly, because the regression this guards is a
+        // *hang*: opening a FIFO with no writer blocks until one appears, holding a
+        // blocking-pool thread for the life of the process. A test that hangs reports far
+        // less than one that fails.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_item(&probe).is_none());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(true) => {}
+            Ok(false) => panic!("a FIFO is not a descriptor and must not parse as one"),
+            Err(_) => panic!("read_item blocked on a FIFO — O_NONBLOCK is what stops that"),
+        }
+
+        use std::os::unix::fs::symlink;
+        let outside = t.0.join("elsewhere.json");
+        std::fs::write(&outside, closed(1)).unwrap();
+        let link = t.meta().join("linked.bin");
+        symlink(&outside, &link).unwrap();
+        assert!(
+            read_item(&link).is_none(),
+            "and a symlink swapped in the same way must not be followed"
+        );
     }
 
     #[test]

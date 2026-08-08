@@ -204,7 +204,7 @@ not by comparing version numbers, which only guesses.
 | **T1** | `core/stats` `transferring[]` | `{name, size}` always; `{bytes, percentage, speed, speedAvg, eta, group}` once rclone attaches accounting; `srcFs`/`dstFs` when a source/destination exists | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). **Does not meet the bar**, despite being the most detailed tier: it shows transfers that have *started*, and lags `vfs/queue` by `--vfs-write-back`, so a total taken from it reads zero while gigabytes sit queued — wrong in the unsafe direction. Mixes directions — see below. Treat every field but `name` and `size` as optional. |
 | **T2** | `vfs/queue` (per-fs) | `{name, id, size, expiry, tries, delay, uploading}` | **The minimum bar.** `sum(size)` = bytes to send; `uploading` = in flight. `vfs/queue-set-expiry` forces an upload. |
 | **T3** | `vfs/stats` (per-fs) | `diskCache{uploadsInProgress, uploadsQueued, erroredFiles, outOfSpace, path, pathMeta}` | Counts only. Does not meet the bar alone, but hands over the cache paths for T4. |
-| **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` plus the data file's own size | Bytes to send is the **data file's** size summed over dirty items — the descriptor's `Size` reads 0 for the whole time a file is open (#10), so summing it reports nothing during exactly the copy the user is watching. **Meets the bar with no rc at all**, survives an rclone crash, and is the only tier that sees a write before it is closed. |
+| **T4** | Cache directory scan | `vfsMeta/<backend>/<path>` JSON `{Size, Dirty, …}` plus the data file's own size | Bytes to send is the **data file's** size summed over dirty items — the descriptor's `Size` is stale while a handle is open — 0 for a new file, the previous size for a rewrite (#10), so summing it reports nothing during exactly the copy the user is watching. **Meets the bar with no rc at all**, survives an rclone crash, and is the only tier that sees a write before it is closed. |
 
 T4 is a first-class tier, not a fallback of last resort. It is the only tier that works when
 the rclone process is unreachable, and the only one that survives a crash, because the rc
@@ -349,8 +349,9 @@ done:**
 A torn read is not the same as a clean one: `rvt_core::scan` counts an entry it could not
 read and refuses to call the result complete, so a walk that lost a race says so rather
 than voting "clean". What remains is the cost, which is why the walk runs only when rclone
-is unreachable — there is nothing uploading then, so the figures cannot move — and never on
-the 1s cadence of a live mount. Making it cheap enough to run continuously is what inotify
+is unreachable, and at the idle cadence even then. Note "unreachable" also covers a timeout
+or a transport fault, which a live and busy rclone can produce — so this is a cheaper place
+to walk, not a guarantee that nothing is moving. Making it cheap enough to run continuously is what inotify
 is for, in the rest of #22.
 
 **T4 is therefore strictly better than T2 for this one question**: the single place the

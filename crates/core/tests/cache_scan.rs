@@ -185,6 +185,7 @@ fn a_write_still_in_flight_is_dirty_on_disk_before_it_reaches_the_queue() {
     let (src, cache) = (dir.0.join("src"), dir.0.join("cache"));
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
+    let rc = dir.0.join("rc.sock");
 
     let mut child = Rclone(
         Command::new(&rclone)
@@ -200,6 +201,10 @@ fn a_write_still_in_flight_is_dirty_on_disk_before_it_reaches_the_queue() {
                 "300s",
                 "--cache-dir",
                 &cache.to_string_lossy(),
+                "--rc",
+                "--rc-addr",
+                &format!("unix://{}", rc.display()),
+                "--rc-no-auth",
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -248,6 +253,14 @@ fn a_write_still_in_flight_is_dirty_on_disk_before_it_reaches_the_queue() {
         "less than the whole file, since the PUT is only part way through: {found:?}"
     );
 
+    // The other half of the claim in this test's name, asserted at the same instant: the
+    // queue has not heard of it. Without this the test proves only that the disk knows.
+    assert_eq!(
+        rc_post(&rc, "vfs/queue").replace([' ', '\n', '\t'], ""),
+        r#"{"queue":[]}"#,
+        "rclone queues on close, so a write still in flight is invisible over rc"
+    );
+
     drop(stream);
 }
 
@@ -289,15 +302,56 @@ fn put(port: u16, path: &str, body: &[u8]) {
     );
 }
 
-/// Read rclone's log until it announces the port it bound.
+/// Read rclone's log until it announces the port it bound, and keep draining it after.
+///
+/// The draining is not optional. Dropping the reader closes the pipe, and Go raises
+/// SIGPIPE on a write to a closed fd 2 — reproduced: rclone died with signal 13 on its
+/// first log line after the close, and the test then failed 20s later pointing at the
+/// scanner rather than at the dead child. It survives at the default log level only
+/// because nothing is logged per request.
 fn read_served_port(stderr: std::process::ChildStderr) -> Option<u16> {
-    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-        if let Some(rest) = line.split("127.0.0.1:").nth(1) {
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(p) = digits.parse() {
-                return Some(p);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut sent = false;
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sent {
+                continue;
+            }
+            if let Some(rest) = line.split("127.0.0.1:").nth(1) {
+                let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(p) = digits.parse::<u16>() {
+                    let _ = tx.send(p);
+                    sent = true;
+                }
             }
         }
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(20)).ok()
+}
+
+/// One rc call over the UNIX socket, as raw HTTP. Enough to read `vfs/queue`; the typed
+/// client lives in the crate under test and is not what this file is exercising.
+fn rc_post(socket: &Path, command: &str) -> String {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Ok(mut s) = UnixStream::connect(socket) {
+            let req = format!(
+                "POST /{command} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            s.write_all(req.as_bytes()).unwrap();
+            s.flush().unwrap();
+            let mut resp = String::new();
+            let _ = s.read_to_string(&mut resp);
+            if let Some((_, body)) = resp.split_once("\r\n\r\n") {
+                return body.to_string();
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rclone never answered on {socket:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    None
 }

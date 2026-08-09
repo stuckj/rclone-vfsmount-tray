@@ -414,6 +414,11 @@ impl MountPoller {
         if !cache.path.is_empty() && !cache.path_meta.is_empty() {
             self.cache_path = Some(cache.path.clone());
             self.meta_path = Some(cache.path_meta.clone());
+        } else {
+            // A cache reported but not named is still an answer: this mount's roots are
+            // unknown. Leaving the old ones in place is the third way to end up scanning
+            // a previous instance's tree, alongside no `diskCache` and no `vfs/stats`.
+            self.forget_cache();
         }
         Ok(CacheProbe::Present(cache, self.mode))
     }
@@ -1614,11 +1619,12 @@ mod tests {
         let _ = std::fs::remove_file(&fake.socket);
 
         let after = p.poll().await;
-        assert_eq!(after.pending.files, 1, "the backlog is still found");
         assert_eq!(
-            after.pending.known_bytes, 2048,
-            "and measured, which needs the data root that matches the metadata root"
+            after.fidelity, None,
+            "a cache reported but not named leaves this mount's roots unknown, and the \
+             previous instance's tree is not an answer about this one"
         );
+        assert!(!after.safe_to_unmount());
     }
 
     #[tokio::test]

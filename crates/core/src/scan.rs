@@ -484,9 +484,11 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_that_has_never_held_anything_is_empty_not_an_error() {
-        // rclone creates the tree lazily. A mount that has cached nothing has nothing
-        // outstanding, and that is a real answer rather than a failure to look.
+    fn a_missing_root_is_reported_as_missing_rather_than_as_an_error_or_a_zero() {
+        // rclone builds the whole chain when the VFS starts, so a root that is not there
+        // was removed. That is not this function's call to make, though: it reports the
+        // absence and the caller decides, because only the caller knows whether it had
+        // reason to expect a tree.
         let t = Tree::new("absent");
         let missing = t.0.join("never-existed");
         let s = scan(&missing, &t.data()).expect("an absent tree is not an error");
@@ -495,8 +497,7 @@ mod tests {
         assert!(s.is_complete(), "there was nothing to fail to read");
         assert!(
             !s.root_present,
-            "the caller has to be able to tell 'never cached anything' from 'the cache \
-             it told us about has gone'"
+            "reported as absent, so an empty tree and a missing one stay distinguishable"
         );
     }
 

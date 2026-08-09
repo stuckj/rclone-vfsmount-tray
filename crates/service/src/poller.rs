@@ -365,17 +365,18 @@ impl MountPoller {
         }
     }
 
-    /// Drop what a previous rclone said about this mount's cache.
+    /// Drop the cache roots a previous rclone named.
     ///
-    /// The roots and the mode describe whichever rclone is behind the socket now. Any
-    /// *answer* saying there is no cache — no `diskCache`, or no `vfs/stats` at all —
-    /// means the previous one's tree is not this mount's, and scanning it would report
-    /// another instance's emptiness as this mount's. A silence says nothing, so the
-    /// unreachable path deliberately does not come through here.
-    fn forget_cache(&mut self) {
+    /// They describe whichever rclone is behind the socket now, so any *answer* that does
+    /// not name a usable pair invalidates them: scanning the old tree would report another
+    /// instance's emptiness as this mount's. A silence says nothing, which is why the
+    /// unreachable path does not come through here — there the roots are all that is left.
+    ///
+    /// The mode is separate: it is whatever the last `vfs/stats` that answered reported,
+    /// and it is cleared only when none did.
+    fn forget_roots(&mut self) {
         self.cache_path = None;
         self.meta_path = None;
-        self.mode = None;
     }
 
     async fn fetch_stats(&mut self) -> Result<CacheProbe, RcError> {
@@ -393,7 +394,11 @@ impl MountPoller {
             // Keeping the roots here lets the fallback scan a tree that is not this
             // mount's and report its emptiness as an answer.
             Err(RcError::Failed { status: 404, .. }) => {
-                self.forget_cache();
+                // An answer, not a silence: this rclone does not have the endpoint, so
+                // nothing it says describes the cache a previous one named — including
+                // the mode, which no answering `vfs/stats` has now reported.
+                self.forget_roots();
+                self.mode = None;
                 return Ok(CacheProbe::NotAsked);
             }
             Err(e) => return Err(e),
@@ -405,7 +410,7 @@ impl MountPoller {
         let mode = stats.cache_mode();
         self.mode = mode;
         let Some(cache) = stats.disk_cache else {
-            self.forget_cache();
+            self.forget_roots();
             return Ok(CacheProbe::Absent);
         };
         // Together or not at all. Latched separately, a response carrying one and not the
@@ -419,15 +424,8 @@ impl MountPoller {
             // A cache reported but not named is still an answer: this mount's roots are
             // unknown. Leaving the old ones in place is the third way to end up scanning
             // a previous instance's tree, alongside no `diskCache` and no `vfs/stats`.
-            //
-            // Only the roots, not the mode — the mode *was* reported, and telling the user
-            // it was not is a different and untrue complaint. With no roots the fallback
-            // has nothing to scan regardless.
-            self.cache_path = None;
-            self.meta_path = None;
+            self.forget_roots();
         }
-        // The mode this response carried, not the latch: `self.mode` may since have been
-        // cleared, and the live path is asking what rclone just said.
         Ok(CacheProbe::Present(cache, mode))
     }
 
@@ -1735,6 +1733,49 @@ mod tests {
             "there is no cache of this mount's to scan, so no tier produced this"
         );
         assert!(!after.safe_to_unmount());
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_cannot_be_read_is_named_separately_from_the_rc_failure() {
+        // `unreachable`'s rustdoc promises this: reporting only "rclone is unreachable"
+        // when the fallback was tried and could not read the cache either sends the user
+        // to look at rclone, when the thing to look at is the cache directory.
+        use std::os::unix::fs::PermissionsExt;
+        let cache =
+            TempDir(std::env::temp_dir().join(format!("rvt-noread-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&cache.0);
+        dirty_entry(&cache.0, "waiting.bin", 16);
+
+        let fake = FakeRc::new(
+            "noread",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", fixture("vfs-queue-uploading.json")),
+                (
+                    "vfs/stats",
+                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                ),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+        let meta = cache.0.join("vfsMeta");
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let after = p.poll().await;
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(!after.outstanding_known);
+        let why = after.degraded_reason.clone().expect("say why");
+        assert!(
+            why.contains("could not be read"),
+            "the cache failing to read is a different thing to go and look at than rclone \
+             being unreachable: {why}"
+        );
     }
 
     #[tokio::test]

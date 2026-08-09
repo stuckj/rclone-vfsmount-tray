@@ -2,8 +2,13 @@
 
 A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mountain Duck.
 
-> **Status: early development.** The workspace, the rc API models and CI are in place; there
-> is no working applet yet. See the [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1).
+> **Status: early development — not usable yet.** The service finds rclone, reads its own
+> configuration, starts, stops and adopts mounts as systemd user units, and works out what
+> each one still has to upload — over rclone's rc API where it answers, and by reading the
+> write-back cache off disk where it does not. What it does not do is *serve*: it
+> reconciles, polls each mount once, logs what it found, and exits. There is no D-Bus
+> surface, and the tray and GTK clients are scaffolding.
+> See the [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1).
 
 ## What it will do
 
@@ -23,6 +28,14 @@ the write-back queue is effectively invisible. Nothing is *lost* when you unmoun
 full queue — rclone's cache is on disk and resumes — but you have no way to know whether
 your data has reached the remote, or when it will.
 
+That queue is now modelled, at whichever fidelity the rclone in front of it supports, and
+every figure carries whether it can be trusted: a number this project cannot stand behind
+is reported as unknown rather than as zero. A file still being *written* is the exception
+worth knowing about, and the reason the unmount check is not just a nicety — rclone only
+queues a file when it is closed, so stopping the mount mid-write severs it and the
+truncated cache item is later uploaded as if complete. Measured, and tracked as
+[#73](https://github.com/stuckj/rclone-vfsmount-tray/issues/73).
+
 ## How it is put together
 
 Three processes:
@@ -33,11 +46,12 @@ Three processes:
 | `rclone-vfsmount-tray` | The tray icon. A client. |
 | `rclone-vfsmount-tray-gtk` | The configuration and transfer windows. Also a client. |
 
-**Mounts will belong to the service, so quitting the tray will not unmount anything** —
-neither will restarting the service for a package upgrade. That is the central design
-guarantee; see [DESIGN.md](DESIGN.md) for the full lifetime matrix, which is the
-specification the supervisor and its integration tests are being built against. None of it
-is implemented yet.
+**Mounts belong to the service, so quitting the tray will not unmount anything** — neither
+will restarting the service for a package upgrade. That is the central design guarantee.
+Each mount runs as its own transient systemd user unit, which is what makes it outlive the
+process that started it; see [DESIGN.md](DESIGN.md) for the full lifetime matrix. The
+supervisor implements and unit-tests it today; asserting the whole matrix against a real
+rclone is [#38](https://github.com/stuckj/rclone-vfsmount-tray/issues/38).
 
 The service is designed to run with no tray at all, which is the sensible configuration on a
 headless box.

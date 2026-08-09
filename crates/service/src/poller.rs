@@ -365,6 +365,19 @@ impl MountPoller {
         }
     }
 
+    /// Drop what a previous rclone said about this mount's cache.
+    ///
+    /// The roots and the mode describe whichever rclone is behind the socket now. Any
+    /// *answer* saying there is no cache — no `diskCache`, or no `vfs/stats` at all —
+    /// means the previous one's tree is not this mount's, and scanning it would report
+    /// another instance's emptiness as this mount's. A silence says nothing, so the
+    /// unreachable path deliberately does not come through here.
+    fn forget_cache(&mut self) {
+        self.cache_path = None;
+        self.meta_path = None;
+        self.mode = None;
+    }
+
     async fn fetch_stats(&mut self) -> Result<CacheProbe, RcError> {
         if !self.caps.has("vfs/stats") {
             return Ok(CacheProbe::NotAsked);
@@ -375,21 +388,23 @@ impl MountPoller {
             // been replaced by one that does not register `vfs/stats`, faulting here would
             // discard the T2 answer `vfs/queue` can still give — the same 404 is already
             // handled that way for the queue.
-            Err(RcError::Failed { status: 404, .. }) => return Ok(CacheProbe::NotAsked),
+            // An answer, not a silence: this rclone does not have the endpoint, so
+            // whatever a previous one said about its cache no longer describes the mount.
+            // Keeping the roots here lets the fallback scan a tree that is not this
+            // mount's and report its emptiness as an answer.
+            Err(RcError::Failed { status: 404, .. }) => {
+                self.forget_cache();
+                return Ok(CacheProbe::NotAsked);
+            }
             Err(e) => return Err(e),
         };
-        // Unconditional. Every path where rclone did not answer returns before this, so
-        // the latch still survives an unreachable poll — but a `vfs/stats` that *did*
-        // answer with a mode this build does not recognise must clear it, or the disk
-        // fallback keeps using the old one and trusts a write path it can no longer read.
+        // Unconditional. An unreachable poll returns before this, so the latch survives
+        // one — but a `vfs/stats` that *did* answer, with a mode this build cannot read,
+        // must clear it, or the disk fallback keeps trusting a write path it can no
+        // longer see.
         self.mode = stats.cache_mode();
         let Some(cache) = stats.disk_cache else {
-            // No cache at all clears the roots, for the same reason a response naming one
-            // root and not the other does not update either: they describe the rclone
-            // answering now. Kept, they let the fallback scan a previous instance's tree
-            // and report its emptiness as this mount's.
-            self.cache_path = None;
-            self.meta_path = None;
+            self.forget_cache();
             return Ok(CacheProbe::Absent);
         };
         // Together or not at all. Latched separately, a response carrying one and not the
@@ -441,6 +456,12 @@ mod tests {
     }
 
     impl FakeRc {
+        /// Stop serving a route, so it answers 404 — an rclone replaced by a build that
+        /// does not register the endpoint.
+        fn remove(&self, path: &str) {
+            self.routes.lock().unwrap().retain(|(p, _)| *p != path);
+        }
+
         /// Replace one route's body. Anything a poll derives by differencing two polls is
         /// invisible to a server that answers identically every time.
         fn set(&self, path: &str, body: String) {
@@ -1598,6 +1619,52 @@ mod tests {
             after.pending.known_bytes, 2048,
             "and measured, which needs the data root that matches the metadata root"
         );
+    }
+
+    #[tokio::test]
+    async fn an_rclone_without_vfs_stats_clears_the_roots_a_previous_one_named() {
+        // A 404 is an answer: this rclone does not have the endpoint, so nothing it says
+        // describes the cache a previous one named. Keeping the roots lets the fallback
+        // scan a tree belonging to an instance that is gone and report its emptiness as
+        // this mount's — a confident idle for a mount whose real cache was never named.
+        let stale =
+            TempDir(std::env::temp_dir().join(format!("rvt-404root-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&stale.0);
+        std::fs::create_dir_all(stale.0.join("vfsMeta")).unwrap();
+        std::fs::create_dir_all(stale.0.join("vfs")).unwrap();
+
+        let fake = FakeRc::new(
+            "root404",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                (
+                    "vfs/stats",
+                    stats_pointing_at(&stale.0.join("vfsMeta"), &stale.0.join("vfs")),
+                ),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        assert!(
+            p.poll().await.safe_to_unmount(),
+            "roots latched from a cache"
+        );
+
+        // Same socket, a build with no `vfs/stats`. Capabilities were latched at connect,
+        // so it is still asked, and answers 404.
+        fake.remove("vfs/stats");
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
+        assert_eq!(
+            after.fidelity, None,
+            "no cache of this mount's was ever named, so no tier produced this"
+        );
+        assert!(!after.safe_to_unmount());
     }
 
     #[tokio::test]

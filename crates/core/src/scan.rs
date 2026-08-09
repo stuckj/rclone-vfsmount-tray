@@ -65,11 +65,9 @@ pub struct CacheScan {
     pub truncated: bool,
     /// Whether the metadata root was there at all.
     ///
-    /// `false` is not "nothing outstanding". rclone creates the tree lazily, so a mount
-    /// that has never cached anything genuinely has none — but a caller that took this
-    /// path *from a `vfs/stats` that reported a cache* is looking at a tree that has since
-    /// gone, and the queue draining is not the only way that happens. Only the caller
-    /// knows which of the two it is in.
+    /// `false` is not "nothing outstanding" — it is "the tree is gone". rclone creates the
+    /// whole `<backend>/<remote path>` chain when the VFS starts, before anything is read
+    /// or written, so a root that `vfs/stats` named and that is now missing was removed.
     pub root_present: bool,
 }
 
@@ -101,8 +99,8 @@ impl CacheScan {
 /// `meta_root` is `diskCache.pathMeta` and `data_root` is `diskCache.path`; the two trees
 /// mirror each other, and a file's size comes from the second.
 ///
-/// A missing `meta_root` is an empty scan: rclone creates the tree lazily, so a mount that
-/// has never cached anything genuinely has nothing outstanding. Anything else that goes
+/// A missing `meta_root` reports [`CacheScan::root_present`] false rather than erroring —
+/// the caller knows whether it had reason to expect a tree there. Anything else that goes
 /// wrong at the root is an error, because "could not look" is not "nothing there".
 pub fn scan(meta_root: &Path, data_root: &Path) -> io::Result<CacheScan> {
     scan_bounded(meta_root, data_root, MAX_ENTRIES)
@@ -142,15 +140,18 @@ fn scan_bounded(meta_root: &Path, data_root: &Path, max_entries: usize) -> io::R
         };
 
         for entry in entries {
-            let Ok(entry) = entry else {
-                out.unreadable += 1;
-                continue;
-            };
+            // Counted before the entry is inspected, so a directory that errors on every
+            // one of them is bounded by the cap like any other.
             if visited >= max_entries {
                 out.truncated = true;
                 return Ok(out);
             }
             visited += 1;
+
+            let Ok(entry) = entry else {
+                out.unreadable += 1;
+                continue;
+            };
 
             let path = entry.path();
             // `file_type` here does not follow links, so a symlink is neither a dir nor a
@@ -222,8 +223,7 @@ fn data_size(path: &Path) -> Option<u64> {
 /// than being reported under a mangled name.
 fn relative_name(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
-    let s = rel.to_str()?;
-    (!s.is_empty()).then(|| s.to_string())
+    Some(rel.to_str()?.to_string())
 }
 
 #[cfg(test)]
@@ -552,6 +552,29 @@ mod tests {
             "what it found is a floor, not a total — reporting it as one is the false \
              idle this tier exists to prevent"
         );
+    }
+
+    #[test]
+    fn a_descriptor_larger_than_the_cap_is_unknown_rather_than_read_whole() {
+        // The last untrusted-input guard without one. The tree is named by an rc response,
+        // so an enormous "descriptor" must not be pulled into memory to find out it was
+        // never JSON. Padding first, so the file only parses if the cap is not applied.
+        let t = Tree::new("huge");
+        let mut json = String::from("{\"Dirty\":true,\"Size\":1,\"Pad\":\"");
+        json.push_str(&"p".repeat(128 * 1024));
+        json.push_str("\"}");
+        t.put("huge.bin", &json, Some(1));
+        t.put("normal.bin", &closed(4), Some(4));
+
+        let s = t.scan();
+        assert_eq!(
+            s.files.len(),
+            1,
+            "the oversized one is not reported as a dirty file: {:?}",
+            s.files
+        );
+        assert_eq!(s.files[0].name, "normal.bin");
+        assert_eq!(s.unreadable, 1, "it is unknown, not clean");
     }
 
     #[test]

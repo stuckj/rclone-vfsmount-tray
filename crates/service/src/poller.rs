@@ -384,6 +384,12 @@ impl MountPoller {
         // fallback keeps using the old one and trusts a write path it can no longer read.
         self.mode = stats.cache_mode();
         let Some(cache) = stats.disk_cache else {
+            // No cache at all clears the roots, for the same reason a response naming one
+            // root and not the other does not update either: they describe the rclone
+            // answering now. Kept, they let the fallback scan a previous instance's tree
+            // and report its emptiness as this mount's.
+            self.cache_path = None;
+            self.meta_path = None;
             return Ok(CacheProbe::Absent);
         };
         // Together or not at all. Latched separately, a response carrying one and not the
@@ -1592,6 +1598,53 @@ mod tests {
             after.pending.known_bytes, 2048,
             "and measured, which needs the data root that matches the metadata root"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cache_that_stops_being_reported_clears_the_latched_roots() {
+        // The roots describe the rclone answering now. If it says it has no cache, a tree
+        // latched from a previous instance is not this mount's — and scanning it finds an
+        // empty directory, which reads as "nothing outstanding" for a mount that has no
+        // cache to be outstanding in. rclone 1.75 pairs a cacheless VFS with CacheMode 0,
+        // which fails closed on its own, so this is the class fix rather than a live bug.
+        let stale =
+            TempDir(std::env::temp_dir().join(format!("rvt-staleroot-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&stale.0);
+        std::fs::create_dir_all(stale.0.join("vfsMeta")).unwrap();
+        std::fs::create_dir_all(stale.0.join("vfs")).unwrap();
+
+        let good = stats_pointing_at(&stale.0.join("vfsMeta"), &stale.0.join("vfs"));
+        // Same socket, an rclone reporting a queueing mode and no cache.
+        let mut cacheless: serde_json::Value = serde_json::from_str(&good).unwrap();
+        cacheless["diskCache"] = serde_json::Value::Null;
+
+        let fake = FakeRc::new(
+            "staleroot",
+            vec![
+                ("rc/list", rc_list(&["rc/list", "vfs/queue", "vfs/stats"])),
+                ("vfs/queue", r#"{"queue":[]}"#.to_string()),
+                ("vfs/stats", good),
+            ],
+        )
+        .await;
+        let mut p = MountPoller::connect("backup", fake.client()).await;
+        assert!(
+            p.poll().await.safe_to_unmount(),
+            "roots latched from a cache"
+        );
+
+        fake.set("vfs/stats", cacheless.to_string());
+        let _ = p.poll().await;
+
+        fake.handle.abort();
+        let _ = std::fs::remove_file(&fake.socket);
+
+        let after = p.poll().await;
+        assert_eq!(
+            after.fidelity, None,
+            "there is no cache of this mount's to scan, so no tier produced this"
+        );
+        assert!(!after.safe_to_unmount());
     }
 
     #[tokio::test]

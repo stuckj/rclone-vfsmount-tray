@@ -402,7 +402,8 @@ impl MountPoller {
         // one — but a `vfs/stats` that *did* answer, with a mode this build cannot read,
         // must clear it, or the disk fallback keeps trusting a write path it can no
         // longer see.
-        self.mode = stats.cache_mode();
+        let mode = stats.cache_mode();
+        self.mode = mode;
         let Some(cache) = stats.disk_cache else {
             self.forget_cache();
             return Ok(CacheProbe::Absent);
@@ -418,9 +419,16 @@ impl MountPoller {
             // A cache reported but not named is still an answer: this mount's roots are
             // unknown. Leaving the old ones in place is the third way to end up scanning
             // a previous instance's tree, alongside no `diskCache` and no `vfs/stats`.
-            self.forget_cache();
+            //
+            // Only the roots, not the mode — the mode *was* reported, and telling the user
+            // it was not is a different and untrue complaint. With no roots the fallback
+            // has nothing to scan regardless.
+            self.cache_path = None;
+            self.meta_path = None;
         }
-        Ok(CacheProbe::Present(cache, self.mode))
+        // The mode this response carried, not the latch: `self.mode` may since have been
+        // cleared, and the live path is asking what rclone just said.
+        Ok(CacheProbe::Present(cache, mode))
     }
 
     async fn fetch_queue(&self) -> Result<VfsQueue, RcError> {
@@ -1612,8 +1620,17 @@ mod tests {
         let mut p = MountPoller::connect("backup", fake.client()).await;
         let _ = p.poll().await;
 
+        // Still live. The mode was reported, so this poll must not complain that it was
+        // not — clearing the latch alongside the roots produced exactly that wrong
+        // complaint, about a mount whose only problem was unusable paths.
         fake.set("vfs/stats", half.to_string());
-        let _ = p.poll().await;
+        let live = p.poll().await;
+        if let Some(why) = live.degraded_reason.clone() {
+            assert!(
+                !why.contains("recognised cache mode"),
+                "rclone did report a mode; only its roots were unusable: {why}"
+            );
+        }
 
         fake.handle.abort();
         let _ = std::fs::remove_file(&fake.socket);

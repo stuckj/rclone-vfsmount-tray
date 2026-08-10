@@ -499,9 +499,12 @@ pub struct VfsMetaItem {
     #[serde(rename = "ATime", default)]
     pub atime: String,
     /// Full size of the file in bytes — **stale while a handle is open**: 0 for a file
-    /// being created, and the *previous* size for one being rewritten, until the upload
-    /// completes. For bytes outstanding, measure the data file under `diskCache.path`, as
-    /// [`crate::scan`] does.
+    /// being created, and the *previous* size for one being rewritten. Both are corrected
+    /// when the file is closed, well before [`Self::dirty`] clears.
+    ///
+    /// For bytes outstanding, measure the data file under `diskCache.path` anyway, as
+    /// [`crate::scan`] does: a scanner cannot tell an open handle from a closed one, and
+    /// once closed the data file's size matches this field.
     #[serde(rename = "Size", default)]
     pub size: u64,
     /// Byte ranges present in the local cache. `null` when none are.

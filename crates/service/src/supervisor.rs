@@ -41,7 +41,7 @@ enum Release {
     /// open descriptor, read or write, or just a working directory inside it. That is the
     /// only signal an in-progress write ever gives.
     Refuse,
-    /// `fusermount3 -z -u`. Detaches whatever is holding it, so a writer mid-file silently
+    /// `fusermount3 -u -z`. Detaches whatever is holding it, so a writer mid-file silently
     /// loses the rest. Reachable only after *our own* unit has been stopped, and only
     /// under `force` — never on a foreign mount, whose rclone is still alive and serving.
     Detach,
@@ -352,9 +352,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         Ok(match (live, unit) {
             (true, UnitStatus::Active | UnitStatus::Activating) => MountState::Mounted,
             // A teardown the user asked for. Reporting it as anything else would tell them
-            // their mount had become somebody else's mid-operation. It can hold the whole
-            // stop timeout when the mount is busy, since rclone's own unmount then fails
-            // and retries.
+            // their mount had become somebody else's mid-operation.
             (true, UnitStatus::Deactivating) => MountState::Unmounting,
             // Ours, and it died with the kernel entry still there. Still ours.
             (true, UnitStatus::Failed) => MountState::Failed {
@@ -517,23 +515,24 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// measured, `-u` is refused for a process whose *working directory* is inside the
     /// mount, and for a read-only descriptor. Someone who closes their editor and retries
     /// would get the identical refusal and no idea why.
-    fn refused(_point: &Path, e: SupervisorError) -> SupervisorError {
+    fn refused(point: &Path, e: SupervisorError) -> SupervisorError {
         let SupervisorError::Busy { detail: reason } = e else {
             return e;
         };
         SupervisorError::Busy {
             detail: format!(
                 "{reason}. Usually a process is still using the mount — a file open under \
-                 it, or a shell whose working directory is inside it. `fuser -m <path>` \
-                 names them. Unmounting anyway cuts anything mid-write off, and rclone then \
-                 uploads the partial file as if it were complete."
+                 it, or a shell whose working directory is inside it. `fuser -m {}` names \
+                 them. Unmounting anyway cuts anything mid-write off, and rclone then \
+                 uploads the partial file as if it were complete.",
+                point.display()
             ),
         }
     }
 
-    /// Wait for the unit to stop occupying its name. `StopUnit` only enqueues a job, and a
-    /// busy mount can hold rclone for the whole `TimeoutStopUSec` retrying its own
-    /// unmount, so the name outlives the mount point.
+    /// Wait for the unit to stop occupying its name. `StopUnit` only enqueues a job, so
+    /// the name is still taken when it returns, and a remount straight after would collide
+    /// with it.
     async fn await_unit_gone(&self, m: &Mount, timeout: Duration) -> Result<(), SupervisorError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -587,8 +586,8 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                         // Already serving, and it is ours. This is the path taken after a
                         // service restart, when every mount is already up.
                         UnitStatus::Active | UnitStatus::Activating => return Ok(()),
-                        // Still mounted, but on its way out: rclone's own unmount can
-                        // fail with EBUSY and hold the point for the whole stop timeout.
+                        // Still mounted, but on its way out. Waiting is what stops the
+                        // remount colliding with the name systemd has not freed yet.
                         UnitStatus::Deactivating => {
                             self.await_unit_gone(m, self.unit_gone_timeout).await?;
                         }
@@ -787,9 +786,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             }
             Err(SupervisorError::Busy {
                 detail: format!(
-                    "{} is still mounted after fusermount -u; something is holding it open. \
-                     A lazy unmount would detach it from processes still writing to it, so \
-                     it is not done automatically.",
+                    "{} is still mounted after everything this can do to release it. \
+                     Something is holding it that a lazy unmount did not clear either, so \
+                     there is likely a second filesystem stacked under the same path.",
                     point.display()
                 ),
             })
@@ -1230,8 +1229,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mount_being_torn_down_is_not_reported_as_somebody_elses() {
-        // A busy mount can hold this state for the whole stop timeout, retrying rclone's
-        // own unmount.
+        // The window between `StopUnit` returning and systemd finishing the job.
         let (_sc, s) = supervisor("tearing", true, &[], UnitStatus::Deactivating);
         assert_eq!(s.state("backup").await.unwrap(), MountState::Unmounting);
     }
@@ -1608,8 +1606,8 @@ mod tests {
 
     #[tokio::test]
     async fn mounting_waits_out_a_unit_that_is_still_stopping() {
-        // The remount gesture. rclone can hold the unit name for the whole 30s stop
-        // timeout while it flushes, and starting into that returns systemd's raw
+        // The remount gesture. `StopUnit` only enqueues a job, so the name can still be
+        // taken when the next mount starts, and starting into that returns systemd's raw
         // "unit already exists".
         let (_sc, s) = supervisor("remount", false, &[], UnitStatus::Deactivating);
         let e = s.mount("backup").await.expect_err("the fake never settles");

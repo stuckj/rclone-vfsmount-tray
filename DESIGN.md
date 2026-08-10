@@ -442,7 +442,7 @@ Measured on rclone v1.75.0 and Linux 6.8, 15 MB written to a file still open:
 | SIGTERM → rclone exits **without** unmounting; the writer is severed | point stays in `/proc/self/mountinfo` |
 | `fusermount3 -u`, rclone **dead**, holder's fd still open | **still refused** |
 | `fusermount3 -u`, after the holder exits | succeeds |
-| `fusermount3 -z -u`, rclone dead, holder's fd open | succeeds |
+| `fusermount3 -u -z`, rclone dead, holder's fd open | succeeds |
 
 The third row is the one that matters and the easy thing to assume away: killing rclone
 does not make the mount releasable, because what pins it is the *holder's* descriptor. So

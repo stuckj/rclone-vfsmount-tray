@@ -298,7 +298,7 @@ impl TransferState {
     /// calls idle can still be refused when one is attempted, and an implementation of
     /// [`crate::supervisor::MountSupervisor`] is what has to catch that. The one in this
     /// workspace does — it asks the kernel to release the point before signalling rclone,
-    /// which fails while a file is open — but that is its guarantee to state, not this
+    /// which fails while any process is still using the mount — but that is its guarantee to state, not this
     /// predicate's, and its `force` path overrides it by design.
     ///
     /// #22 is what would let this see an open write itself.

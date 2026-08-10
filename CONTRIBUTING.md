@@ -27,8 +27,9 @@ cargo build -p rclone-vfsmount-tray-gtk
 It will need the GTK4 development headers once it gains its `gtk4` dependency. Today it
 has none and builds anywhere.
 
-To exercise anything against a real rclone you will want `rclone` (1.87+ is what the code
-has been verified against) and `fuse3` on `PATH`.
+To exercise anything against a real rclone you will want `rclone` (v1.75.0 is what the
+behaviour here has been measured against; the floor is 1.61) and `fuse3` on `PATH`. Note
+`fusermount3` is not optional for the service: unmounting a live mount goes through it.
 
 ## Before opening a pull request
 

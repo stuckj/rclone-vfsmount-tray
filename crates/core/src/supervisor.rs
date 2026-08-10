@@ -118,8 +118,10 @@ pub enum SupervisorError {
     #[error("{}", pending_summary(.0))]
     PendingUploads(Pending),
 
-    /// The mount point could not be released — usually because something still has a file
-    /// open under it, which is the one signal that an in-progress write exists at all.
+    /// The mount point could not be released — usually because some process is still
+    /// using it. A file open under it will do that, but so will a read-only descriptor or
+    /// a working directory inside it; the kernel does not distinguish. This is the one
+    /// signal that an in-progress write exists at all.
     ///
     /// Carries the whole message rather than just the path, and renders it verbatim. What
     /// a user needs here is the path, what the kernel said, and what to do about it; a

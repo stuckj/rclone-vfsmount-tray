@@ -9,7 +9,7 @@
 //! bytes or more fails to bind. Measured on Linux 6.8: `UnixListener::bind` returns
 //! `InvalidInput`, "path must be shorter than SUN_LEN", at 108 and succeeds at 107.
 //!
-//! Paths are also per-process and per-user, so two people running the suite on one
+//! No level of a path is shared between processes, so two people running the suite on one
 //! machine never meet.
 
 use std::path::{Path, PathBuf};
@@ -300,8 +300,10 @@ mod tests {
 
     #[test]
     fn paths_leave_room_for_a_unix_socket() {
-        // The deepest socket the suite actually binds, from the supervisor tests:
-        // `<scratch>/run/<mount>.sock`, with a tag longer than any in use.
+        // Deeper than any socket the suite binds — those all sit at `<scratch>/*.sock` —
+        // and with a tag longer than any in use. The extra level matches where the
+        // supervisor tests put their placeholder socket files, so the budget still holds
+        // if one of those ever becomes a real listener.
         let s = Scratch::new("a-fairly-descriptive-tag");
         let sock = s.join("run").join("backup.sock");
         assert!(

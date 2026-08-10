@@ -95,9 +95,10 @@ headers installed.
 ### Scratch directories for tests
 
 `rvt-testutil` exists so no test builds its own path under the system temporary directory.
-A leaked directory there is resident memory wherever it is tmpfs, and the container this is
-developed in sizes `/tmp` from the *host's* RAM, so it absorbs several times the container's
-memory before reporting itself full.
+A leaked directory there is resident memory wherever `/tmp` is tmpfs, it accumulates every
+run — 77 directories per full suite before this, never reused — and nothing reclaims it
+until reboot. How much headroom that eats is a property of the machine, so it is not
+recorded here; #75 has the measurement that prompted the work.
 
 Two properties of the layout are load-bearing, and both were mistakes first:
 

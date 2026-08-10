@@ -6,6 +6,7 @@
 
 use crate::capabilities::Tier;
 use crate::models::{DiskCache, Pending, Transfer, VfsQueue};
+use crate::scan::CacheScan;
 
 /// One outstanding file.
 ///
@@ -161,14 +162,30 @@ impl TransferState {
 
     /// From the on-disk cache scan. Sizes and a total, but `Dirty` stays true until an
     /// upload completes, so queued and uploading are indistinguishable.
-    pub fn from_scan(mount: &str, files: Vec<(String, u64)>) -> Self {
+    ///
+    /// [`Self::outstanding_known`] needs [`CacheScan::is_complete`] *and*
+    /// [`CacheScan::root_present`]: a walk that could not read an entry, stopped at its
+    /// cap, or found no tree at all has not established that nothing else is waiting.
+    ///
+    /// [`TransferFile::in_flight`] stays `None`: `Dirty` is set from the write until the
+    /// upload completes, so the disk cannot tell a queued file from one being sent.
+    pub fn from_scan(mount: &str, found: &CacheScan) -> Self {
         let mut s = Self::empty(mount, Some(Tier::T4));
-        s.pending = Pending::new(files.len() as u64, files.iter().map(|(_, b)| b).sum(), 0);
-        s.files = files
-            .into_iter()
-            .map(|(name, size)| TransferFile {
-                name,
-                size: Some(size),
+        // `root_present` as well as `is_complete`: an absent tree is completely read and
+        // finds nothing, which is only an answer if the caller expected no cache. The type
+        // decides rather than leaving it to whoever calls next.
+        s.outstanding_known = found.is_complete() && found.root_present;
+        s.pending = Pending::new(
+            found.files.len() as u64,
+            found.known_bytes(),
+            found.files.iter().filter(|f| f.bytes.is_none()).count() as u64,
+        );
+        s.files = found
+            .files
+            .iter()
+            .map(|f| TransferFile {
+                name: f.name.clone(),
+                size: f.bytes,
                 // The disk cannot tell these apart.
                 in_flight: None,
                 tries: None,
@@ -372,6 +389,23 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// A scan result, as `scan::scan` would return one. `None` is a file whose data file
+    /// could not be measured — the scanner reports that rather than guessing zero.
+    fn scanned(files: &[(&str, Option<u64>)]) -> CacheScan {
+        CacheScan {
+            files: files
+                .iter()
+                .map(|(name, bytes)| crate::scan::DirtyFile {
+                    name: (*name).to_string(),
+                    bytes: *bytes,
+                })
+                .collect(),
+            unreadable: 0,
+            truncated: false,
+            root_present: true,
+        }
+    }
+
     fn queue_fixture(name: &str) -> VfsQueue {
         let raw = std::fs::read_to_string(format!(
             "{}/../../testdata/{name}",
@@ -431,10 +465,57 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_that_could_not_finish_looking_does_not_claim_a_total() {
+        // The scanner counts what it could not read rather than folding it into "clean",
+        // and that has to survive into the state: a walk that skipped an entry has not
+        // established that nothing else is waiting, so its zero is not an answer.
+        let mut partial = scanned(&[("a.bin", Some(10))]);
+        partial.unreadable = 1;
+        let s = TransferState::from_scan("backup", &partial);
+        assert!(!s.outstanding_known);
+        assert!(!s.is_idle(), "and it must not read as safe to unmount");
+
+        let mut capped = scanned(&[]);
+        capped.truncated = true;
+        assert!(
+            !TransferState::from_scan("backup", &capped).outstanding_known,
+            "a walk stopped at its cap found no files because it stopped, not because \
+             there are none"
+        );
+
+        let mut gone = scanned(&[]);
+        gone.root_present = false;
+        assert!(
+            !TransferState::from_scan("backup", &gone).outstanding_known,
+            "an absent tree is read completely and finds nothing, which is only an answer \
+             if no cache was expected — the type must not decide that for the caller"
+        );
+
+        // The complete case still reports a total, or the tier would be useless.
+        assert!(
+            TransferState::from_scan("backup", &scanned(&[("a.bin", Some(10))])).outstanding_known
+        );
+    }
+
+    #[test]
+    fn a_scan_reports_a_file_it_could_not_measure_as_unknown_rather_than_zero() {
+        // The descriptor and the data file are written separately, so a walk can land
+        // between them. Counting the file but not its bytes is the honest reading.
+        let s =
+            TransferState::from_scan("backup", &scanned(&[("a.bin", Some(10)), ("b.bin", None)]));
+        assert_eq!(s.pending.files, 2);
+        assert_eq!(s.pending.known_bytes, 10);
+        assert!(
+            !s.pending.is_exact(),
+            "one of the two sizes is unknown, so the total is a floor"
+        );
+    }
+
+    #[test]
     fn a_disk_scan_cannot_say_what_is_in_flight() {
         let s = TransferState::from_scan(
             "backup",
-            vec![("a.bin".into(), 1024), ("b.bin".into(), 2048)],
+            &scanned(&[("a.bin", Some(1024)), ("b.bin", Some(2048))]),
         );
         assert_eq!(s.fidelity, Some(Tier::T4));
         assert_eq!(s.pending.known_bytes, 3072);
@@ -579,7 +660,7 @@ mod tests {
     fn progress_does_not_promote_a_disk_scan() {
         // T4 has no queue behind it, so `transferring[]` cannot be joined to it and the
         // result would be a T1 claim over data that cannot support one.
-        let s = TransferState::from_scan("backup", vec![("a.bin".into(), 10)]);
+        let s = TransferState::from_scan("backup", &scanned(&[("a.bin", Some(10))]));
         let lifted = s.with_progress(&[Transfer {
             name: "a.bin".into(),
             size: 10,
@@ -660,7 +741,8 @@ mod tests {
 
     #[test]
     fn degradation_is_recorded_rather_than_silent() {
-        let s = TransferState::from_scan("backup", vec![]).degraded("rc socket is not private");
+        let s =
+            TransferState::from_scan("backup", &scanned(&[])).degraded("rc socket is not private");
         assert!(s.degraded_reason.unwrap().contains("not private"));
     }
 

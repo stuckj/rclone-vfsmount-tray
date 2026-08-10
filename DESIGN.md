@@ -453,6 +453,12 @@ writer already severed, so detaching removes a mount-table entry and nothing els
 that point it would be the very thing this section exists to prevent. `Release::Refuse`
 and `Release::Detach` are separate operations rather than a boolean for that reason.
 
+That "by then rclone is dead" only holds for a mount whose unit we stopped, so detaching
+is gated on ownership as well as `force`. A **foreign** mount that is held refuses even
+under `force`: its rclone was never signalled, so `-z` would strand it alive and serving a
+mount nothing can see, with whatever it is buffering in a cache directory the user can no
+longer reach. Refusing leaves the user somewhere they can act; detaching does not.
+
 The settle wait after the stop is kept at its full length: a holder that lets go inside it
 is the difference between the escalation succeeding cleanly and having to detach.
 

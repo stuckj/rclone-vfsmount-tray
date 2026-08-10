@@ -9,18 +9,10 @@
 //! not on PATH.
 
 use rvt_core::scan;
+use rvt_testutil::Scratch;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-
-/// Removes its directory however the test leaves the stack.
-struct TempDir(PathBuf);
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Kills the child however the test leaves the stack — an assertion between the spawn and
 /// the teardown would otherwise leave rclone holding a listener for as long as the machine
@@ -100,9 +92,8 @@ fn a_real_rclone_cache_reads_back_as_one_dirty_file() {
         return;
     };
 
-    let dir = TempDir(std::env::temp_dir().join(format!("rvt-scanlive-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&dir.0);
-    let (src, cache) = (dir.0.join("src"), dir.0.join("cache"));
+    let dir = Scratch::new("scanlive");
+    let (src, cache) = (dir.join("src"), dir.join("cache"));
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
 
@@ -180,12 +171,11 @@ fn a_write_still_in_flight_is_dirty_on_disk_before_it_reaches_the_queue() {
         return;
     };
 
-    let dir = TempDir(std::env::temp_dir().join(format!("rvt-scanmid-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&dir.0);
-    let (src, cache) = (dir.0.join("src"), dir.0.join("cache"));
+    let dir = Scratch::new("scanmid");
+    let (src, cache) = (dir.join("src"), dir.join("cache"));
     std::fs::create_dir_all(&src).unwrap();
     std::fs::create_dir_all(&cache).unwrap();
-    let rc = dir.0.join("rc.sock");
+    let rc = dir.join("rc.sock");
 
     let mut child = Rclone(
         Command::new(&rclone)

@@ -69,6 +69,27 @@ fix applied only to the input someone happened to report.
 runs cannot detect a sub-1% failure rate. Run the compiled test binary in a loop rather
 than `cargo test`, and run it enough times to mean something.
 
+### Scratch directories
+
+Anything a test needs on disk comes from `rvt_testutil::Scratch`, never from
+`std::env::temp_dir()` directly:
+
+```rust
+use rvt_testutil::Scratch;
+
+let dir = Scratch::new("my-test");   // unique, empty, removed on drop
+let cfg  = dir.write("config.toml", b"...");
+let sub  = dir.dir("cache");
+```
+
+It removes itself however the test leaves the stack, including while a panic unwinds —
+which is when a failing test would otherwise leave the most behind. A test that builds its
+own path under the temporary directory is rejected by
+`crates/testutil/tests/no_stray_scratch.rs`.
+
+Set `RVT_KEEP_SCRATCH=1` to keep the directories and have each one's path printed, for
+when a failure is easier to read from what it wrote than from the assertion.
+
 ### Fixtures
 
 `testdata/` holds JSON captured from a live rclone, not hand-written examples. When you

@@ -1,0 +1,15 @@
+[package]
+name = "rvt-testutil"
+description = "Scratch directories for rclone-vfsmount-tray's tests. Not published, not linked into any binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# No dependencies, and none should be added. This crate is a dev-dependency of every
+# other crate's tests, so anything it links, they link — including on the bare tier-1 CI
+# runner that has no `apt-get` step.
+[dependencies]

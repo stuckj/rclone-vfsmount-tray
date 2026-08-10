@@ -28,6 +28,7 @@ http-body-util = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+rvt-testutil = { path = "../testutil" }
 tokio = { workspace = true }
 # Reports the keys a deserialize silently dropped. This is what makes the fixture
 # tests an actual wire-format guard: without it a field the model fails to read just

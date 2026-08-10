@@ -7,6 +7,7 @@
 //! Serialised, because two races make it flaky otherwise — measured at 2/20 runs.
 
 use rvt_core::rclone::{Rclone, RcloneError, MINIMUM_VERSION};
+use rvt_testutil::Scratch;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -41,7 +42,7 @@ const CONFIG_PATHS_OUTPUT: &str = "Config file: /home/user/.config/rclone/rclone
                                    Temp dir:    /tmp\n";
 
 struct Stub {
-    dir: PathBuf,
+    dir: Scratch,
     _guard: MutexGuard<'static, ()>,
 }
 
@@ -58,9 +59,7 @@ impl Stub {
     /// Write a stub `rclone` that reports `version` and canned subcommand output.
     fn build(tag: &str, version: &str, fail_paths: bool) -> Self {
         let _guard = serialised();
-        let dir = std::env::temp_dir().join(format!("rvt-stub-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new(tag);
 
         let script = format!(
             r#"#!/bin/sh
@@ -97,12 +96,6 @@ fn write_executable(path: &Path, body: &str) {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-}
-
-impl Drop for Stub {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -191,7 +184,7 @@ fn discovery_finds_rclone_on_path() {
     let stub = Stub::new("path", VERSION_OUTPUT);
     let prev = std::env::var_os("PATH");
     let joined = std::env::join_paths(
-        std::iter::once(stub.dir.clone())
+        std::iter::once(stub.dir.path().to_path_buf())
             .chain(std::env::split_paths(prev.as_deref().unwrap_or_default())),
     )
     .unwrap();
@@ -229,8 +222,7 @@ fn a_broken_candidate_does_not_mask_a_working_one() {
     // One Stub, two directories: a Stub holds STUB_LOCK for its lifetime, so building a
     // second one here would self-deadlock on a non-reentrant mutex.
     let good = Stub::new("fallthrough", VERSION_OUTPUT);
-    let old_dir = good.dir.join("old");
-    std::fs::create_dir_all(&old_dir).unwrap();
+    let old_dir = good.dir.dir("old");
     write_executable(
         &old_dir.join("rclone"),
         "#!/bin/sh\necho 'rclone v1.50.0'\n",
@@ -238,7 +230,7 @@ fn a_broken_candidate_does_not_mask_a_working_one() {
 
     let prev = std::env::var_os("PATH");
     // Old one first, so discovery has to get past it.
-    let joined = std::env::join_paths([old_dir.clone(), good.dir.clone()]).unwrap();
+    let joined = std::env::join_paths([old_dir.clone(), good.dir.path().to_path_buf()]).unwrap();
     std::env::set_var("PATH", &joined);
     let found = Rclone::discover(None);
     match prev {

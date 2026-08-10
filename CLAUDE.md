@@ -11,6 +11,8 @@ crates/core/      rvt-core — rc API models, rclone discovery, config, MountSup
 crates/service/   rclone-vfsmount-trayd — owns mounts, polls, serves D-Bus. Pure Rust.
 crates/tray/      rclone-vfsmount-tray — ksni SNI client over D-Bus. Pure Rust.
 crates/gtk/       rclone-vfsmount-tray-gtk — GTK4 client. The only crate that links C.
+crates/testutil/  rvt-testutil — scratch directories for tests. A dev-dependency of the
+                  others, never linked into a binary, and depends on nothing itself.
 ```
 
 Dependencies flow one way: the three binaries depend on `rvt-core`, never on each other.
@@ -93,6 +95,11 @@ because the code is dense, not because the prose is.
 
 So the number is a prompt to look, never a reason to cut a comment that is doing real work
 or to pad toward a figure.
+
+Anything a test needs on disk comes from `rvt_testutil::Scratch`, never from
+`std::env::temp_dir()`. It removes itself on drop, including while a panic unwinds;
+`crates/testutil/tests/no_stray_scratch.rs` rejects any other spelling. See
+`CONTRIBUTING.md`.
 
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.

@@ -794,6 +794,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rvt-core",
+ "rvt-testutil",
  "serde",
  "serde_json",
  "tokio",
@@ -846,6 +847,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "rvt-testutil",
  "serde",
  "serde_ignored",
  "serde_json",
@@ -853,6 +855,10 @@ dependencies = [
  "tokio",
  "toml",
 ]
+
+[[package]]
+name = "rvt-testutil"
+version = "0.1.0"
 
 [[package]]
 name = "serde"

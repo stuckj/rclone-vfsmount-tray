@@ -592,6 +592,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvt_testutil::Scratch;
 
     fn mount(name: &str, point: &str) -> Mount {
         Mount {
@@ -792,8 +793,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_the_default_config() {
-        let dir = std::env::temp_dir().join(format!("rvt-cfg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Scratch::new("cfg");
         let path = dir.join("config.toml");
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg, Config::default());
@@ -805,8 +805,7 @@ mod tests {
 
     #[test]
     fn save_then_load_survives_the_trip() {
-        let dir = std::env::temp_dir().join(format!("rvt-save-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = Scratch::new("save");
         let path = dir.join("config.toml");
 
         let c = with(vec![mount("photos", "/mnt/photos")]);
@@ -814,20 +813,18 @@ mod tests {
         assert_eq!(Config::load(&path).unwrap(), c);
 
         // No temp files left behind.
-        let strays: Vec<_> = std::fs::read_dir(&dir)
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp."))
             .collect();
         assert!(strays.is_empty(), "left temp files: {strays:?}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_newer_schema_is_refused_not_guessed_at() {
-        let dir = std::env::temp_dir().join(format!("rvt-ver-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("ver");
         let path = dir.join("config.toml");
         // With an unknown field too: that is what a real schema bump looks like, and the
         // strict parse would otherwise reject it before the version check ran.
@@ -842,19 +839,17 @@ mod tests {
 
         let e = Config::load(&path).unwrap_err().to_string();
         assert!(e.contains("upgrade"), "should say what to do: {e}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn saving_refuses_to_write_an_invalid_config() {
         // Better to fail the D-Bus call than to persist something the service cannot
         // load on its next start.
-        let dir = std::env::temp_dir().join(format!("rvt-inv-{}", std::process::id()));
+        let dir = Scratch::new("inv");
         let path = dir.join("config.toml");
         let bad = with(vec![mount("a", "/mnt/one"), mount("a", "/mnt/two")]);
         assert!(bad.save(&path).is_err());
         assert!(!path.exists(), "nothing should have been written");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

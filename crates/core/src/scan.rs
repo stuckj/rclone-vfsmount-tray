@@ -229,26 +229,17 @@ fn relative_name(root: &Path, path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvt_testutil::Scratch;
     use std::path::PathBuf;
 
-    /// A cache tree under a directory that removes itself.
-    struct Tree(PathBuf);
-
-    impl Drop for Tree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// The `vfsMeta` and `vfs` pair rclone keeps side by side, under one scratch root.
+    struct Tree(Scratch);
 
     impl Tree {
         fn new(tag: &str) -> Self {
-            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let root =
-                std::env::temp_dir().join(format!("rvt-scan-{}-{tag}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&root);
-            std::fs::create_dir_all(root.join("vfsMeta")).unwrap();
-            std::fs::create_dir_all(root.join("vfs")).unwrap();
+            let root = Scratch::new(tag);
+            root.dir("vfsMeta");
+            root.dir("vfs");
             Self(root)
         }
 

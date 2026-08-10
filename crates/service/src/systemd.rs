@@ -271,6 +271,7 @@ pub mod dbus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvt_testutil::Scratch;
 
     /// Exercise the real property set against the running systemd.
     ///
@@ -382,9 +383,8 @@ mod tests {
             return;
         };
 
-        let marker = std::env::temp_dir().join(format!("rvt-pre-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
-        std::fs::write(&marker, b"x").unwrap();
+        let dir = Scratch::new("pre");
+        let marker = dir.write("marker", b"x");
 
         let name = format!("rvt-pretest-{}.service", std::process::id());
         let spec = UnitSpec {
@@ -422,7 +422,6 @@ mod tests {
 
         let _ = units.stop(&name).await;
         let _ = units.reset_failed(&name).await;
-        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]
@@ -436,8 +435,8 @@ mod tests {
             return;
         };
 
-        let marker = std::env::temp_dir().join(format!("rvt-restart-{}", std::process::id()));
-        let _ = std::fs::remove_file(&marker);
+        let dir = Scratch::new("restart");
+        let marker = dir.join("marker");
 
         let name = format!("rvt-restarttest-{}.service", std::process::id());
         let sleep_arg = format!("{}.5", 600 + std::process::id() % 100);
@@ -495,7 +494,6 @@ mod tests {
 
         let _ = units.stop(&name).await;
         let _ = units.reset_failed(&name).await;
-        let _ = std::fs::remove_file(&marker);
     }
 
     #[tokio::test]

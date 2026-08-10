@@ -33,9 +33,9 @@ every figure carries whether it can be trusted: a number this project cannot sta
 is reported as unknown rather than as zero. A file still being *written* is the exception
 worth knowing about: rclone only queues a file when it is closed, so no rc endpoint sees
 an open write and the queue reads empty throughout it. Unmounting therefore asks the
-kernel to release the mount point *before* it signals rclone, and refuses when a file is
-open — signalling first severed the writer and published the truncated cache item as
-though it were complete, measured in
+kernel to release the mount point *before* it signals rclone, and refuses while any process
+is still using the mount. Signalling first severed the writer and published the truncated
+cache item as though it were complete — measured, in
 [#73](https://github.com/stuckj/rclone-vfsmount-tray/issues/73).
 
 ## How it is put together

@@ -177,13 +177,22 @@ pub trait MountSupervisor: Send + Sync {
 
     /// Tear down a mount.
     ///
-    /// When the write-back cache still holds unuploaded data, returns
-    /// [`SupervisorError::PendingUploads`] carrying the summary rather than unmounting.
-    /// That is a warning channel, not a veto: nothing is lost by unmounting, since the
-    /// cache is on disk and uploads resume on remount (#19). The caller shows the user
-    /// what is outstanding and, if they choose to proceed, calls again with `force`.
+    /// Two refusals, and they are not alike.
     ///
-    /// `force` is always an explicit caller decision — never a default, never inferred.
+    /// [`SupervisorError::Busy`] means the kernel would not give the mount point back,
+    /// which is what an in-progress write looks like from outside: rclone queues a file
+    /// when it is *closed*, so nothing over its rc API reports one. **Forcing past this
+    /// loses data** — the writer is cut off mid-file and rclone then uploads the partial
+    /// file as if it were complete. An implementation must consult the kernel *before* it
+    /// signals rclone, or the refusal never happens; see #73.
+    ///
+    /// [`SupervisorError::PendingUploads`] means the write-back cache holds data that has
+    /// not gone up yet. That one is a warning channel rather than a veto: the cache is on
+    /// disk and uploads resume on remount, so nothing is lost by proceeding (#19). Not yet
+    /// implemented by anything in this workspace.
+    ///
+    /// `force` is always an explicit caller decision — never a default, never inferred —
+    /// and a caller that offers it should say which of the two it is overriding.
     fn unmount<'a>(
         &'a self,
         name: &'a str,

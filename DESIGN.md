@@ -141,7 +141,7 @@ filesystems.
 | Service restarts (package upgrade) | unaffected — reconciled and adopted on start |
 | Service crashes | unaffected; adopted on restart |
 | Service stopped explicitly | unaffected by default; unmounts only if `unmount_on_service_stop` is on |
-| User clicks Unmount | unmounted — refused while a file is open, unless forced. The pending-uploads *warning* is still #19 |
+| User clicks Unmount | unmounted — refused while anything is still using the mount, unless forced. The pending-uploads *warning* is still #19 |
 | Session ends / logout | depends on `loginctl enable-linger`; documented in the README |
 | Suspend / resume | mounts survive; stale handles recovered |
 

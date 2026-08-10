@@ -515,6 +515,48 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    /// An environment variable set for the life of the guard, then put back.
+    ///
+    /// The process environment is shared by every test in this binary, and the harness
+    /// runs them on threads — so a test that sets one has to exclude the others while it
+    /// holds it, and has to restore it even when an assertion panics past the end of the
+    /// function. Leaving `XDG_RUNTIME_DIR` overwritten would hand every later test that
+    /// resolves a socket path a fabricated root.
+    struct EnvVar {
+        key: &'static str,
+        saved: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvVar {
+        fn set(key: &'static str, value: &str) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            // A poisoned lock means another test panicked while holding it; the value was
+            // still restored by its guard, so the environment is sound and this one may
+            // proceed.
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = std::env::var_os(key);
+            // SAFETY: no other thread may touch this variable while the lock is held, and
+            // every writer goes through this type.
+            unsafe { std::env::set_var(key, value) };
+            Self {
+                key,
+                saved,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            // SAFETY: as above — the lock is released after this runs.
+            match self.saved.take() {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
     #[test]
     fn a_conventional_socket_path_never_escapes_the_runtime_directory() {
         // The client's half of the rule the service enforces in `rc_socket_path`. A
@@ -522,9 +564,7 @@ mod tests {
         // absolute path throws the base away — so a client resolving `/srv/media` by name
         // would look for an rc socket at `/srv/media.sock` and, finding any user-owned
         // socket in a private directory there, POST `rc/list` at an unrelated daemon.
-        let saved = std::env::var_os("XDG_RUNTIME_DIR");
-        // SAFETY: single-threaded test; restored before returning.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000") };
+        let _env = EnvVar::set("XDG_RUNTIME_DIR", "/run/user/1000");
 
         let root = RcClient::socket_dir().expect("set above");
         for name in ["/srv/media", "/", "../../etc/passwd", "a/b"] {
@@ -550,12 +590,6 @@ mod tests {
                 seen.insert(RcClient::socket_file_name(n)),
                 "{n:?} collides with an earlier name; one mount would answer for another"
             );
-        }
-
-        match saved {
-            // SAFETY: as above.
-            Some(v) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", v) },
-            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
         }
     }
 

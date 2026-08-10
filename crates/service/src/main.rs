@@ -5,6 +5,7 @@
 //!
 //! Scaffolding only; see #12, #17, #40.
 
+mod poller;
 mod supervisor;
 mod systemd;
 
@@ -114,10 +115,38 @@ async fn main() -> anyhow::Result<()> {
 
     // Reconcile before doing anything else. The service may have restarted while its
     // mounts stayed up, and a mount somebody else started is still worth reporting.
-    for found in rvt_core::supervisor::MountSupervisor::reconcile(&sup).await? {
-        tracing::info!(name = %found.name, state = ?found.state, "found mount");
+    let found = rvt_core::supervisor::MountSupervisor::reconcile(&sup).await?;
+    for m in &found {
+        tracing::info!(name = %m.name, state = ?m.state, "found mount");
     }
 
-    tracing::warn!("serving is not implemented yet — see issues #12 and #40");
+    // One poll per mount we started, so the tier and what is outstanding are visible in
+    // the log before there is anywhere to publish them. The loop that keeps this current,
+    // and the D-Bus surface that serves it, are #40.
+    //
+    // `Mounted` rather than `is_live()`, which also admits `Foreign`. We did not start a
+    // foreign mount, so none of our rc sockets addresses it and its own is unknown by
+    // definition. Reaching it at all is #70.
+    for m in found
+        .iter()
+        .filter(|m| matches!(m.state, rvt_core::supervisor::MountState::Mounted))
+    {
+        let socket = sup.socket_path(&m.name);
+        let mut p = poller::MountPoller::connect(&m.name, rvt_core::RcClient::new(&socket)).await;
+        tracing::debug!(mount = %m.name, tier = ?p.tier(), "resolved capability tier");
+        let state = p.poll().await;
+        tracing::info!(
+            mount = %state.mount,
+            tier = ?state.fidelity,
+            outstanding_known = state.outstanding_known,
+            pending_files = state.pending.files,
+            pending_bytes = state.pending.known_bytes,
+            degraded = ?state.degraded_reason,
+            next_poll_secs = poller::MountPoller::interval(&state).as_secs(),
+            "polled"
+        );
+    }
+
+    tracing::warn!("serving is not implemented yet — see issue #40");
     Ok(())
 }

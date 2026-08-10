@@ -100,7 +100,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
 
     /// The rc socket for a mount.
     pub fn socket_path(&self, name: &str) -> PathBuf {
-        self.runtime_dir.join(format!("{name}.sock"))
+        rc_socket_path(&self.runtime_dir, name)
     }
 
     /// The `ExecStartPre` that clears leftovers before rclone is exec'd.
@@ -541,9 +541,12 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 return Ok(());
             }
 
-            // The pending-upload check lands with the rc client (#12, #21, #23), and is
-            // a warning rather than a refusal (#19) — so proceeding while the answer is
-            // unknown is the default, not a gap.
+            // The pending-upload check lands in #73, and is a warning rather than a
+            // refusal (#19) — so proceeding while the answer is unknown is the default,
+            // not a gap. #73 rather than the rc client, because the poller cannot see a
+            // file that is still open: rclone queues on close, so `safe_to_unmount()` is
+            // necessary and not sufficient, and the `StopUnit` below reaches rclone before
+            // the kernel ever gets to refuse a busy mount.
 
             if ours {
                 // `StopUnit` only enqueues a job, so the unit reaches `failed` — on a
@@ -641,6 +644,15 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
     }
 }
 
+/// Where a mount's rc socket lives.
+///
+/// This service's runtime directory joined with the shared socket file name. The client
+/// resolves the same name against `XDG_RUNTIME_DIR`; `RcClient::socket_file_name` is the
+/// single definition both use, and explains why the name is escaped rather than folded.
+fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
+    runtime_dir.join(rvt_core::RcClient::socket_file_name(name))
+}
+
 /// Clear what a hard-killed rclone leaves behind, so a start can succeed.
 ///
 /// Runs from `ExecStartPre`, so it covers systemd's automatic restarts. Talks to nothing
@@ -659,7 +671,7 @@ pub async fn prepare_for_start(
         .find(|m| m.name == name)
         .ok_or_else(|| SupervisorError::UnknownMount(name.to_string()))?;
 
-    let socket = runtime_dir.join(format!("{name}.sock"));
+    let socket = rc_socket_path(runtime_dir, name);
     if socket.exists() {
         let _ = std::fs::remove_file(&socket);
     }
@@ -1049,6 +1061,30 @@ mod tests {
         assert!(
             !msg.contains("still mounted after"),
             "that message means the release was never attempted: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_socket_path_never_escapes_the_runtime_directory() {
+        // A foreign mount is named by its absolute mount point, and `Path::join` given an
+        // absolute path throws the base away. Without this, reconcile handing a foreign
+        // name here would have the service stat — and, finding any user-owned socket in a
+        // private directory, connect to and POST rc/list at — an arbitrary filesystem
+        // location that has nothing to do with the mount.
+        let s = supervisor("escape", false, &[], UnitStatus::Active);
+        for name in ["/srv/media", "/", "../../etc/passwd", "a/b"] {
+            let p = s.socket_path(name);
+            assert!(
+                p.starts_with(&s.runtime_dir),
+                "{name:?} produced {p:?}, outside {:?}",
+                s.runtime_dir
+            );
+        }
+        // The ordinary case is untouched.
+        assert_eq!(
+            s.socket_path("backup"),
+            s.runtime_dir.join("backup.sock"),
+            "a configured name must keep the path it has always had"
         );
     }
 

@@ -8,6 +8,7 @@
 //! *dropped* must match `ignored`. Swaps between same-typed fields need value
 //! assertions; the key set cannot see them.
 
+use rvt_core::config::CacheMode;
 use rvt_core::models::*;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -278,6 +279,21 @@ const VFS_STATS_SPEC: FixtureSpec<'static> = FixtureSpec {
     opaque: &["opt"],
 };
 
+/// A VFS with no write-back cache: `diskCache` is absent, everything else is as usual.
+const VFS_STATS_CACHELESS_SPEC: FixtureSpec<'static> = FixtureSpec {
+    keys: &[
+        "fs",
+        "inUse",
+        "metadataCache",
+        "metadataCache.dirs",
+        "metadataCache.files",
+        "opt",
+    ],
+    optional: &[],
+    ignored: &[],
+    opaque: &["opt"],
+};
+
 const VFS_QUEUE_SPEC: FixtureSpec<'static> = FixtureSpec {
     keys: &[
         "queue",
@@ -289,6 +305,14 @@ const VFS_QUEUE_SPEC: FixtureSpec<'static> = FixtureSpec {
         "queue.[].tries",
         "queue.[].uploading",
     ],
+    optional: &[],
+    ignored: &[],
+    opaque: &[],
+};
+
+/// A VFS with no write-back cache answers `{}` — no `queue` key, not an empty list.
+const VFS_QUEUE_CACHELESS_SPEC: FixtureSpec<'static> = FixtureSpec {
+    keys: &[],
     optional: &[],
     ignored: &[],
     opaque: &[],
@@ -364,6 +388,116 @@ fn vfs_stats(name: &str) -> VfsStats {
 }
 fn vfs_queue(name: &str) -> VfsQueue {
     parse_fixture(name, &VFS_QUEUE_SPEC)
+}
+
+/// Two files queued at once, captured from a live rclone v1.75.0.
+///
+/// A single-entry queue cannot exercise anything that joins per file: an assertion that
+/// "every other file stays unmeasured" iterates zero times and passes whatever the code
+/// does. This is the fixture the join in `TransferState::with_progress` is checked with.
+#[test]
+fn a_multi_item_queue_carries_a_distinct_entry_per_file() {
+    let q: VfsQueue = vfs_queue("vfs-queue-two-items.json");
+    assert_eq!(q.items().len(), 2, "captured with two files queued");
+
+    let names: Vec<_> = q.items().iter().map(|i| i.name.as_str()).collect();
+    assert_eq!(names, vec!["one.bin", "two.bin"]);
+
+    let ids: std::collections::BTreeSet<_> = q.items().iter().map(|i| i.id).collect();
+    assert_eq!(ids.len(), 2, "ids are what vfs/queue-set-expiry addresses");
+
+    // Distinct sizes, so a test that mixed the two entries up would show it.
+    assert_eq!(q.items()[0].size, 262_144);
+    assert_eq!(q.items()[1].size, 131_072);
+    assert_eq!(q.pending().known_bytes, 393_216);
+    assert!(
+        q.items().iter().all(|i| !i.uploading),
+        "captured before upload"
+    );
+}
+
+/// The three cache modes, each captured from its own live rclone v1.75.0 FUSE mount.
+///
+/// Two facts the unmount-safety decision rests on, and neither is inferable from the
+/// others. `off` answers `vfs/queue` with `{}` — no key — while `minimal` and `writes`
+/// both answer `{"queue":[]}` and both carry a `diskCache`, so the *only* thing that
+/// separates a mount whose queue is the whole story from one where writes stream past it
+/// is `opt.CacheMode`.
+///
+/// `opt` is opaque to the key-set machinery, so a rename or a re-encode of `CacheMode`
+/// would go unnoticed there. This reads it through the accessor instead.
+#[test]
+fn each_cache_mode_reports_itself_and_its_queue_differently() {
+    let cacheless: VfsStats = parse_fixture("vfs-stats-cacheless.json", &VFS_STATS_CACHELESS_SPEC);
+    let minimal: VfsStats = vfs_stats("vfs-stats-minimal.json");
+    let writes: VfsStats = vfs_stats("vfs-stats-upload-in-progress.json");
+
+    assert_eq!(cacheless.cache_mode(), Some(CacheMode::Off));
+    assert_eq!(minimal.cache_mode(), Some(CacheMode::Minimal));
+    assert_eq!(writes.cache_mode(), Some(CacheMode::Writes));
+
+    // An ordinal rclone has not defined yet must read as unknown, which the poller fails
+    // closed on. Defaulting instead would let a fifth cache mode — one whose writes do not
+    // all reach the queue — report as `writes` and be called safe to unmount. The sibling
+    // case, `CacheMode` arriving as a string, exits earlier at `as_u64` and is covered in
+    // the poller; this is the other half of the same rule.
+    let mut future = serde_json::to_value(&writes).unwrap();
+    future["opt"]["CacheMode"] = serde_json::json!(4);
+    let future: VfsStats = serde_json::from_value(future).unwrap();
+    assert_eq!(
+        future.cache_mode(),
+        None,
+        "an unrecognised mode is unknown, never a guess"
+    );
+
+    // Only `off` lacks a cache. `minimal` has one, which is exactly why its queue cannot
+    // be told from a `writes` queue without the mode above.
+    assert!(cacheless.disk_cache.is_none());
+    assert!(minimal.disk_cache.is_some());
+    assert!(writes.disk_cache.is_some());
+
+    // And only `off` omits the queue key.
+    let q: VfsQueue = parse_fixture("vfs-queue-cacheless.json", &VFS_QUEUE_CACHELESS_SPEC);
+    assert!(
+        !q.reported_queue(),
+        "a cacheless VFS reports no queue at all; reading it as empty is a false idle"
+    );
+    assert!(q.items().is_empty());
+    assert!(
+        vfs_queue("vfs-queue-uploading.json").reported_queue(),
+        "a cached VFS does report one"
+    );
+}
+
+/// Only `minimal` and `writes` can be confused, and only the mode tells them apart.
+#[test]
+fn only_the_modes_that_queue_every_write_may_be_trusted_on_an_empty_queue() {
+    assert!(!CacheMode::Off.all_writes_queued());
+    assert!(!CacheMode::Minimal.all_writes_queued());
+    assert!(CacheMode::Writes.all_writes_queued());
+    assert!(CacheMode::Full.all_writes_queued());
+}
+
+/// A file rclone has failed to upload several times, captured from a live rclone v1.75.0
+/// writing to a remote whose permissions were removed mid-run.
+///
+/// `tries` counts attempts from the moment each one starts, not failures: the healthy
+/// capture in `vfs-queue-uploading.json` also reports 1. Only a value above 1 is evidence
+/// of failure, and this is the fixture that pins the difference.
+#[test]
+fn a_retrying_upload_is_told_apart_from_a_healthy_one_by_tries_alone() {
+    let failing: VfsQueue = vfs_queue("vfs-queue-retrying.json");
+    let healthy: VfsQueue = vfs_queue("vfs-queue-uploading.json");
+
+    assert_eq!(healthy.items()[0].tries, 1, "a first attempt, going fine");
+    assert!(
+        failing.items()[0].tries > 1,
+        "captured after repeated failure"
+    );
+    // Neither is `uploading`: the failing one is between retries, backing off, so that
+    // flag alone reads as "merely queued". `tries` is the only thing that separates them.
+    assert!(!failing.items()[0].uploading);
+    assert!(healthy.items()[0].uploading);
 }
 
 #[test]
@@ -485,9 +619,14 @@ const PINNED_FIXTURES: &[&str] = &[
     "core-version.json",
     "rc-list-v1.75.0.json",
     "vfs-list.json",
+    "vfs-queue-cacheless.json",
     "vfs-queue-queued-not-uploading.json",
+    "vfs-queue-retrying.json",
+    "vfs-queue-two-items.json",
     "vfs-queue-uploading.json",
+    "vfs-stats-cacheless.json",
     "vfs-stats-idle.json",
+    "vfs-stats-minimal.json",
     "vfs-stats-upload-in-progress.json",
     "vfsmeta-item-dirty.json",
 ];
@@ -557,7 +696,7 @@ fn queue_names_join_to_transfer_names() {
     let queue: VfsQueue = vfs_queue("vfs-queue-uploading.json");
 
     let tname = &stats.transfers_slice()[0].name;
-    let qname = &queue.queue[0].name;
+    let qname = &queue.items()[0].name;
     assert_eq!(
         tname, qname,
         "the join key between core/stats and vfs/queue is an exact name match"
@@ -567,7 +706,7 @@ fn queue_names_join_to_transfer_names() {
 #[test]
 fn queue_queued_versus_uploading() {
     let queued: VfsQueue = vfs_queue("vfs-queue-queued-not-uploading.json");
-    let item = &queued.queue[0];
+    let item = &queued.items()[0];
     assert!(!item.uploading, "still waiting out --vfs-write-back");
     assert!(item.expiry > 0.0, "expiry counts down to zero");
     assert_eq!(queued.uploading().count(), 0);
@@ -580,7 +719,7 @@ fn queue_queued_versus_uploading() {
     assert!(queued.pending().is_exact());
 
     let live: VfsQueue = vfs_queue("vfs-queue-uploading.json");
-    let item = &live.queue[0];
+    let item = &live.items()[0];
     assert!(item.uploading);
     assert!(
         item.expiry < 0.0,

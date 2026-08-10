@@ -113,6 +113,9 @@ async fn a_socket_we_refuse_says_so_rather_than_looking_like_an_idle_rclone() {
     // misconfiguration — and it is permanent until the user fixes it. Both cases resolve
     // to T4, so the reason is the only thing that can tell them apart.
     let (dir, socket, server) = serve("insecure", &captured_rc_list()).await;
+    // Both, because reachability is what is refused: inside a 0700 directory a loose
+    // socket cannot be reached and is accepted, which is what the service itself creates.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o777)).unwrap();
 
     let caps = Capabilities::probe(&RcClient::new(&socket))

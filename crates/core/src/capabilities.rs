@@ -28,13 +28,17 @@ pub enum Tier {
 }
 
 impl Tier {
-    /// Whether this tier can report what is outstanding well enough to answer "is it safe
-    /// to unmount".
+    /// Whether an outstanding *byte total* from this tier can be trusted.
     ///
-    /// Only `vfs/queue` and the disk scan can: `core/stats` lags `vfs/queue` by
+    /// Only `vfs/queue` and the disk scan carry one: `core/stats` lags `vfs/queue` by
     /// `--vfs-write-back`, so a total taken from it reads zero while gigabytes are still
     /// queued, and T3 gives counts without bytes. A T1 or T3 build is not stuck — see
     /// [`Capabilities::rc_can_answer_outstanding`]. DESIGN.md has the measurements.
+    ///
+    /// A property of the tier, not of a reading. **"Is it safe to unmount" is
+    /// [`crate::transfer::TransferState::safe_to_unmount`]**, which also weighs whether
+    /// anything could be observed at all: a T3 build reporting an empty queue is safe to
+    /// unmount even though no byte total stands behind it.
     pub fn meets_the_bar(self) -> bool {
         matches!(self, Tier::T2 | Tier::T4)
     }
@@ -42,6 +46,11 @@ impl Tier {
     /// Whether per-file percentages are honest at this tier.
     ///
     /// Only T1 carries per-file byte progress; a percentage anywhere else is invented.
+    ///
+    /// Also a property of the tier. Whether a given reading carries progress is
+    /// [`crate::transfer::TransferState::has_progress`], which is true of a `vfs/queue`
+    /// state that `core/stats` enriched — real progress this predicate answers `false`
+    /// for, because the *total* still came from the queue.
     pub fn has_per_file_progress(self) -> bool {
         self == Tier::T1
     }

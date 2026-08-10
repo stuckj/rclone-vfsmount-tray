@@ -421,24 +421,45 @@ order is: refuse a path this mount does not own, then `fusermount3 -u`, then `St
   signalled, so the writer is untouched. This is the only moment at which an open write is
   visible to us at all.
 - `force`, which is #18's "unmount anyway" and has already been confirmed with the user,
-  logs a warning naming the mount and the refusal, then falls through to the escalation:
-  an escape hatch a busy mount can veto is not one.
+  logs a warning naming the mount and the refusal, then escalates: an escape hatch a busy
+  mount can veto is not one.
 
-The refusal does not distinguish `EBUSY` from any other failure, because `fusermount`
-cannot: it reports every non-zero exit the same way, and the stderr is the only detail
+The refusal does not distinguish `EBUSY` from any other non-zero exit, because
+`fusermount` cannot: it reports them all the same way, and the stderr is the only detail
 there is. The question being answered is whether it is *certainly* safe to signal rclone,
 and anything short of a clean release leaves that unknown — so this fails closed, like the
 cache-mode gate above, and the message reports what was refused rather than asserting why.
+A failure to *run* `fusermount` is passed through as itself; advice about closing files
+would be nonsense when nothing was asked.
 
-The forced sequence is worth spelling out, because it is not "refuse, then succeed": the
-release is refused, the SIGTERM goes out, rclone exits **without** unmounting so the point
-survives as a stale mount, and the same release then takes it because nothing is holding a
-stale mount. There is no point waiting for rclone to free a point it has already declined
-to free, so the settle wait is skipped when the release was refused.
+#### What `force` actually has to do
+
+Measured on rclone v1.75.0 and Linux 6.8, 15 MB written to a file still open:
+
+| step | result |
+| --- | --- |
+| `fusermount3 -u`, rclone alive, holder's fd open | refused |
+| SIGTERM → rclone exits **without** unmounting; the writer is severed | point stays in `/proc/self/mountinfo` |
+| `fusermount3 -u`, rclone **dead**, holder's fd still open | **still refused** |
+| `fusermount3 -u`, after the holder exits | succeeds |
+| `fusermount3 -z -u`, rclone dead, holder's fd open | succeeds |
+
+The third row is the one that matters and the easy thing to assume away: killing rclone
+does not make the mount releasable, because what pins it is the *holder's* descriptor. So
+`force` cannot be "refuse, then stop, then unmount" — that ends with the file sacrificed
+**and** the unmount failed, which is the worst of both. It is refuse → stop → refuse →
+detach, and `-z` is reachable only on that last step. By then rclone is dead and the
+writer already severed, so detaching removes a mount-table entry and nothing else; before
+that point it would be the very thing this section exists to prevent. `Release::Refuse`
+and `Release::Detach` are separate operations rather than a boolean for that reason.
+
+The settle wait after the stop is kept at its full length: a holder that lets go inside it
+is the difference between the escalation succeeding cleanly and having to detach.
 
 `fusermount3` (or `fusermount`) is therefore required on the unmount path for any live
-mount, where before a unit stop alone would sometimes do. rclone's own `mount` needs
-libfuse anyway, so this adds no dependency in practice.
+mount, where before a unit stop alone would sometimes do. rclone ships as a static binary
+and links no libfuse — it execs `fusermount3` itself to mount — so this needs nothing that
+was not already there.
 
 The ownership and source-mismatch checks moved ahead of the release for the same reason:
 refusing after the SIGTERM has gone out refuses nothing.
@@ -526,9 +547,9 @@ boundary at all. Everything below is scoped to that:
 - **A forced unmount is destructive**, and `force` is an explicit parameter that defaults to
   off. Being service-side, the kernel's refusal cannot be skipped by a client that simply
   omits it — but it does not stop a caller that deliberately passes `force = true`, which
-  logs a warning naming the mount and comes down anyway. That is a guard against accident
-  and bugs, not against malice. (The pending-uploads check this paragraph used to name is
-  not implemented; it is #19.)
+  logs a warning naming the mount and then severs and detaches. That is a guard against
+  accident and bugs, not against malice. (The pending-uploads check this paragraph used to
+  name is not implemented; it is #19.)
 
   Closing the malice case needs an authorization decision the bus cannot make for us. The
   options are a polkit action for forced unmount, or accepting the risk on the grounds that a

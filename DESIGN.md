@@ -110,7 +110,12 @@ Two properties of the layout are load-bearing, and both were mistakes first:
   be a stable path under a world-writable parent for anyone to pre-plant.
 - **The name is not the pid alone.** Pids are reused, so a run killed hard enough to skip
   every destructor would hand its leftovers to a later process that drew the same pid,
-  which would then see a dirty scratch and pass or fail for the wrong reason.
+  which would then see a dirty scratch and pass or fail for the wrong reason. A truncated
+  nanosecond stamp makes that improbable — two processes need the same pid *and* start
+  times an exact multiple of 4.295s apart — rather than impossible, so each scratch is
+  created with `create_dir` rather than `create_dir_all` and a directory that is already
+  there is refused instead of adopted. The truncation is deliberate: the full stamp costs
+  11 bytes of the 108 available to a UNIX socket path.
 
 Removal restores directory permissions and retries before giving up, because a test that
 chmods a directory unreadable and panics before restoring it leaves a tree its own owner

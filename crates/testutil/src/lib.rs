@@ -5,9 +5,12 @@
 //! directory left behind on a machine where `/tmp` is tmpfs is resident memory that no
 //! later run reclaims.
 //!
-//! Paths are kept short: tests bind UNIX sockets inside a [`Scratch`], and a path of 108
-//! bytes or more fails to bind. Measured on Linux 6.8: `UnixListener::bind` returns
-//! `InvalidInput`, "path must be shorter than SUN_LEN", at 108 and succeeds at 107.
+//! Keep tags short — nothing here enforces it. Tests bind UNIX sockets inside a
+//! [`Scratch`], and a path of 108 bytes or more fails to bind: measured on Linux 6.8,
+//! `UnixListener::bind` returns `InvalidInput`, "path must be shorter than SUN_LEN", at
+//! 108 and succeeds at 107. Under `/tmp` with a seven-digit pid that leaves a tag about
+//! 55 characters before `<scratch>/run/<name>.sock` breaches it; the longest tag in use
+//! is 13.
 //!
 //! No level of a path is shared between processes, so two people running the suite on one
 //! machine never meet.
@@ -26,8 +29,12 @@ static LIVE: Mutex<usize> = Mutex::new(0);
 
 /// This process's directory, holding one subdirectory per [`Scratch`].
 ///
-/// Sits directly in the temporary directory: no level here may be shared between users,
-/// and the pid alone is not unique enough, because pids are reused. See DESIGN.md.
+/// Sits directly in the temporary directory: no level here may be shared between users.
+/// The stamp is there because pids are reused, and truncating it to 32 bits — worth 11
+/// bytes of the socket budget above — makes a repeat improbable rather than impossible.
+/// Two processes collide only on the same pid *and* start times an exact multiple of
+/// 4.295s apart. [`create_exclusive`] is what catches that, rather than this. See
+/// DESIGN.md.
 fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -66,8 +73,9 @@ impl Scratch {
         // Under the lock so a concurrent Drop cannot remove the root between the two
         // directories this creates.
         let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(&path)
-            .unwrap_or_else(|e| panic!("create scratch {}: {e}", path.display()));
+        std::fs::create_dir_all(root())
+            .unwrap_or_else(|e| panic!("create scratch root {}: {e}", root().display()));
+        create_exclusive(&path);
         *live += 1;
         drop(live);
 
@@ -125,6 +133,23 @@ impl Drop for Scratch {
             // to this process alone, so no other process can be creating inside it.
             let _ = std::fs::remove_dir(root());
         }
+    }
+}
+
+/// Create a directory, refusing to adopt one that is already there.
+///
+/// `create_dir_all` would take it, and the only way this path can exist is a root drawn by
+/// an earlier process that died without its destructors — see [`root`]. Its leftovers
+/// would then decide whether a test passes, so this fails loudly instead.
+fn create_exclusive(path: &Path) {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => panic!(
+            "scratch {} already exists: an earlier process drew the same root and left it \
+             behind. Remove it and re-run.",
+            path.display()
+        ),
+        Err(e) => panic!("create scratch {}: {e}", path.display()),
     }
 }
 
@@ -277,6 +302,26 @@ mod tests {
             let _ = std::fs::remove_dir_all(&path);
             panic!("a tree containing an unreadable directory outlived its Scratch");
         }
+    }
+
+    /// `create_dir_all` returns `Ok` for a directory that is already there, which would
+    /// hand a test whatever the previous owner of the path left in it.
+    #[test]
+    fn an_existing_directory_is_refused_rather_than_adopted() {
+        let s = Scratch::new("adopt");
+        let taken = s.dir("already-here");
+        std::fs::write(taken.join("someone-elses"), b"x").unwrap();
+
+        let err = std::panic::catch_unwind(|| create_exclusive(&taken))
+            .expect_err("an existing directory must not be accepted");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(msg.contains("already exists"), "unhelpful panic: {msg}");
+
+        create_exclusive(&s.join("fresh"));
+        assert!(s.join("fresh").is_dir(), "a new path must still be created");
     }
 
     #[test]

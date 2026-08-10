@@ -141,7 +141,7 @@ filesystems.
 | Service restarts (package upgrade) | unaffected — reconciled and adopted on start |
 | Service crashes | unaffected; adopted on restart |
 | Service stopped explicitly | unaffected by default; unmounts only if `unmount_on_service_stop` is on |
-| User clicks Unmount | unmounted, after the pending-uploads check — refused while a file is open, unless forced |
+| User clicks Unmount | unmounted — refused while a file is open, unless forced. The pending-uploads *warning* is still #19 |
 | Session ends / logout | depends on `loginctl enable-linger`; documented in the README |
 | Suspend / resume | mounts survive; stale handles recovered |
 
@@ -415,14 +415,30 @@ order is: refuse a path this mount does not own, then `fusermount3 -u`, then `St
 
 - The release succeeds — nothing was holding the mount, it is already down, and stopping
   the unit is bookkeeping.
-- The release returns `EBUSY` — **refuse**, and say so. Nothing has been signalled, so the
-  writer is untouched. This is the only moment at which an open write is visible to us.
+- The release fails and the point is **gone anyway** — an rclone crash or a concurrent
+  `systemctl stop` between the liveness read and the release. Not a failure to unmount.
+- The release fails and the point is **still there** — **refuse**. Nothing has been
+  signalled, so the writer is untouched. This is the only moment at which an open write is
+  visible to us at all.
 - `force`, which is #18's "unmount anyway" and has already been confirmed with the user,
-  falls through to the old escalation: an escape hatch a busy mount can veto is not one.
+  logs a warning naming the mount and the refusal, then falls through to the escalation:
+  an escape hatch a busy mount can veto is not one.
 
-Any failure of the release refuses, not only `EBUSY`. The question is whether it is
-*certainly* safe to signal rclone, and anything short of a clean release leaves that
-unknown — so this fails closed, like the cache-mode gate above.
+The refusal does not distinguish `EBUSY` from any other failure, because `fusermount`
+cannot: it reports every non-zero exit the same way, and the stderr is the only detail
+there is. The question being answered is whether it is *certainly* safe to signal rclone,
+and anything short of a clean release leaves that unknown — so this fails closed, like the
+cache-mode gate above, and the message reports what was refused rather than asserting why.
+
+The forced sequence is worth spelling out, because it is not "refuse, then succeed": the
+release is refused, the SIGTERM goes out, rclone exits **without** unmounting so the point
+survives as a stale mount, and the same release then takes it because nothing is holding a
+stale mount. There is no point waiting for rclone to free a point it has already declined
+to free, so the settle wait is skipped when the release was refused.
+
+`fusermount3` (or `fusermount`) is therefore required on the unmount path for any live
+mount, where before a unit stop alone would sometimes do. rclone's own `mount` needs
+libfuse anyway, so this adds no dependency in practice.
 
 The ownership and source-mismatch checks moved ahead of the release for the same reason:
 refusing after the SIGTERM has gone out refuses nothing.
@@ -508,9 +524,11 @@ boundary at all. Everything below is scoped to that:
   offer, and is not needed. Nothing published over D-Bus carries credentials or full remote
   configuration.
 - **A forced unmount is destructive**, and `force` is an explicit parameter that defaults to
-  off. Being service-side, the pending-uploads check cannot be skipped by a client that simply
-  omits it — but it does not stop a caller that deliberately passes `force = true`. That is a
-  guard against accident and bugs, not against malice.
+  off. Being service-side, the kernel's refusal cannot be skipped by a client that simply
+  omits it — but it does not stop a caller that deliberately passes `force = true`, which
+  logs a warning naming the mount and comes down anyway. That is a guard against accident
+  and bugs, not against malice. (The pending-uploads check this paragraph used to name is
+  not implemented; it is #19.)
 
   Closing the malice case needs an authorization decision the bus cannot make for us. The
   options are a polkit action for forced unmount, or accepting the risk on the grounds that a

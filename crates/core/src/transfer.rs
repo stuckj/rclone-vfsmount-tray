@@ -253,7 +253,7 @@ impl TransferState {
     /// For a `minimal` mount: a read-write open goes through the write-back cache and
     /// appears in the queue, while a write-only open of an uncached file streams straight
     /// past it. The entries are real and worth showing; an empty queue still cannot be
-    /// read as "nothing outstanding", which is the reading that gets a file truncated.
+    /// read as "nothing outstanding", which is the reading that calls a busy mount idle.
     pub fn partially_observed(mut self, reason: impl Into<String>) -> Self {
         self.outstanding_known = false;
         self.degraded_reason = Some(reason.into());
@@ -294,12 +294,14 @@ impl TransferState {
     /// still in progress is invisible to every rc endpoint and this returns `true` while
     /// it runs — measured; see DESIGN.md and #73.
     ///
-    /// The truncation that used to follow does not: `SystemdSupervisor::unmount` has the
-    /// kernel release the mount point before it signals rclone, and `fusermount3 -u`
-    /// refuses a mount with a file open. Acting on this predicate is therefore safe, but
-    /// the predicate still overstates — a mount it calls idle can be refused. Use it to
-    /// decide what to *offer*, never to conclude that an unmount will succeed. #22 is
-    /// what would make it whole.
+    /// So this decides what to *offer*, never that an unmount will succeed: a mount it
+    /// calls idle can still be refused when one is attempted, and an implementation of
+    /// [`crate::supervisor::MountSupervisor`] is what has to catch that. The one in this
+    /// workspace does — it asks the kernel to release the point before signalling rclone,
+    /// which fails while a file is open — but that is its guarantee to state, not this
+    /// predicate's, and its `force` path overrides it by design.
+    ///
+    /// #22 is what would let this see an open write itself.
     pub fn safe_to_unmount(&self) -> bool {
         self.is_idle()
     }

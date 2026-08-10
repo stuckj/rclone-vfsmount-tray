@@ -613,7 +613,9 @@ mod tests {
         // `diskCache` was present with every counter zero, and the transfer appeared only
         // in `core/stats` with no `srcFs`, so the attribution filter drops it too.
         //
-        // Reporting that as idle is what lets an unmount truncate the file being written.
+        // Reporting that as idle offers the user an unmount of a mount that is not idle.
+        // The kernel refuses it (#73), so the file survives — but the applet has still
+        // told them something untrue.
         let fake = FakeRc::new(
             "minimal",
             vec![
@@ -641,7 +643,7 @@ mod tests {
         // releases. Giving `vfs.CacheMode` a `MarshalJSON` — it already has a `String()` —
         // would turn it into `"minimal"`, and every mount would parse as mode-unknown. If
         // unknown were read as "all writes are queued", that one upstream change would
-        // silently restore the truncation bug on every minimal mount at once.
+        // turn every minimal mount confidently idle at once, whatever it was doing.
         let mut v: serde_json::Value =
             serde_json::from_str(&fixture("vfs-stats-upload-in-progress.json")).unwrap();
         v["opt"]["CacheMode"] = serde_json::json!("minimal");
@@ -675,9 +677,10 @@ mod tests {
         // unable to call anything safe to unmount — useless rather than cautious.
         //
         // What this does not cover is a file still open: rclone enqueues on close, so
-        // nothing over rc sees it, and stopping the mount then truncates the object at the
-        // remote — measured, #73. `safe_to_unmount()` is necessary and not sufficient, and
-        // its rustdoc says so.
+        // nothing over rc sees it and this reads idle throughout. The unmount path asks
+        // the kernel before it signals rclone and is refused (#73), so nothing is
+        // truncated; the reading here is still wrong, which is why `safe_to_unmount()` is
+        // necessary and not sufficient and its rustdoc says so.
         let fake = FakeRc::new(
             "writes",
             vec![

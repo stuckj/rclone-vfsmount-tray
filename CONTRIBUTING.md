@@ -11,7 +11,7 @@ cd rclone-vfsmount-tray
 cargo test
 ```
 
-That is the whole setup for `rvt-core`, the service and the tray: they link no system C
+That is the whole setup for every crate except the GTK client: they link no system C
 libraries, so nothing needs installing beyond a Rust toolchain.
 
 `rust-toolchain.toml` pins `stable`, so rustup will fetch it regardless of what you have.

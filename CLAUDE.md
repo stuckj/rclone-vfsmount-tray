@@ -10,7 +10,8 @@ crates/core/      rvt-core — rc API models, rclone discovery, config, MountSup
                   Pure Rust. Everything else depends on this; it depends on nothing local.
 crates/service/   rclone-vfsmount-trayd — owns mounts, polls, serves D-Bus. Pure Rust.
 crates/tray/      rclone-vfsmount-tray — ksni SNI client over D-Bus. Pure Rust.
-crates/gtk/       rclone-vfsmount-tray-gtk — GTK4 client. The only crate that links C.
+crates/gtk/       rclone-vfsmount-tray-gtk — GTK4 client. The only crate that will link
+                  C, once it gains `gtk4`; today it has none and nothing here links one.
 crates/testutil/  rvt-testutil — scratch directories for tests. A dev-dependency of the
                   others, never linked into a binary, and depends on nothing itself.
 ```
@@ -136,17 +137,19 @@ repo squash-merges, so a merged branch is never an ancestor of `main` and
 `git merge-base --is-ancestor` will say it is unmerged. An empty `git diff main..<branch>`
 is the test.
 
-**`gh issue view` and `gh pr edit` fail against this repo.** Both hit the deprecated
-projects-classic GraphQL field, which `.github/workflows/project-add.yml` puts issues and
-PRs on. Each exits 1 printing only the deprecation notice, and `gh pr edit` **discards the
-edit** — measured on #78, where the title was unchanged afterwards. Use REST:
+**`gh issue view`, `gh pr view` and `gh pr edit` fail against this repo.** All three hit
+the deprecated projects-classic GraphQL field, which `.github/workflows/project-add.yml`
+puts issues and PRs on. Each exits 1 printing only the deprecation notice, and `gh pr edit`
+**discards the edit** — measured on #78, where the title was unchanged afterwards. Use
+REST:
 
 ```sh
 gh api repos/stuckj/rclone-vfsmount-tray/issues/<n>
 gh api -X PATCH repos/stuckj/rclone-vfsmount-tray/pulls/<n> -f title=... --input body.json
 ```
 
-`gh pr create`, `gh pr view`, `gh pr list` and `gh api .../comments` are unaffected.
+`gh pr view <n> --json <fields>` *is* fine — that query omits `projectCards` — as are
+`gh pr create`, `gh pr list` and `gh api`.
 
 **Never write a bracketed skip-ci marker in a commit message, not even to describe one.**
 GitHub scans the whole message, body included, for `[skip ci]`, `[ci skip]`, `[no ci]`,

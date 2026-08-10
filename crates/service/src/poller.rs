@@ -448,6 +448,7 @@ fn empty() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvt_testutil::Scratch;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
@@ -460,7 +461,7 @@ mod tests {
 
     /// Answers a body per rc command path, so a poll can be driven end to end.
     struct FakeRc {
-        dir: PathBuf,
+        _dir: Scratch,
         socket: PathBuf,
         routes: Routes,
         handle: tokio::task::JoinHandle<()>,
@@ -487,15 +488,7 @@ mod tests {
         }
 
         async fn new(tag: &str, routes: Vec<(&'static str, String)>) -> Self {
-            // The sequence number, not the tag, is what keeps two concurrent tests apart:
-            // `new` opens by removing the directory, so a tag used twice has one test
-            // deleting the other's live socket.
-            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let dir =
-                std::env::temp_dir().join(format!("rvt-poll-{}-{tag}-{n}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = Scratch::new(tag);
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             let socket = dir.join("rc.sock");
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -505,7 +498,7 @@ mod tests {
             let served = routes.clone();
             let handle = tokio::spawn(async move { serve_routes(listener, served).await });
             Self {
-                dir,
+                _dir: dir,
                 socket,
                 routes,
                 handle,
@@ -551,7 +544,6 @@ mod tests {
     impl Drop for FakeRc {
         fn drop(&mut self) {
             self.handle.abort();
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
@@ -944,8 +936,8 @@ mod tests {
     async fn an_rclone_that_has_gone_away_degrades_and_says_why() {
         // The case the on-disk tier exists for: reporting it as a fault would show the
         // user an error where a disk scan would still have an answer.
-        let missing = std::env::temp_dir().join(format!("rvt-gone-{}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&missing);
+        let dir = Scratch::new("gone");
+        let missing = dir.join("rc.sock");
         let client = RcClient::new(&missing);
 
         // `connect` degrades to no capabilities rather than erroring.
@@ -1021,13 +1013,9 @@ mod tests {
         // Both cleanups run on unwind. Every assertion below is between the spawn and the
         // teardown, so a failing one would otherwise leave an rclone holding a listener
         // and an rc socket for as long as the machine stays up.
-        let dir = TempDir(std::env::temp_dir().join(format!("rvt-live-{}", std::process::id())));
-        let dir = &dir.0;
-        let _ = std::fs::remove_dir_all(dir);
-        let (src, cache) = (dir.join("src"), dir.join("cache"));
-        std::fs::create_dir_all(&src).unwrap();
-        std::fs::create_dir_all(&cache).unwrap();
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = Scratch::new("live");
+        let (src, cache) = (dir.dir("src"), dir.dir("cache"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.join("rc.sock");
 
         // A long write-back delay keeps the file in the queue for the whole test rather
@@ -1138,15 +1126,6 @@ mod tests {
         assert_eq!(state.errored_files, Some(0));
 
         let _ = child.kill().await;
-    }
-
-    /// Removes its directory however the test leaves the stack.
-    struct TempDir(PathBuf);
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 
     /// Read rclone's log until it announces the port it bound.
@@ -1299,11 +1278,9 @@ mod tests {
         // else is `Err`. Dropping that `Err` leaves the connect-time reason in place, so a
         // mount whose socket is now present and answering keeps reporting "no rc socket at
         // …" — sending the user to look for a missing file that exists.
-        let dir = TempDir(std::env::temp_dir().join(format!("rvt-relatch-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&dir.0);
-        std::fs::create_dir_all(&dir.0).unwrap();
-        std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket = dir.0.join("rc.sock");
+        let dir = Scratch::new("relatch");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = dir.join("rc.sock");
 
         let mut p = MountPoller::connect("backup", RcClient::new(&socket)).await;
         let before = p.poll().await;
@@ -1336,9 +1313,7 @@ mod tests {
         // re-probing the mount reports as unobservable for the life of the service even
         // after rclone comes back. The service starting before its mount units, or a
         // mount unit restarting after a crash, both land here.
-        let dir = std::env::temp_dir().join(format!("rvt-late-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("late");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.join("rc.sock");
 
@@ -1366,7 +1341,6 @@ mod tests {
         assert!(after.pending.files > 0);
 
         server.abort();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `vfs/stats` whose cache paths point at a tree this test controls.
@@ -1405,9 +1379,8 @@ mod tests {
         // queue — and then rclone goes away. The backlog does not: dirty items outlive the
         // process that queued them, which is the whole reason this tier exists. Before
         // #22 the honest answer here was "cannot tell"; now it is the answer itself.
-        let cache = TempDir(std::env::temp_dir().join(format!("rvt-died-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&cache.0);
-        dirty_entry(&cache.0, "left-behind.bin", 4096);
+        let cache = Scratch::new("died");
+        dirty_entry(cache.path(), "left-behind.bin", 4096);
 
         let fake = FakeRc::new(
             "died",
@@ -1416,7 +1389,7 @@ mod tests {
                 ("vfs/queue", fixture("vfs-queue-uploading.json")),
                 (
                     "vfs/stats",
-                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                    stats_pointing_at(&cache.join("vfsMeta"), &cache.join("vfs")),
                 ),
             ],
         )
@@ -1454,15 +1427,13 @@ mod tests {
         // nothing there proves even less than an empty queue did. Without the mode latched
         // beside the roots, falling back produced a *more* confident answer than the live
         // path it replaced.
-        let cache =
-            TempDir(std::env::temp_dir().join(format!("rvt-minfall-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&cache.0);
-        std::fs::create_dir_all(cache.0.join("vfsMeta")).unwrap();
-        std::fs::create_dir_all(cache.0.join("vfs")).unwrap();
+        let cache = Scratch::new("minfall");
+        cache.dir("vfsMeta");
+        cache.dir("vfs");
 
         let mut v: serde_json::Value = serde_json::from_str(&stats_pointing_at(
-            &cache.0.join("vfsMeta"),
-            &cache.0.join("vfs"),
+            &cache.join("vfsMeta"),
+            &cache.join("vfs"),
         ))
         .unwrap();
         v["opt"]["CacheMode"] = serde_json::json!(1);
@@ -1500,11 +1471,9 @@ mod tests {
     async fn a_writes_mount_falling_to_disk_is_still_trusted() {
         // The other side, or the rule above would just be "never trust the fallback",
         // which makes the tier pointless.
-        let cache =
-            TempDir(std::env::temp_dir().join(format!("rvt-writefall-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&cache.0);
-        std::fs::create_dir_all(cache.0.join("vfsMeta")).unwrap();
-        std::fs::create_dir_all(cache.0.join("vfs")).unwrap();
+        let cache = Scratch::new("writefall");
+        cache.dir("vfsMeta");
+        cache.dir("vfs");
 
         let fake = FakeRc::new(
             "writefall",
@@ -1513,7 +1482,7 @@ mod tests {
                 ("vfs/queue", r#"{"queue":[]}"#.to_string()),
                 (
                     "vfs/stats",
-                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                    stats_pointing_at(&cache.join("vfsMeta"), &cache.join("vfs")),
                 ),
             ],
         )
@@ -1542,13 +1511,11 @@ mod tests {
         // write path it can no longer see, undoing the fail-closed default on the live
         // path. The replacement-on-the-same-socket case is one the poller already handles
         // elsewhere, so it is not hypothetical.
-        let cache =
-            TempDir(std::env::temp_dir().join(format!("rvt-modelatch-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&cache.0);
-        std::fs::create_dir_all(cache.0.join("vfsMeta")).unwrap();
-        std::fs::create_dir_all(cache.0.join("vfs")).unwrap();
+        let cache = Scratch::new("modelatch");
+        cache.dir("vfsMeta");
+        cache.dir("vfs");
 
-        let good = stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs"));
+        let good = stats_pointing_at(&cache.join("vfsMeta"), &cache.join("vfs"));
         let mut odd: serde_json::Value = serde_json::from_str(&good).unwrap();
         odd["opt"]["CacheMode"] = serde_json::json!(9);
 
@@ -1591,19 +1558,15 @@ mod tests {
         // size reads unknown — and had the staleness gone the other way, an empty old
         // metadata tree would have reported a backlogged cache as idle. rclone sets both
         // whenever `diskCache` is present, so this is a guard rather than a fix.
-        let old =
-            TempDir(std::env::temp_dir().join(format!("rvt-rootpair-a-{}", std::process::id())));
-        let new =
-            TempDir(std::env::temp_dir().join(format!("rvt-rootpair-b-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&old.0);
-        let _ = std::fs::remove_dir_all(&new.0);
-        dirty_entry(&old.0, "waiting.bin", 2048);
-        std::fs::create_dir_all(new.0.join("vfs")).unwrap();
+        let old = Scratch::new("rootpair-a");
+        let new = Scratch::new("rootpair-b");
+        dirty_entry(old.path(), "waiting.bin", 2048);
+        new.dir("vfs");
 
-        let good = stats_pointing_at(&old.0.join("vfsMeta"), &old.0.join("vfs"));
+        let good = stats_pointing_at(&old.join("vfsMeta"), &old.join("vfs"));
         // A response naming a data root but no metadata root.
         let mut half: serde_json::Value = serde_json::from_str(&good).unwrap();
-        half["diskCache"]["path"] = serde_json::json!(new.0.join("vfs").to_string_lossy());
+        half["diskCache"]["path"] = serde_json::json!(new.join("vfs").to_string_lossy());
         half["diskCache"]["pathMeta"] = serde_json::json!("");
 
         let fake = FakeRc::new(
@@ -1648,11 +1611,9 @@ mod tests {
         // describes the cache a previous one named. Keeping the roots lets the fallback
         // scan a tree belonging to an instance that is gone and report its emptiness as
         // this mount's — a confident idle for a mount whose real cache was never named.
-        let stale =
-            TempDir(std::env::temp_dir().join(format!("rvt-404root-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&stale.0);
-        std::fs::create_dir_all(stale.0.join("vfsMeta")).unwrap();
-        std::fs::create_dir_all(stale.0.join("vfs")).unwrap();
+        let stale = Scratch::new("404root");
+        stale.dir("vfsMeta");
+        stale.dir("vfs");
 
         let fake = FakeRc::new(
             "root404",
@@ -1661,7 +1622,7 @@ mod tests {
                 ("vfs/queue", r#"{"queue":[]}"#.to_string()),
                 (
                     "vfs/stats",
-                    stats_pointing_at(&stale.0.join("vfsMeta"), &stale.0.join("vfs")),
+                    stats_pointing_at(&stale.join("vfsMeta"), &stale.join("vfs")),
                 ),
             ],
         )
@@ -1695,13 +1656,11 @@ mod tests {
         // empty directory, which reads as "nothing outstanding" for a mount that has no
         // cache to be outstanding in. rclone 1.75 pairs a cacheless VFS with CacheMode 0,
         // which fails closed on its own, so this is the class fix rather than a live bug.
-        let stale =
-            TempDir(std::env::temp_dir().join(format!("rvt-staleroot-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&stale.0);
-        std::fs::create_dir_all(stale.0.join("vfsMeta")).unwrap();
-        std::fs::create_dir_all(stale.0.join("vfs")).unwrap();
+        let stale = Scratch::new("staleroot");
+        stale.dir("vfsMeta");
+        stale.dir("vfs");
 
-        let good = stats_pointing_at(&stale.0.join("vfsMeta"), &stale.0.join("vfs"));
+        let good = stats_pointing_at(&stale.join("vfsMeta"), &stale.join("vfs"));
         // Same socket, an rclone reporting a queueing mode and no cache.
         let mut cacheless: serde_json::Value = serde_json::from_str(&good).unwrap();
         cacheless["diskCache"] = serde_json::Value::Null;
@@ -1741,10 +1700,8 @@ mod tests {
         // when the fallback was tried and could not read the cache either sends the user
         // to look at rclone, when the thing to look at is the cache directory.
         use std::os::unix::fs::PermissionsExt;
-        let cache =
-            TempDir(std::env::temp_dir().join(format!("rvt-noread-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&cache.0);
-        dirty_entry(&cache.0, "waiting.bin", 16);
+        let cache = Scratch::new("noread");
+        dirty_entry(cache.path(), "waiting.bin", 16);
 
         let fake = FakeRc::new(
             "noread",
@@ -1753,7 +1710,7 @@ mod tests {
                 ("vfs/queue", fixture("vfs-queue-uploading.json")),
                 (
                     "vfs/stats",
-                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                    stats_pointing_at(&cache.join("vfsMeta"), &cache.join("vfs")),
                 ),
             ],
         )
@@ -1763,7 +1720,7 @@ mod tests {
 
         fake.handle.abort();
         let _ = std::fs::remove_file(&fake.socket);
-        let meta = cache.0.join("vfsMeta");
+        let meta = cache.join("vfsMeta");
         std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         let after = p.poll().await;
@@ -1783,13 +1740,11 @@ mod tests {
         // Otherwise the state reads not-known with nothing in the text to explain it, and
         // the rc failure takes the blame for a cache that was only half read — sending the
         // user to look at rclone when the thing to look at is the cache directory.
-        let cache =
-            TempDir(std::env::temp_dir().join(format!("rvt-partial-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&cache.0);
-        dirty_entry(&cache.0, "readable.bin", 32);
+        let cache = Scratch::new("partial");
+        dirty_entry(cache.path(), "readable.bin", 32);
         // A descriptor that exists and does not parse. rclone rewrites these in place, so
         // a torn read looks exactly like this.
-        std::fs::write(cache.0.join("vfsMeta").join("torn.bin"), "").unwrap();
+        cache.write("vfsMeta/torn.bin", "");
 
         let fake = FakeRc::new(
             "partialscan",
@@ -1798,7 +1753,7 @@ mod tests {
                 ("vfs/queue", fixture("vfs-queue-uploading.json")),
                 (
                     "vfs/stats",
-                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                    stats_pointing_at(&cache.join("vfsMeta"), &cache.join("vfs")),
                 ),
             ],
         )
@@ -1823,9 +1778,7 @@ mod tests {
         // The other half. An empty scan and an absent tree both find no dirty files, but
         // a cache directory disappearing is not evidence the queue drained — and this is
         // the mount that must never flip to "nothing outstanding, exactly".
-        let cache =
-            TempDir(std::env::temp_dir().join(format!("rvt-nocache-{}", std::process::id())));
-        let _ = std::fs::remove_dir_all(&cache.0);
+        let cache = Scratch::new("nocache");
 
         let fake = FakeRc::new(
             "diednocache",
@@ -1834,7 +1787,7 @@ mod tests {
                 ("vfs/queue", fixture("vfs-queue-uploading.json")),
                 (
                     "vfs/stats",
-                    stats_pointing_at(&cache.0.join("vfsMeta"), &cache.0.join("vfs")),
+                    stats_pointing_at(&cache.join("vfsMeta"), &cache.join("vfs")),
                 ),
             ],
         )

@@ -8,11 +8,12 @@
 
 use rvt_core::rc::RcError;
 use rvt_core::{Capabilities, RcClient, Tier};
+use rvt_testutil::Scratch;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 /// Serves one canned response, then keeps accepting so nothing blocks on connect.
-async fn serve(tag: &str, body: &str) -> (PathBuf, PathBuf, tokio::task::JoinHandle<()>) {
+async fn serve(tag: &str, body: &str) -> (Scratch, PathBuf, tokio::task::JoinHandle<()>) {
     serve_status(tag, 200, "OK", body).await
 }
 
@@ -22,10 +23,8 @@ async fn serve_status(
     code: u16,
     reason: &str,
     body: &str,
-) -> (PathBuf, PathBuf, tokio::task::JoinHandle<()>) {
-    let dir = std::env::temp_dir().join(format!("rvt-probe-{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+) -> (Scratch, PathBuf, tokio::task::JoinHandle<()>) {
+    let dir = Scratch::new(tag);
     // `verify()` refuses anything a third party could reach or replace.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = dir.join("rc.sock");
@@ -68,7 +67,7 @@ async fn probing_a_real_rclone_reads_its_command_paths() {
     // The whole path, against the captured payload: if the wrong field were read, every
     // `has()` would answer false and every mount would resolve to T4 while looking as
     // though rclone had simply said so.
-    let (dir, socket, server) = serve("ok", &captured_rc_list()).await;
+    let (_dir, socket, server) = serve("ok", &captured_rc_list()).await;
 
     let caps = Capabilities::probe(&RcClient::new(&socket))
         .await
@@ -84,16 +83,14 @@ async fn probing_a_real_rclone_reads_its_command_paths() {
     );
 
     server.abort();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn probing_an_absent_socket_falls_through_to_the_disk_scan() {
     // #13: "fall through to T4 when the socket is unreachable entirely". Surfacing this
     // as an error instead would make an unmounted mount look broken on every poll.
-    let missing =
-        std::env::temp_dir().join(format!("rvt-probe-absent-{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&missing);
+    let dir = Scratch::new("probe-absent");
+    let missing = dir.join("rc.sock");
 
     let caps = Capabilities::probe(&RcClient::new(&missing))
         .await
@@ -132,14 +129,13 @@ async fn a_socket_we_refuse_says_so_rather_than_looking_like_an_idle_rclone() {
     );
 
     server.abort();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
 async fn an_rclone_that_answers_with_an_error_is_a_fault_not_a_degrade() {
     // The other half of the error model. Degrading here would hide a real rclone fault
     // behind a mount that merely looks unable to do much, permanently and with no log.
-    let (dir, socket, server) = serve_status("500", 500, "Internal Server Error", "boom").await;
+    let (_dir, socket, server) = serve_status("500", 500, "Internal Server Error", "boom").await;
 
     let e = Capabilities::probe(&RcClient::new(&socket))
         .await
@@ -155,7 +151,6 @@ async fn an_rclone_that_answers_with_an_error_is_a_fault_not_a_degrade() {
     }
 
     server.abort();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -163,7 +158,7 @@ async fn a_renamed_commands_field_is_an_error_rather_than_an_empty_answer() {
     // The drift this whole detection strategy exists to survive. If it defaulted to an
     // empty command set, every mount would sit at T4 reporting nothing wrong — disk-scan
     // fidelity presented as rclone's own answer, with no error anywhere to explain it.
-    let (dir, socket, server) = serve("renamed", r#"{"list":[{"Path":"core/stats"}]}"#).await;
+    let (_dir, socket, server) = serve("renamed", r#"{"list":[{"Path":"core/stats"}]}"#).await;
 
     let e = Capabilities::probe(&RcClient::new(&socket))
         .await
@@ -174,5 +169,4 @@ async fn a_renamed_commands_field_is_an_error_rather_than_an_empty_answer() {
     );
 
     server.abort();
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -512,6 +512,7 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvt_testutil::Scratch;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -599,7 +600,7 @@ mod tests {
     /// a library would smooth over.
     #[cfg(unix)]
     struct FakeRc {
-        dir: PathBuf,
+        dir: Scratch,
         socket: PathBuf,
         handle: tokio::task::JoinHandle<Option<String>>,
     }
@@ -607,9 +608,7 @@ mod tests {
     #[cfg(unix)]
     impl FakeRc {
         async fn serving(tag: &str, response: &'static str) -> Self {
-            let dir = std::env::temp_dir().join(format!("rvt-fakerc-{}-{tag}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = Scratch::new(tag);
             // 0700, as `socket_dir()` demands in production: the directory is what keeps
             // the socket unreachable, and `verify()` refuses one others can write to.
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -643,9 +642,7 @@ mod tests {
 
         /// The request line and headers the client actually sent.
         async fn request(self) -> String {
-            let r = self.handle.await.ok().flatten().unwrap_or_default();
-            let _ = std::fs::remove_dir_all(&self.dir);
-            r
+            self.handle.await.ok().flatten().unwrap_or_default()
         }
     }
 
@@ -755,15 +752,13 @@ mod tests {
         fail_first: usize,
         response: &'static str,
     ) -> (
-        PathBuf,
+        Scratch,
         PathBuf,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let dir = std::env::temp_dir().join(format!("rvt-flaky-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new(tag);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.join("rc.sock");
 
@@ -799,7 +794,7 @@ mod tests {
     async fn a_transport_fault_is_retried_until_it_succeeds() {
         use std::sync::atomic::Ordering;
 
-        let (dir, socket, connects) = flaky_server(
+        let (_dir, socket, connects) = flaky_server(
             "retry",
             2,
             "HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\n{\"version\":\"v1.75.0\"}",
@@ -817,7 +812,6 @@ mod tests {
             3,
             "two failures then a success"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -826,7 +820,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         // Always fails, so the limit is what ends it rather than success.
-        let (dir, socket, connects) = flaky_server("exhaust", usize::MAX, "").await;
+        let (_dir, socket, connects) = flaky_server("exhaust", usize::MAX, "").await;
 
         let e = RcClient::new(&socket)
             .with_limits(Duration::from_secs(5), 3)
@@ -839,7 +833,6 @@ mod tests {
             3,
             "exactly max_attempts connections, no more"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -849,7 +842,7 @@ mod tests {
 
         // A 404 is an answer, not a fault to try again — retrying would triple the load
         // and the latency for a result that cannot change.
-        let (dir, socket, connects) = flaky_server(
+        let (_dir, socket, connects) = flaky_server(
             "noretry",
             0,
             "HTTP/1.1 404 Not Found\r\nContent-Length: 5\r\n\r\nnope!",
@@ -867,7 +860,6 @@ mod tests {
             1,
             "answered once, not retried"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Accepts, waits, then resets — a crash-looping rclone. Counts connections so a
@@ -877,16 +869,14 @@ mod tests {
         tag: &str,
         delay: Duration,
     ) -> (
-        PathBuf,
+        Scratch,
         PathBuf,
         std::sync::Arc<std::sync::atomic::AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let dir = std::env::temp_dir().join(format!("rvt-slowfail-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new(tag);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.join("rc.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -912,9 +902,7 @@ mod tests {
         // Pins the timeout arm itself. Without this nothing in the suite produces a
         // `Timeout` from a real call, so the whole expiry path could be removed unnoticed
         // — and a wedged rclone would freeze every poll tick forever.
-        let dir = std::env::temp_dir().join(format!("rvt-wedged-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("wedged");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket = dir.join("rc.sock");
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -945,7 +933,6 @@ mod tests {
         );
 
         held.abort();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -963,7 +950,7 @@ mod tests {
         // per-attempt budget would instead give each attempt its own 600ms.
         let delay = Duration::from_millis(250);
         let budget = Duration::from_millis(600);
-        let (dir, socket, connects, server) = slow_failing_server("budget", delay).await;
+        let (_dir, socket, connects, server) = slow_failing_server("budget", delay).await;
 
         let started = std::time::Instant::now();
         let e = RcClient::new(&socket)
@@ -990,7 +977,6 @@ mod tests {
         );
 
         server.abort();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1023,7 +1009,6 @@ mod tests {
         );
 
         server.abort();
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1049,7 +1034,6 @@ mod tests {
         }
 
         server.handle.abort();
-        let _ = std::fs::remove_dir_all(&server.dir);
     }
 
     #[cfg(unix)]
@@ -1061,9 +1045,7 @@ mod tests {
         // the mount. A 0700 directory cannot be traversed, so nobody else can reach the
         // socket whatever its own mode says. Refusing it would reject every socket this
         // project creates, on a default install.
-        let dir = std::env::temp_dir().join(format!("rvt-loose-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("loose");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("rc.sock");
         let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -1082,15 +1064,12 @@ mod tests {
             ),
             "with a traversable directory the socket's own mode is what decides"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn a_socket_owned_by_another_user_is_refused() {
-        let dir = std::env::temp_dir().join(format!("rvt-owner-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("owner");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("rc.sock");
         let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -1107,7 +1086,6 @@ mod tests {
         RcClient::new(&path)
             .verify()
             .expect("our own socket is fine");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1115,9 +1093,7 @@ mod tests {
     fn a_symlink_standing_in_for_the_socket_is_refused() {
         // Judged on its own account. Following it would approve whatever it points at
         // right now, and the link can be repointed before the connect.
-        let dir = std::env::temp_dir().join(format!("rvt-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("link");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let real = dir.join("real.sock");
         let _l = std::os::unix::net::UnixListener::bind(&real).unwrap();
@@ -1132,7 +1108,6 @@ mod tests {
             }
             other => panic!("a symlink must be refused, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1146,7 +1121,7 @@ mod tests {
         let resp: &'static str = Box::leak(
             format!("HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n{body}").into_boxed_str(),
         );
-        let (dir, socket, connects) = flaky_server("toolarge", 0, resp).await;
+        let (_dir, socket, connects) = flaky_server("toolarge", 0, resp).await;
 
         let e = RcClient::new(&socket)
             .with_limits(Duration::from_secs(5), 3)
@@ -1166,7 +1141,6 @@ mod tests {
             1,
             "an oversized body must not be fetched again"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1174,9 +1148,7 @@ mod tests {
     async fn a_socket_in_a_group_writable_directory_is_refused() {
         // The socket's own mode is not enough: anyone who can write to the directory can
         // unlink it and put their own socket at the same path.
-        let dir = std::env::temp_dir().join(format!("rvt-dir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("dir");
         let socket = dir.join("rc.sock");
         let _l = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1193,7 +1165,6 @@ mod tests {
         RcClient::new(&socket)
             .verify()
             .expect("0700 directory with a 0600 socket is fine");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1215,7 +1186,6 @@ mod tests {
         assert!(e.is_unreachable());
 
         server.handle.abort();
-        let _ = std::fs::remove_dir_all(&server.dir);
     }
 
     #[test]
@@ -1231,8 +1201,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_group_accessible_socket_is_refused() {
-        let dir = std::env::temp_dir().join(format!("rvt-rc-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("rc");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("perms.sock");
         let _l = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -1259,15 +1228,12 @@ mod tests {
         // than "can connect", because a mode that loose means something else set it.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         assert!(matches!(c.verify(), Err(RcError::InsecureSocket { .. })));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]
     #[test]
     fn a_regular_file_is_not_a_socket() {
-        let dir = std::env::temp_dir().join(format!("rvt-rc-file-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("rc-file");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let path = dir.join("not.sock");
         std::fs::write(&path, b"").unwrap();
@@ -1277,7 +1243,6 @@ mod tests {
             Err(RcError::InsecureSocket { reason, .. }) => assert_eq!(reason, "not a socket"),
             other => panic!("expected a refusal, got {other:?}"),
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

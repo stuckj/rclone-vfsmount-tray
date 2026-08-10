@@ -723,6 +723,7 @@ fn foreign_name(e: &MountEntry) -> String {
 mod tests {
     use super::*;
     use rvt_core::config::CacheMode;
+    use rvt_testutil::Scratch;
     use std::sync::Mutex;
 
     /// Records what it was asked to do and reports whatever status the test sets.
@@ -776,10 +777,8 @@ mod tests {
 
     /// A real directory, because `mount` refuses a mount point it cannot create and the
     /// tests that exercise starting a unit have to get past that check.
-    fn mount_point(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("rvt-mp-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&p).unwrap();
-        p
+    fn mount_point(scratch: &Scratch) -> PathBuf {
+        scratch.dir("mnt")
     }
 
     fn mountinfo_with(paths: &[&str]) -> String {
@@ -796,11 +795,8 @@ mod tests {
         s
     }
 
-    fn fixture(name: &str, contents: &str) -> PathBuf {
-        let p =
-            std::env::temp_dir().join(format!("rvt-sup-{}-{name}.mountinfo", std::process::id()));
-        std::fs::write(&p, contents).unwrap();
-        p
+    fn fixture(scratch: &Scratch, name: &str, contents: &str) -> PathBuf {
+        scratch.write(format!("{name}.mountinfo"), contents)
     }
 
     fn config_with_backup(mount_point: PathBuf) -> Arc<Config> {
@@ -831,11 +827,9 @@ mod tests {
         mounted: bool,
         extra: &[&str],
         status: UnitStatus,
-    ) -> SystemdSupervisor<FakeUnits> {
-        let mp = mount_point(tag);
-        let _ = std::fs::remove_dir_all(
-            std::env::temp_dir().join(format!("rvt-run-{}-{tag}", std::process::id())),
-        );
+    ) -> (Scratch, SystemdSupervisor<FakeUnits>) {
+        let scratch = Scratch::new(tag);
+        let mp = mount_point(&scratch);
         let mp_str = mp.to_string_lossy().into_owned();
         let mut live: Vec<&str> = Vec::new();
         if mounted {
@@ -845,22 +839,24 @@ mod tests {
 
         let units = FakeUnits::default();
         *units.status.lock().unwrap() = status;
-        SystemdSupervisor::new(
+        let sup = SystemdSupervisor::new(
             config_with_backup(mp.clone()),
             PathBuf::from("/usr/bin/rclone"),
             units,
-            std::env::temp_dir().join(format!("rvt-run-{}-{tag}", std::process::id())),
+            // Deliberately not created: the runtime directory is the supervisor's to make.
+            scratch.join("run"),
             PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
-            fixture(tag, &mountinfo_with(&live)),
+            fixture(&scratch, tag, &mountinfo_with(&live)),
             Duration::from_millis(300),
-        )
+        );
+        (scratch, sup)
     }
 
     #[tokio::test]
     async fn a_mount_we_started_is_ours() {
-        let s = supervisor("ours", true, &[], UnitStatus::Active);
+        let (_sc, s) = supervisor("ours", true, &[], UnitStatus::Active);
         assert_eq!(s.state("backup").await.unwrap(), MountState::Mounted);
     }
 
@@ -868,7 +864,7 @@ mod tests {
     async fn a_mount_with_no_unit_of_ours_is_foreign() {
         // Same kernel evidence, no unit. This is the case that must not be reported as
         // ours, because acting on it would be acting on somebody else's mount.
-        let s = supervisor("foreign", true, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("foreign", true, &[], UnitStatus::Inactive);
         let st = s.state("backup").await.unwrap();
         assert_eq!(st, MountState::Foreign);
         assert!(st.is_live() && !st.is_managed());
@@ -876,13 +872,13 @@ mod tests {
 
     #[tokio::test]
     async fn nothing_mounted_is_unmounted_not_failed() {
-        let s = supervisor("down", false, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("down", false, &[], UnitStatus::Inactive);
         assert_eq!(s.state("backup").await.unwrap(), MountState::Unmounted);
     }
 
     #[tokio::test]
     async fn a_failed_unit_carries_rclones_own_words() {
-        let s = supervisor("failed", false, &[], UnitStatus::Failed);
+        let (_sc, s) = supervisor("failed", false, &[], UnitStatus::Failed);
         match s.state("backup").await.unwrap() {
             MountState::Failed { reason } => {
                 assert!(reason.contains("permission denied"), "{reason}");
@@ -894,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn mounting_something_already_up_is_a_no_op() {
         // The service restarting must not try to remount everything it finds.
-        let s = supervisor("already", true, &[], UnitStatus::Active);
+        let (_sc, s) = supervisor("already", true, &[], UnitStatus::Active);
         s.mount("backup").await.unwrap();
         assert!(
             s.units.started.lock().unwrap().is_empty(),
@@ -904,7 +900,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_mount_that_never_appears_reports_why() {
-        let s = supervisor("never", false, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("never", false, &[], UnitStatus::Inactive);
         match s.mount("backup").await {
             Err(SupervisorError::RcloneFailed { reason, .. }) => {
                 assert!(reason.contains("permission denied"), "{reason}");
@@ -924,7 +920,7 @@ mod tests {
         // restrictive one here gives a mount with `allow_other` 0600 files that the
         // account it was shared with cannot read. The socket is kept private by the mode
         // of the directory holding it instead.
-        let s = supervisor("umask", false, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("umask", false, &[], UnitStatus::Inactive);
         let _ = s.mount("backup").await;
 
         let started = s.units.started.lock().unwrap();
@@ -953,14 +949,14 @@ mod tests {
 
     #[tokio::test]
     async fn unmounting_something_already_down_is_a_no_op() {
-        let s = supervisor("gone", false, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("gone", false, &[], UnitStatus::Inactive);
         s.unmount("backup", false).await.unwrap();
         assert!(s.units.stopped.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn a_foreign_mount_is_not_unmounted_without_force() {
-        let s = supervisor("noforce", true, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("noforce", true, &[], UnitStatus::Inactive);
         match s.unmount("backup", false).await {
             Err(SupervisorError::NotManaged(n)) => assert_eq!(n, "backup"),
             other => panic!("expected NotManaged, got {other:?}"),
@@ -978,7 +974,7 @@ mod tests {
 
     #[tokio::test]
     async fn unmounting_a_mount_we_started_stops_its_unit() {
-        let s = supervisor("stops", true, &[], UnitStatus::Active);
+        let (_sc, s) = supervisor("stops", true, &[], UnitStatus::Active);
         releasing(&s);
         s.unmount("backup", false).await.expect("our own mount");
         assert_eq!(
@@ -993,7 +989,7 @@ mod tests {
         // The wedge: rclone restart-loops without mounting anything. Nothing is live, so
         // an is_live() check alone returns Ok and leaves it respawning forever, with no
         // way to stop it from the applet.
-        let s = supervisor("wedged", false, &[], UnitStatus::Activating);
+        let (_sc, s) = supervisor("wedged", false, &[], UnitStatus::Activating);
         s.unmount("backup", false)
             .await
             .expect("a running unit of ours must be stoppable even with nothing mounted");
@@ -1010,7 +1006,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_unit_is_stopped_and_cleared_so_the_mount_can_be_retried() {
-        let s = supervisor("retryable", false, &[], UnitStatus::Failed);
+        let (_sc, s) = supervisor("retryable", false, &[], UnitStatus::Failed);
         s.unmount("backup", false)
             .await
             .expect("a failed unit is ours");
@@ -1022,13 +1018,13 @@ mod tests {
     async fn a_mount_being_torn_down_is_not_reported_as_somebody_elses() {
         // rclone flushes the write-back cache during its stop timeout, so this state can
         // last 30s of the user's own unmount.
-        let s = supervisor("tearing", true, &[], UnitStatus::Deactivating);
+        let (_sc, s) = supervisor("tearing", true, &[], UnitStatus::Deactivating);
         assert_eq!(s.state("backup").await.unwrap(), MountState::Unmounting);
     }
 
     #[tokio::test]
     async fn our_own_crashed_mount_stays_ours() {
-        let s = supervisor("crashed", true, &[], UnitStatus::Failed);
+        let (_sc, s) = supervisor("crashed", true, &[], UnitStatus::Failed);
         match s.state("backup").await.unwrap() {
             MountState::Failed { .. } => {}
             other => panic!("a failed unit of ours must not read as Foreign, got {other:?}"),
@@ -1039,7 +1035,7 @@ mod tests {
     async fn a_started_unit_with_nothing_mounted_yet_is_coming_up() {
         // `Type=exec` reports active the moment rclone is exec'd, seconds before the
         // mount point answers. Reporting that as Unmounted inverts the two states.
-        let s = supervisor("comingup", false, &[], UnitStatus::Active);
+        let (_sc, s) = supervisor("comingup", false, &[], UnitStatus::Active);
         assert_eq!(s.state("backup").await.unwrap(), MountState::Mounting);
     }
 
@@ -1048,7 +1044,7 @@ mod tests {
         // Without force this is refused. With it, the release must genuinely be attempted
         // — it fails here because the fixture is not a real filesystem, but "we did not
         // try" and "we tried and could not" are different answers.
-        let s = supervisor("force", true, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("force", true, &[], UnitStatus::Inactive);
         let e = s
             .unmount("backup", true)
             .await
@@ -1071,7 +1067,7 @@ mod tests {
         // name here would have the service stat — and, finding any user-owned socket in a
         // private directory, connect to and POST rc/list at — an arbitrary filesystem
         // location that has nothing to do with the mount.
-        let s = supervisor("escape", false, &[], UnitStatus::Active);
+        let (_sc, s) = supervisor("escape", false, &[], UnitStatus::Active);
         for name in ["/srv/media", "/", "../../etc/passwd", "a/b"] {
             let p = s.socket_path(name);
             assert!(
@@ -1092,7 +1088,7 @@ mod tests {
     async fn a_stale_socket_is_cleared_when_the_unit_died() {
         // The only state in which a stale socket can exist. rclone binds with a bare
         // listen and dies on EADDRINUSE, so leaving it makes the mount unstartable.
-        let s = supervisor("staleock", false, &[], UnitStatus::Failed);
+        let (_sc, s) = supervisor("staleock", false, &[], UnitStatus::Failed);
         std::fs::create_dir_all(&s.runtime_dir).unwrap();
         let sock = s.socket_path("backup");
         std::fs::write(&sock, b"").unwrap();
@@ -1109,7 +1105,7 @@ mod tests {
         // `StartTransientUnit` refuses a name that is already taken, and its error is a
         // raw D-Bus string. A second click during the 45s readiness window must wait for
         // the mount in flight instead.
-        let s = supervisor("double", false, &[], UnitStatus::Activating);
+        let (_sc, s) = supervisor("double", false, &[], UnitStatus::Activating);
         std::fs::create_dir_all(&s.runtime_dir).unwrap();
         let sock = s.socket_path("backup");
         std::fs::write(&sock, b"").unwrap();
@@ -1138,11 +1134,9 @@ mod tests {
     async fn a_symlinked_mount_point_is_matched_against_the_resolved_path() {
         // The kernel records resolved paths. Comparing the configured one would report a
         // working mount as down, then fail to unmount it either.
-        let real = std::env::temp_dir().join(format!("rvt-real-{}", std::process::id()));
-        let link = std::env::temp_dir().join(format!("rvt-link-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&real);
-        let _ = std::fs::remove_file(&link);
-        std::fs::create_dir_all(&real).unwrap();
+        let scratch = Scratch::new("symlink");
+        let real = scratch.dir("real");
+        let link = scratch.join("link");
         std::os::unix::fs::symlink(&real, &link).unwrap();
 
         let mut c = Config::default();
@@ -1156,11 +1150,15 @@ mod tests {
             Arc::new(c),
             PathBuf::from("/usr/bin/rclone"),
             units,
-            std::env::temp_dir().join(format!("rvt-run-link-{}", std::process::id())),
+            scratch.join("run"),
             PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
-            fixture("symlink", &mountinfo_with(&[&real.to_string_lossy()])),
+            fixture(
+                &scratch,
+                "symlink",
+                &mountinfo_with(&[&real.to_string_lossy()]),
+            ),
             Duration::from_millis(300),
         );
 
@@ -1169,17 +1167,14 @@ mod tests {
             MountState::Mounted,
             "the mount is up at the resolved path and must be recognised"
         );
-
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&real);
     }
 
     #[tokio::test]
     async fn a_mount_point_that_no_longer_responds_is_reported_as_failed() {
         // The kernel still lists it, so a path check alone says "mounted". Every
         // operation on it returns ENOTCONN.
-        let s = supervisor("stale", true, &[], UnitStatus::Inactive);
-        let point = mount_point("stale");
+        let (sc, s) = supervisor("stale", true, &[], UnitStatus::Inactive);
+        let point = mount_point(&sc);
         let s = s.with_stale(&[&point]);
         match s.state("backup").await.unwrap() {
             MountState::Failed { reason } => {
@@ -1193,8 +1188,8 @@ mod tests {
     async fn mounting_over_a_dead_mount_point_clears_it_first() {
         // rclone cannot mount over an occupied path, so without this the mount is
         // unrecoverable from the applet: every attempt returns success onto a dead mount.
-        let s = supervisor("staleclear", true, &[], UnitStatus::Inactive);
-        let point = mount_point("staleclear");
+        let (sc, s) = supervisor("staleclear", true, &[], UnitStatus::Inactive);
+        let point = mount_point(&sc);
         let s = s.with_stale(&[&point]);
         let e = s
             .mount("backup")
@@ -1212,7 +1207,7 @@ mod tests {
         // The remount gesture. rclone can hold the unit name for the whole 30s stop
         // timeout while it flushes, and starting into that returns systemd's raw
         // "unit already exists".
-        let s = supervisor("remount", false, &[], UnitStatus::Deactivating);
+        let (_sc, s) = supervisor("remount", false, &[], UnitStatus::Deactivating);
         let e = s.mount("backup").await.expect_err("the fake never settles");
         match e {
             SupervisorError::Supervision { context, .. } => assert!(
@@ -1231,8 +1226,9 @@ mod tests {
     async fn a_failed_unit_ends_the_wait_instead_of_burning_the_timeout() {
         // Without the early exit the user waits the full readiness window to be told
         // something systemd already knew.
-        let s = supervisor("earlyexit", false, &[], UnitStatus::Failed).with_test_overrides(
-            fixture("earlyexit2", &mountinfo_with(&[])),
+        let (sc, s) = supervisor("earlyexit", false, &[], UnitStatus::Failed);
+        let s = s.with_test_overrides(
+            fixture(&sc, "earlyexit2", &mountinfo_with(&[])),
             Duration::from_secs(20),
         );
         let started = std::time::Instant::now();
@@ -1249,7 +1245,8 @@ mod tests {
         // Ownership is decided from the unit name but the release acts on a path. A
         // hand-edited mount_point can put those out of step, and releasing blind would
         // tear down a filesystem the user never named.
-        let mp = mount_point("mismatch");
+        let scratch = Scratch::new("mismatch");
+        let mp = mount_point(&scratch);
         let mut c = Config::default();
         c.mounts.push(Mount {
             remote: "somethingelse".into(),
@@ -1261,12 +1258,16 @@ mod tests {
             Arc::new(c),
             PathBuf::from("/usr/bin/rclone"),
             units,
-            std::env::temp_dir().join(format!("rvt-run-mm-{}", std::process::id())),
+            scratch.join("run"),
             PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
             // mountinfo says backup:pictures is what is actually there.
-            fixture("mismatch", &mountinfo_with(&[&mp.to_string_lossy()])),
+            fixture(
+                &scratch,
+                "mismatch",
+                &mountinfo_with(&[&mp.to_string_lossy()]),
+            ),
             Duration::from_millis(300),
         );
 
@@ -1282,7 +1283,7 @@ mod tests {
     async fn mounting_over_somebody_elses_mount_is_refused() {
         // The property this PR leads with. Silently taking over another process's mount
         // is what makes a tray applet get uninstalled.
-        let s = supervisor("takeover", true, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("takeover", true, &[], UnitStatus::Inactive);
         match s.mount("backup").await {
             Err(SupervisorError::NotManaged(why)) => {
                 assert!(why.contains("did not start"), "{why}");
@@ -1300,7 +1301,7 @@ mod tests {
         // rclone's own unmount can fail with EBUSY and hold the point for the whole stop
         // timeout. Reporting success there leaves the user with no mount and no unit once
         // systemd finishes, and no indication anything went wrong.
-        let s = supervisor("teardown", true, &[], UnitStatus::Deactivating);
+        let (_sc, s) = supervisor("teardown", true, &[], UnitStatus::Deactivating);
         let e = s
             .mount("backup")
             .await
@@ -1318,7 +1319,8 @@ mod tests {
     async fn force_overrides_a_source_mismatch_as_well_as_the_refusal() {
         // "Unmount anyway" on a foreign mount of a *different* remote is exactly the case
         // #18 is about. Refusing it after the user confirmed reads as a contradiction.
-        let mp = mount_point("forcemismatch");
+        let scratch = Scratch::new("forcemismatch");
+        let mp = mount_point(&scratch);
         let mut c = Config::default();
         c.mounts.push(Mount {
             remote: "somethingelse".into(),
@@ -1330,11 +1332,15 @@ mod tests {
             Arc::new(c),
             PathBuf::from("/usr/bin/rclone"),
             units,
-            std::env::temp_dir().join(format!("rvt-run-fm-{}", std::process::id())),
+            scratch.join("run"),
             PathBuf::from("/nonexistent/config.toml"),
         )
         .with_test_overrides(
-            fixture("forcemismatch", &mountinfo_with(&[&mp.to_string_lossy()])),
+            fixture(
+                &scratch,
+                "forcemismatch",
+                &mountinfo_with(&[&mp.to_string_lossy()]),
+            ),
             Duration::from_millis(300),
         );
 
@@ -1354,7 +1360,7 @@ mod tests {
         // rebind over its own leftover socket. The argv is checked against the binary's
         // own parser, because a hook systemd runs and the binary rejects is a no-op that
         // nothing else would notice.
-        let s = supervisor("hook", false, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("hook", false, &[], UnitStatus::Inactive);
         let _ = s.mount("backup").await;
 
         let started = s.units.started.lock().unwrap();
@@ -1386,18 +1392,16 @@ mod tests {
 
     #[tokio::test]
     async fn the_recovery_hook_clears_a_stale_socket() {
-        let dir = std::env::temp_dir().join(format!("rvt-hook-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mp = mount_point("hookstale");
-        let sock = dir.join("backup.sock");
-        std::fs::write(&sock, b"").unwrap();
+        let scratch = Scratch::new("hookstale");
+        let dir = scratch.dir("run");
+        let mp = mount_point(&scratch);
+        let sock = scratch.write("run/backup.sock", b"");
 
         let cfg = config_with_backup(mp.clone());
         prepare_for_start(
             &cfg,
             &dir,
-            &fixture("hooksock", &mountinfo_with(&[])),
+            &fixture(&scratch, "hooksock", &mountinfo_with(&[])),
             "backup",
         )
         .await
@@ -1406,7 +1410,6 @@ mod tests {
             !sock.exists(),
             "rclone dies on EADDRINUSE rather than replacing its own leftover socket"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1414,13 +1417,16 @@ mod tests {
         // The guard that keeps this from being a take-over. The hook runs without the
         // ownership checks `mount()` applies, so it must only ever clear a mount point
         // that is dead — a live one at the configured path is somebody else's.
-        let dir = std::env::temp_dir().join(format!("rvt-hooklive-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mp = mount_point("hooklive");
+        let scratch = Scratch::new("hooklive");
+        let dir = scratch.dir("run");
+        let mp = mount_point(&scratch);
 
         let cfg = config_with_backup(mp.clone());
-        let mi = fixture("hooklive", &mountinfo_with(&[&mp.to_string_lossy()]));
+        let mi = fixture(
+            &scratch,
+            "hooklive",
+            &mountinfo_with(&[&mp.to_string_lossy()]),
+        );
         prepare_for_start(&cfg, &dir, &mi, "backup").await.unwrap();
 
         // `mp` is a real directory, so it is not stale; the hook must not have touched
@@ -1429,18 +1435,17 @@ mod tests {
             mp.is_dir(),
             "a live mount point must be left exactly as it was"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn the_recovery_hook_names_a_mount_it_does_not_know() {
-        let dir = std::env::temp_dir().join(format!("rvt-hookunk-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg = config_with_backup(mount_point("hookunk"));
+        let scratch = Scratch::new("hookunk");
+        let dir = scratch.dir("run");
+        let cfg = config_with_backup(mount_point(&scratch));
         match prepare_for_start(
             &cfg,
             &dir,
-            &fixture("hookunk", &mountinfo_with(&[])),
+            &fixture(&scratch, "hookunk", &mountinfo_with(&[])),
             "nope",
         )
         .await
@@ -1448,13 +1453,12 @@ mod tests {
             Err(SupervisorError::UnknownMount(n)) => assert_eq!(n, "nope"),
             other => panic!("expected UnknownMount, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn reconcile_reports_configured_and_foreign_mounts() {
         let other = "/tmp/somebody-elses";
-        let s = supervisor("reconcile", true, &[other], UnitStatus::Active);
+        let (_sc, s) = supervisor("reconcile", true, &[other], UnitStatus::Active);
         let found = s.reconcile().await.unwrap();
         assert_eq!(found.len(), 2, "{found:?}");
         assert_eq!(found[0].name, "backup");
@@ -1468,7 +1472,7 @@ mod tests {
     #[tokio::test]
     async fn a_configured_mount_that_is_down_is_still_listed() {
         // Omitting it would make a down mount indistinguishable from a deleted one.
-        let s = supervisor("listdown", false, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("listdown", false, &[], UnitStatus::Inactive);
         let found = s.reconcile().await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].state, MountState::Unmounted);
@@ -1476,7 +1480,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_mount_is_named_in_the_error() {
-        let s = supervisor("unknown", false, &[], UnitStatus::Inactive);
+        let (_sc, s) = supervisor("unknown", false, &[], UnitStatus::Inactive);
         match s.state("nope").await {
             Err(SupervisorError::UnknownMount(n)) => assert_eq!(n, "nope"),
             other => panic!("expected UnknownMount, got {other:?}"),

@@ -10,7 +10,10 @@ crates/core/      rvt-core — rc API models, rclone discovery, config, MountSup
                   Pure Rust. Everything else depends on this; it depends on nothing local.
 crates/service/   rclone-vfsmount-trayd — owns mounts, polls, serves D-Bus. Pure Rust.
 crates/tray/      rclone-vfsmount-tray — ksni SNI client over D-Bus. Pure Rust.
-crates/gtk/       rclone-vfsmount-tray-gtk — GTK4 client. The only crate that links C.
+crates/gtk/       rclone-vfsmount-tray-gtk — GTK4 client. The only crate that will link
+                  C, once it gains `gtk4`; today it has none and nothing here links one.
+crates/testutil/  rvt-testutil — scratch directories for tests. A dev-dependency of the
+                  others, never linked into a binary, and depends on nothing itself.
 ```
 
 Dependencies flow one way: the three binaries depend on `rvt-core`, never on each other.
@@ -67,6 +70,16 @@ comment about it.
 locations; one copy went stale and produced a real bug. `DESIGN.md` is the single home for
 reasoning. Code comments state the rule and point there.
 
+**A search that found nothing, believed.** Three rules for checking a claim about this
+codebase, each learned from a wrong answer:
+
+1. When independent surfaces appear to fail identically, suspect the checker before
+   believing you found several separate faults.
+2. Sanity-check a pattern against a known-present control before trusting a negative. A
+   suspiciously clean "nothing found" is usually a bad pattern.
+3. Parse the source of truth, not prose about it. Grepping documentation produces false
+   gaps; reading the dispatch table, the manifest or the real output finds true ones.
+
 ## Conventions
 
 Comments describe the code, not the project's history. Explain what a reader would
@@ -94,6 +107,12 @@ because the code is dense, not because the prose is.
 So the number is a prompt to look, never a reason to cut a comment that is doing real work
 or to pad toward a figure.
 
+Anything a test needs on disk comes from `rvt_testutil::Scratch`, never from
+`std::env::temp_dir()`. It removes itself on drop, including while a panic unwinds.
+`crates/testutil/tests/no_stray_scratch.rs` rejects `temp_dir` and `TMPDIR` in any
+crate — not a hardcoded `/tmp`, which two tests legitimately name without creating
+anything. See `CONTRIBUTING.md`.
+
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.
 
@@ -103,6 +122,47 @@ detected with `rc/list`, not inferred from a version.
 
 Commit messages explain why. When a change corrects an earlier decision, say what was
 wrong with it.
+
+## Tooling gotchas
+
+**Put git worktrees beside the repo, never inside it.** The convention is a sibling
+directory named after the topic — `../test-scratch-cleanup`, `../unmount-ordering`. A
+worktree nested under the checkout is a second clone living inside the repo, which is
+confusing to browse and to search. Claude Code's `EnterWorktree` defaults to
+`.claude/worktrees/<name>` *inside* the repo, so do not create one with it: run
+`git worktree add ../<topic> -b <branch>` yourself, then pass that path to `EnterWorktree`.
+
+Remove a worktree once its PR merges, and decide that on content rather than commits: this
+repo squash-merges, so a merged branch is never an ancestor of `main` and
+`git merge-base --is-ancestor` will say it is unmerged. An empty `git diff main..<branch>`
+is the test.
+
+**`gh issue view`, `gh pr view` and `gh pr edit` fail against this repo.** All three hit
+the deprecated projects-classic GraphQL field, which `.github/workflows/project-add.yml`
+puts issues and PRs on. Each exits 1 printing only the deprecation notice, and `gh pr edit`
+**discards the edit** — measured on #78, where the title was unchanged afterwards. Use
+REST:
+
+```sh
+gh api repos/stuckj/rclone-vfsmount-tray/issues/<n>
+gh api -X PATCH repos/stuckj/rclone-vfsmount-tray/pulls/<n> -f title=... --input body.json
+```
+
+`gh pr view <n> --json <fields>` *is* fine — that query omits `projectCards` — as are
+`gh pr create`, `gh pr list` and `gh api`.
+
+**Never write a bracketed skip-ci marker in a commit message, not even to describe one.**
+GitHub scans the whole message, body included, for `[skip ci]`, `[ci skip]`, `[no ci]`,
+`[skip actions]` and `[actions skip]`, so a commit that merely *explains* them disables CI
+on itself. The runs are never created, so nothing reports as skipped and the PR still looks
+green from whatever is not gated. It survives the squash, since GitHub seeds the squash
+message from the commits. Write the regex form `\[(skip ci|...)\]`, or "skip-ci marker" in
+prose. After pushing, confirm the workflows actually appeared:
+`gh api "repos/stuckj/rclone-vfsmount-tray/actions/runs?branch=<branch>"` — a green PR is
+not evidence they ran.
+
+**Only the repo owner can request a Copilot review.** A bot account's request returns
+success but creates no timeline event and no review.
 
 ## Checks
 

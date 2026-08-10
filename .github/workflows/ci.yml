@@ -22,11 +22,13 @@ env:
 jobs:
   # Tier 1: fast pure-logic tests + lint.
   #
-  # `rvt-core`, the service and the tray link NO system C libraries — ksni 0.3 speaks
-  # StatusNotifierItem over zbus, and everything else is pure Rust — so this runs on a
-  # bare runner with no `apt-get install` step at all. If a dependency ever drags a
-  # system library into one of those three crates, this job failing is the intended
+  # `rvt-core`, the service, the tray and `rvt-testutil` link NO system C libraries — ksni
+  # 0.3 speaks StatusNotifierItem over zbus, and everything else is pure Rust — so this
+  # runs on a bare runner with no `apt-get install` step at all. If a dependency ever
+  # drags a system library into one of those four crates, this job failing is the intended
   # alarm, which is why their manifests declare deps the stubs do not yet reference.
+  # `rvt-testutil` is a dev-dependency of every other crate, so whatever it links is
+  # linked into this job's test build and is covered by the same alarm.
   #
   # Third-party actions are pinned to full commit SHAs: a tag is mutable, and
   # `dtolnay/rust-toolchain@stable` is a *branch*, so either would let an upstream

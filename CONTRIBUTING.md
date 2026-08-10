@@ -11,7 +11,7 @@ cd rclone-vfsmount-tray
 cargo test
 ```
 
-That is the whole setup for `rvt-core`, the service and the tray: they link no system C
+That is the whole setup for every crate except the GTK client: they link no system C
 libraries, so nothing needs installing beyond a Rust toolchain.
 
 `rust-toolchain.toml` pins `stable`, so rustup will fetch it regardless of what you have.
@@ -69,6 +69,30 @@ fix applied only to the input someone happened to report.
 runs cannot detect a sub-1% failure rate. Run the compiled test binary in a loop rather
 than `cargo test`, and run it enough times to mean something.
 
+### Scratch directories
+
+Anything a test needs on disk comes from `rvt_testutil::Scratch`, never from
+`std::env::temp_dir()` directly:
+
+```rust
+use rvt_testutil::Scratch;
+
+let dir = Scratch::new("my-test");   // unique, empty, removed on drop
+let cfg  = dir.write("config.toml", b"...");
+let sub  = dir.dir("cache");
+```
+
+It removes itself however the test leaves the stack, including while a panic unwinds —
+which is when a failing test would otherwise leave the most behind, and including when the
+test chmodded a directory unreadable and never got to the line restoring it. A test that
+builds its own path under the temporary directory is rejected by
+`crates/testutil/tests/no_stray_scratch.rs`.
+
+Set `RVT_KEEP_SCRATCH=1` to keep the directories, for when a failure is easier to read from
+what the test wrote than from the assertion. Each kept path is printed, so pass
+`--nocapture` to see the paths of tests that passed — libtest swallows the output of those
+that did.
+
 ### Fixtures
 
 `testdata/` holds JSON captured from a live rclone, not hand-written examples. When you
@@ -102,9 +126,11 @@ never starting — may unmount anything. Restarting the service must not unmount
 package upgrade restarts it. No unmounting from a `Drop` impl, and rclone must not live in
 the service's own cgroup.
 
-**`rvt-core`, the service and the tray link no system C libraries.** Only the GTK crate
-does. That boundary is what lets CI test three of four crates on a bare runner. If a
-dependency drags one in, CI breaking is the intended alarm — do not work around it.
+**`rvt-core`, the service, the tray and `rvt-testutil` link no system C libraries.** Only
+the GTK crate will, once it gains `gtk4`; today nothing does, so CI runs the whole
+workspace on a bare runner. That boundary is what keeps those four testable there
+afterwards. If a dependency drags one in, CI breaking is the intended alarm — do not work
+around it.
 
 **Never fake precision the data source cannot support.** How much can be said about
 pending uploads depends on which rclone endpoints are reachable. Rendering a progress bar

@@ -65,7 +65,7 @@ of tool this is.
 
 ## Process model
 
-Four crates, three processes.
+Five crates, three processes. Four of them ship; the fifth exists only for tests.
 
 ```
 crates/
@@ -75,7 +75,9 @@ crates/
 │                                         polls VFS state, serves D-Bus. Headless.
 ├── tray/      rclone-vfsmount-tray       ksni StatusNotifierItem client over D-Bus.
 │                                         Pure Rust, deliberately low RSS.
-└── gtk/       rclone-vfsmount-tray-gtk   GTK4 client over D-Bus. Only crate linking GTK.
+├── gtk/       rclone-vfsmount-tray-gtk   GTK4 client over D-Bus. Only crate linking GTK.
+└── testutil/  rvt-testutil               scratch directories for tests. A dev-dependency
+                                          of the others, never linked into a binary.
 ```
 
 The service owns everything. The tray and the windows are both *clients* of it, with no
@@ -83,11 +85,41 @@ privileged position between them — the tray is not "the app" with a settings w
 on; it is one of two equal front-ends.
 
 `crates/gtk` will be the only crate that links a system C library, once it gains its `gtk4`
-dependency — today it has none, so nothing in the workspace links one. The boundary is
-nonetheless load-bearing and enforced from the start: it lets CI lint and test three of the
-four crates on a bare runner with no `apt-get install` step, so the common path stays fast.
-`crates/gtk` is excluded from the workspace `default-members` for the same reason — a bare
-`cargo build` works without GTK headers installed.
+dependency — today it has none, so nothing in the workspace links one and tier-1 CI can run
+`--workspace` across all five. The boundary is nonetheless load-bearing and enforced from
+the start: once `gtk4` lands, the other four still lint and test on a bare runner with no
+`apt-get install` step, so the common path stays fast. `crates/gtk` is excluded from the
+workspace `default-members` for the same reason — a bare `cargo build` works without GTK
+headers installed.
+
+### Scratch directories for tests
+
+`rvt-testutil` exists so no test builds its own path under the system temporary directory.
+A leaked directory there is resident memory wherever `/tmp` is tmpfs, it accumulates every
+run — 77 directories per full suite before this, never reused — and nothing reclaims it
+until reboot. How much headroom that eats is a property of the machine, so it is not
+recorded here; #75 has the measurement that prompted the work.
+
+Two properties of the layout are load-bearing, and both were mistakes first:
+
+- **No level of the path is shared between users.** The root is
+  `<tmpdir>/rvt-test-<pid>-<stamp>`, straight into the temporary directory. A fixed
+  intermediate directory is created by whichever user runs the suite first, at their umask,
+  and every later user on that machine then fails to write inside it — for the rest of the
+  boot, with an error naming a directory they have no reason to know exists. It would also
+  be a stable path under a world-writable parent for anyone to pre-plant.
+- **The name is not the pid alone.** Pids are reused, so a run killed hard enough to skip
+  every destructor would hand its leftovers to a later process that drew the same pid,
+  which would then see a dirty scratch and pass or fail for the wrong reason. A truncated
+  nanosecond stamp makes that improbable — two processes need the same pid *and* start
+  times an exact multiple of 4.295s apart — rather than impossible, so each scratch is
+  created with `create_dir` rather than `create_dir_all` and a directory that is already
+  there is refused instead of adopted. The truncation is deliberate: the full stamp costs
+  11 bytes of the 108 available to a UNIX socket path.
+
+Removal restores directory permissions and retries before giving up, because a test that
+chmods a directory unreadable and panics before restoring it leaves a tree its own owner
+cannot walk — which is exactly the case the crate exists to survive.
 
 ### The lifetime rule
 

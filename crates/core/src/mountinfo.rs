@@ -140,6 +140,7 @@ fn unescape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvt_testutil::Scratch;
 
     /// Captured from a machine with an rclone mount up, trimmed to the interesting lines.
     const REAL: &str = "\
@@ -217,8 +218,7 @@ mod tests {
         // The kernel writes such bytes raw, and any user can create a directory
         // containing one and mount something there. Reading the file strictly would make
         // every mount on the machine invisible.
-        let dir = std::env::temp_dir().join(format!("rvt-mi-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("mi");
         let path = dir.join("mountinfo");
 
         let mut bytes = Vec::new();
@@ -236,7 +236,6 @@ mod tests {
             "both rclone mounts must still be visible: {got:?}"
         );
         assert!(is_mounted_at(&got, Path::new("/home/user/mnt/backup")));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

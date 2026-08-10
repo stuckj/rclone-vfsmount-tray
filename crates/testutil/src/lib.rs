@@ -6,7 +6,8 @@
 //! later run reclaims.
 //!
 //! Paths are kept short: tests bind UNIX sockets inside a [`Scratch`], and `sockaddr_un`
-//! truncates a path over 108 bytes rather than reporting it.
+//! truncates a path over 108 bytes rather than reporting it. They are also per-process
+//! and per-user, so two people running the suite on one machine never meet.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,6 +23,12 @@ static LIVE: Mutex<usize> = Mutex::new(0);
 
 /// This process's directory, holding one subdirectory per [`Scratch`].
 ///
+/// Directly inside the temporary directory, with no shared `rvt-test` level above it. A
+/// fixed shared name would be created by whichever user ran the suite first, at their
+/// umask, and every later user on the machine would then fail to write inside it — for
+/// the rest of the boot, with an error naming a directory they have no reason to know
+/// about. It would also be a stable, world-writable-parent path for anyone to pre-plant.
+///
 /// The name carries the pid *and* a timestamp because pids are reused: a run killed hard
 /// enough to skip every destructor would otherwise hand its leftovers to a later process
 /// that drew the same pid, which would then see a dirty scratch and pass or fail wrongly.
@@ -31,12 +38,21 @@ fn root() -> &'static Path {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos() as u64);
-        std::env::temp_dir().join("rvt-test").join(format!(
-            "{}-{:x}",
+        std::env::temp_dir().join(format!(
+            "rvt-test-{}-{:x}",
             std::process::id(),
             stamp & 0xffff_ffff
         ))
     })
+}
+
+/// Whether to keep scratch directories, read once.
+///
+/// Reading it per drop would mean a `getenv` on a test thread every time, while other
+/// tests in the same binary call `set_var` — and those two race.
+fn keep() -> bool {
+    static KEEP: OnceLock<bool> = OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var_os(KEEP_ENV).is_some())
 }
 
 /// A unique, empty directory that removes itself on drop — including while a panic
@@ -101,7 +117,7 @@ impl AsRef<Path> for Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        if std::env::var_os(KEEP_ENV).is_some() {
+        if keep() {
             eprintln!("{KEEP_ENV} set, keeping {}", self.path.display());
         } else {
             let _ = std::fs::remove_dir_all(&self.path);
@@ -110,10 +126,9 @@ impl Drop for Scratch {
         let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
         *live -= 1;
         if *live == 0 {
-            // Non-recursive, so this takes the root only once nothing is left under it.
-            // The shared `rvt-test` parent is deliberately left in place: removing it
-            // would race another test process creating its own root inside it, and one
-            // empty directory is not what this crate exists to prevent.
+            // Non-recursive, so this takes the root only once nothing is left under it,
+            // and leaves it alone when KEEP_ENV held the contents back. The root belongs
+            // to this process alone, so no other process can be creating inside it.
             let _ = std::fs::remove_dir(root());
         }
     }
@@ -187,10 +202,25 @@ mod tests {
         assert_eq!(s.path().parent(), Some(root()));
     }
 
+    /// A shared parent directory would be made by whichever user ran the suite first, at
+    /// their umask, locking every other user on the machine out of the whole suite.
+    #[test]
+    fn the_root_sits_directly_in_the_temporary_directory() {
+        let tmp = std::env::temp_dir();
+        assert_eq!(
+            root().parent(),
+            Some(tmp.as_path()),
+            "a level between {} and the root is shared between users",
+            tmp.display()
+        );
+    }
+
     #[test]
     fn paths_leave_room_for_a_unix_socket() {
+        // The deepest socket the suite actually binds, from the supervisor tests:
+        // `<scratch>/run/<mount>.sock`, with a tag longer than any in use.
         let s = Scratch::new("a-fairly-descriptive-tag");
-        let sock = s.join("rc.sock");
+        let sock = s.join("run").join("backup.sock");
         assert!(
             sock.as_os_str().len() < 108,
             "{} is too long to bind",

@@ -123,9 +123,10 @@ never starting — may unmount anything. Restarting the service must not unmount
 package upgrade restarts it. No unmounting from a `Drop` impl, and rclone must not live in
 the service's own cgroup.
 
-**`rvt-core`, the service and the tray link no system C libraries.** Only the GTK crate
-does. That boundary is what lets CI test three of four crates on a bare runner. If a
-dependency drags one in, CI breaking is the intended alarm — do not work around it.
+**`rvt-core`, the service, the tray and `rvt-testutil` link no system C libraries.** Only
+the GTK crate does. That boundary is what lets CI test four of the five crates on a bare
+runner. If a dependency drags one in, CI breaking is the intended alarm — do not work
+around it.
 
 **Never fake precision the data source cannot support.** How much can be said about
 pending uploads depends on which rclone endpoints are reachable. Rendering a progress bar

@@ -65,7 +65,7 @@ of tool this is.
 
 ## Process model
 
-Four crates, three processes.
+Five crates, three processes. Four of them ship; the fifth exists only for tests.
 
 ```
 crates/
@@ -75,7 +75,9 @@ crates/
 │                                         polls VFS state, serves D-Bus. Headless.
 ├── tray/      rclone-vfsmount-tray       ksni StatusNotifierItem client over D-Bus.
 │                                         Pure Rust, deliberately low RSS.
-└── gtk/       rclone-vfsmount-tray-gtk   GTK4 client over D-Bus. Only crate linking GTK.
+├── gtk/       rclone-vfsmount-tray-gtk   GTK4 client over D-Bus. Only crate linking GTK.
+└── testutil/  rvt-testutil               scratch directories for tests. A dev-dependency
+                                          of the others, never linked into a binary.
 ```
 
 The service owns everything. The tray and the windows are both *clients* of it, with no
@@ -84,8 +86,8 @@ on; it is one of two equal front-ends.
 
 `crates/gtk` will be the only crate that links a system C library, once it gains its `gtk4`
 dependency — today it has none, so nothing in the workspace links one. The boundary is
-nonetheless load-bearing and enforced from the start: it lets CI lint and test three of the
-four crates on a bare runner with no `apt-get install` step, so the common path stays fast.
+nonetheless load-bearing and enforced from the start: it lets CI lint and test four of the
+five crates on a bare runner with no `apt-get install` step, so the common path stays fast.
 `crates/gtk` is excluded from the workspace `default-members` for the same reason — a bare
 `cargo build` works without GTK headers installed.
 

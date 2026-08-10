@@ -5,9 +5,12 @@
 //! directory left behind on a machine where `/tmp` is tmpfs is resident memory that no
 //! later run reclaims.
 //!
-//! Paths are kept short: tests bind UNIX sockets inside a [`Scratch`], and `sockaddr_un`
-//! truncates a path over 108 bytes rather than reporting it. They are also per-process
-//! and per-user, so two people running the suite on one machine never meet.
+//! Paths are kept short: tests bind UNIX sockets inside a [`Scratch`], and a path of 108
+//! bytes or more fails to bind. Measured on Linux 6.8: `UnixListener::bind` returns
+//! `InvalidInput`, "path must be shorter than SUN_LEN", at 108 and succeeds at 107.
+//!
+//! Paths are also per-process and per-user, so two people running the suite on one
+//! machine never meet.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -120,7 +123,7 @@ impl Drop for Scratch {
         if keep() {
             eprintln!("{KEEP_ENV} set, keeping {}", self.path.display());
         } else {
-            let _ = std::fs::remove_dir_all(&self.path);
+            remove_tree(&self.path);
         }
 
         let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
@@ -131,6 +134,50 @@ impl Drop for Scratch {
             // to this process alone, so no other process can be creating inside it.
             let _ = std::fs::remove_dir(root());
         }
+    }
+}
+
+/// Remove a tree, putting back any permissions that stop the walk.
+///
+/// A test that chmods a directory `0o000` and asserts before restoring it leaves, when
+/// that assertion fails, a tree its own owner cannot enter — and `remove_dir_all` then
+/// fails on the one path this crate exists to handle. The retry is what makes the promise
+/// in [`Scratch`]'s documentation true for a panicking test rather than only a passing
+/// one. Anything still left is reported, never panicked on: a panic here would replace
+/// the test's own failure with this one.
+fn remove_tree(path: &Path) {
+    if std::fs::remove_dir_all(path).is_ok() {
+        return;
+    }
+    #[cfg(unix)]
+    make_walkable(path);
+    if let Err(e) = std::fs::remove_dir_all(path) {
+        if path.exists() {
+            eprintln!("rvt-testutil: {} left behind: {e}", path.display());
+        }
+    }
+}
+
+/// Give every directory in a tree back its owner bits, so the tree can be walked.
+///
+/// Symlinks are read with `symlink_metadata` and never followed, so a link pointing out
+/// of the scratch cannot have its target's mode changed.
+#[cfg(unix)]
+fn make_walkable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !md.is_dir() {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for e in entries.flatten() {
+        make_walkable(&e.path());
     }
 }
 
@@ -151,6 +198,16 @@ fn sanitised(tag: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The tests below assert that a directory was removed, which is exactly what
+    /// [`KEEP_ENV`] suppresses. Without this they fail for anyone using the debugging aid
+    /// `CONTRIBUTING.md` points them at, burying the failure they set it to read.
+    fn skip_if_keeping(what: &str) -> bool {
+        if keep() {
+            eprintln!("skipped: {KEEP_ENV} is set, so {what} is not removed");
+        }
+        keep()
+    }
+
     #[test]
     fn the_directory_exists_and_is_empty() {
         let s = Scratch::new("empty");
@@ -167,6 +224,9 @@ mod tests {
 
     #[test]
     fn dropping_removes_the_tree_including_its_contents() {
+        if skip_if_keeping("the tree") {
+            return;
+        }
         let path = {
             let s = Scratch::new("contents");
             s.write("a/b/c.txt", b"data");
@@ -179,6 +239,9 @@ mod tests {
     /// The case the plain `remove_dir_all` at the end of a test body cannot cover.
     #[test]
     fn a_panicking_test_still_has_its_directory_removed() {
+        if skip_if_keeping("the directory") {
+            return;
+        }
         let path = std::sync::Mutex::new(PathBuf::new());
         let caught = std::panic::catch_unwind(|| {
             let s = Scratch::new("panicking");
@@ -194,6 +257,36 @@ mod tests {
             "the closure did not reach the assignment"
         );
         assert!(!path.exists(), "{} survived the unwind", path.display());
+    }
+
+    /// Three tests in this workspace chmod a directory `0o000` and restore it on the line
+    /// after the assertion, so a failing assertion skips the restore. `remove_dir_all`
+    /// alone cannot enter what it is left with.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_nothing_can_enter_is_still_removed() {
+        if skip_if_keeping("the tree") {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = {
+            let s = Scratch::new("denied");
+            let hidden = s.dir("tree/hidden");
+            s.write("tree/hidden/inside", b"x");
+            std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+            s.path().to_path_buf()
+        };
+
+        if path.exists() {
+            // Leave nothing behind even when the assertion below is the thing that fails.
+            let _ = std::fs::set_permissions(
+                path.join("tree/hidden"),
+                std::fs::Permissions::from_mode(0o700),
+            );
+            let _ = std::fs::remove_dir_all(&path);
+            panic!("a tree containing an unreadable directory outlived its Scratch");
+        }
     }
 
     #[test]

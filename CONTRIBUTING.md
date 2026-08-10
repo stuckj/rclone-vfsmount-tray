@@ -83,12 +83,15 @@ let sub  = dir.dir("cache");
 ```
 
 It removes itself however the test leaves the stack, including while a panic unwinds —
-which is when a failing test would otherwise leave the most behind. A test that builds its
-own path under the temporary directory is rejected by
+which is when a failing test would otherwise leave the most behind, and including when the
+test chmodded a directory unreadable and never got to the line restoring it. A test that
+builds its own path under the temporary directory is rejected by
 `crates/testutil/tests/no_stray_scratch.rs`.
 
-Set `RVT_KEEP_SCRATCH=1` to keep the directories and have each one's path printed, for
-when a failure is easier to read from what it wrote than from the assertion.
+Set `RVT_KEEP_SCRATCH=1` to keep the directories, for when a failure is easier to read from
+what the test wrote than from the assertion. Each kept path is printed, so pass
+`--nocapture` to see the paths of tests that passed — libtest swallows the output of those
+that did.
 
 ### Fixtures
 

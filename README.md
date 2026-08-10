@@ -70,9 +70,9 @@ cargo build --release
 
 Requires a Rust toolchain. Note that `rust-toolchain.toml` pins `stable`, so rustup will
 use current stable regardless of what you have installed; the declared MSRV of **1.87** is
-enforced by a dedicated CI job rather than by local builds. The core, service and tray crates link no system
-C libraries, so a bare `cargo build` needs nothing else. The GTK client is excluded from the
-workspace's default members and built explicitly:
+enforced by a dedicated CI job rather than by local builds. Every crate except the GTK
+client links no system C libraries, so a bare `cargo build` needs nothing else. The GTK
+client is excluded from the workspace's default members and built explicitly:
 
 ```sh
 cargo build -p rclone-vfsmount-tray-gtk
@@ -86,7 +86,7 @@ At runtime you will need `rclone` and `fuse3`.
 ## Development
 
 ```sh
-cargo test --locked           # core, service and tray — no system deps needed
+cargo test --locked           # everything but the GTK client — no system deps needed
 cargo clippy --all-targets
 cargo fmt --all
 ```

@@ -6,9 +6,15 @@
 
 use std::path::{Path, PathBuf};
 
-/// What a call site would have to write, in any of its spellings — a qualified call, a
-/// `use std::env`, or a bare import.
-const NEEDLE: &str = "temp_dir";
+/// What a call site would have to write. `temp_dir` covers every spelling of the call —
+/// qualified, via `use std::env`, or a bare import — and `TMPDIR` covers reading the
+/// variable behind it directly.
+///
+/// A hardcoded `"/tmp/..."` is deliberately *not* here: two already exist and neither
+/// creates anything (`config.rs` asserts on a path it never touches, `supervisor.rs` puts
+/// one in a mountinfo fixture), so the pattern would need an allowlist to stay quiet, and
+/// an allowlist is the thing that goes stale.
+const NEEDLES: [&str; 2] = ["temp_dir", "TMPDIR"];
 
 /// The helper, which is allowed to name it, and this guard, which has to.
 const EXEMPT: [&str; 2] = [
@@ -28,7 +34,7 @@ fn nothing_outside_the_helper_builds_its_own_scratch_path() {
         }
         let body = std::fs::read_to_string(&file).unwrap();
         for (n, line) in body.lines().enumerate() {
-            if line.contains(NEEDLE) {
+            if NEEDLES.iter().any(|needle| line.contains(needle)) {
                 offenders.push(format!("{}:{}: {}", rel.display(), n + 1, line.trim()));
             }
         }
@@ -41,9 +47,20 @@ fn nothing_outside_the_helper_builds_its_own_scratch_path() {
     );
 }
 
-/// A control for the search above: it finds the occurrences in the exempt files, so an
-/// empty result means the workspace is clean rather than that the pattern stopped
-/// matching or the walk stopped finding files.
+/// Files the walk must reach, one per crate, so a walk that quietly stopped early cannot
+/// be mistaken for a clean workspace. `rust_sources` skips a directory it cannot list
+/// rather than failing, which is what makes an unnamed count too weak to rely on.
+const MUST_REACH: [&str; 5] = [
+    "crates/core/src/rc.rs",
+    "crates/service/src/supervisor.rs",
+    "crates/tray/src/main.rs",
+    "crates/gtk/src/main.rs",
+    "crates/testutil/src/lib.rs",
+];
+
+/// The control for the search above. Both halves have to hold for an empty result to mean
+/// anything: the pattern still matches text that is really there, and the walk still
+/// reaches the files that would carry an offender.
 #[test]
 fn the_search_matches_the_files_it_exempts() {
     let root = workspace_root();
@@ -52,14 +69,19 @@ fn the_search_matches_the_files_it_exempts() {
         let body =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{rel} moved or gone: {e}"));
         assert!(
-            body.contains(NEEDLE),
-            "{rel} no longer contains the pattern the guard searches for"
+            NEEDLES.iter().any(|needle| body.contains(needle)),
+            "{rel} no longer contains any pattern the guard searches for"
         );
     }
-    assert!(
-        rust_sources(&root.join("crates")).len() > EXEMPT.len(),
-        "the walk found almost nothing, so a clean result proves nothing"
-    );
+
+    let found = rust_sources(&root.join("crates"));
+    for rel in MUST_REACH {
+        let want = root.join(rel);
+        assert!(
+            found.contains(&want),
+            "the walk never reached {rel}, so a clean result proves nothing"
+        );
+    }
 }
 
 fn workspace_root() -> PathBuf {

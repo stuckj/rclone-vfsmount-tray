@@ -107,9 +107,10 @@ So the number is a prompt to look, never a reason to cut a comment that is doing
 or to pad toward a figure.
 
 Anything a test needs on disk comes from `rvt_testutil::Scratch`, never from
-`std::env::temp_dir()`. It removes itself on drop, including while a panic unwinds;
-`crates/testutil/tests/no_stray_scratch.rs` rejects any other spelling. See
-`CONTRIBUTING.md`.
+`std::env::temp_dir()`. It removes itself on drop, including while a panic unwinds.
+`crates/testutil/tests/no_stray_scratch.rs` rejects `temp_dir` and `TMPDIR` in any
+crate — not a hardcoded `/tmp`, which two tests legitimately name without creating
+anything. See `CONTRIBUTING.md`.
 
 `testdata/` is captured from a live rclone, never hand-written. Capture new fixtures; a
 fake will agree with whatever assumption you already had.

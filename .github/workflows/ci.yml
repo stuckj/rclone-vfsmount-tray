@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag v2 (annotated) -> this commit
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # tag v2 (annotated) -> this commit
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -101,7 +101,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # tag v2 (annotated) -> this commit
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # tag v2 (annotated) -> this commit
       # VERSION comes via env rather than being interpolated into the script body:
       # it is read from the PR's own Cargo.toml, so textual interpolation is the
       # classic injection shape even though the blast radius here is nil.

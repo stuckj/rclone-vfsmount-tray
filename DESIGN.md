@@ -85,11 +85,35 @@ privileged position between them — the tray is not "the app" with a settings w
 on; it is one of two equal front-ends.
 
 `crates/gtk` will be the only crate that links a system C library, once it gains its `gtk4`
-dependency — today it has none, so nothing in the workspace links one. The boundary is
-nonetheless load-bearing and enforced from the start: it lets CI lint and test four of the
-five crates on a bare runner with no `apt-get install` step, so the common path stays fast.
-`crates/gtk` is excluded from the workspace `default-members` for the same reason — a bare
-`cargo build` works without GTK headers installed.
+dependency — today it has none, so nothing in the workspace links one and tier-1 CI can run
+`--workspace` across all five. The boundary is nonetheless load-bearing and enforced from
+the start: once `gtk4` lands, the other four still lint and test on a bare runner with no
+`apt-get install` step, so the common path stays fast. `crates/gtk` is excluded from the
+workspace `default-members` for the same reason — a bare `cargo build` works without GTK
+headers installed.
+
+### Scratch directories for tests
+
+`rvt-testutil` exists so no test builds its own path under the system temporary directory.
+A leaked directory there is resident memory wherever it is tmpfs, and the container this is
+developed in sizes `/tmp` from the *host's* RAM, so it absorbs several times the container's
+memory before reporting itself full.
+
+Two properties of the layout are load-bearing, and both were mistakes first:
+
+- **No level of the path is shared between users.** The root is
+  `<tmpdir>/rvt-test-<pid>-<stamp>`, straight into the temporary directory. A fixed
+  intermediate directory is created by whichever user runs the suite first, at their umask,
+  and every later user on that machine then fails to write inside it — for the rest of the
+  boot, with an error naming a directory they have no reason to know exists. It would also
+  be a stable path under a world-writable parent for anyone to pre-plant.
+- **The name is not the pid alone.** Pids are reused, so a run killed hard enough to skip
+  every destructor would hand its leftovers to a later process that drew the same pid,
+  which would then see a dirty scratch and pass or fail for the wrong reason.
+
+Removal restores directory permissions and retries before giving up, because a test that
+chmods a directory unreadable and panics before restoring it leaves a tree its own owner
+cannot walk — which is exactly the case the crate exists to survive.
 
 ### The lifetime rule
 

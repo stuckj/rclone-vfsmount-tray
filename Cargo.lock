@@ -769,6 +769,7 @@ dependencies = [
  "clap",
  "ksni",
  "rvt-core",
+ "rvt-testutil",
  "serde_json",
  "tokio",
  "tracing",
@@ -783,6 +784,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rvt-core",
+ "rvt-testutil",
  "serde_json",
  "zbus",
 ]

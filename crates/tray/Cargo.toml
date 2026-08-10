@@ -31,3 +31,9 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+
+# Declared before a test here needs it, like the dependencies above. `no_stray_scratch`
+# already scans this crate, so the first test written in it is told to use `Scratch`; it
+# should find `Scratch` rather than an unresolved import.
+[dev-dependencies]
+rvt-testutil = { path = "../testutil" }

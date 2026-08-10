@@ -26,15 +26,8 @@ static LIVE: Mutex<usize> = Mutex::new(0);
 
 /// This process's directory, holding one subdirectory per [`Scratch`].
 ///
-/// Directly inside the temporary directory, with no shared `rvt-test` level above it. A
-/// fixed shared name would be created by whichever user ran the suite first, at their
-/// umask, and every later user on the machine would then fail to write inside it — for
-/// the rest of the boot, with an error naming a directory they have no reason to know
-/// about. It would also be a stable, world-writable-parent path for anyone to pre-plant.
-///
-/// The name carries the pid *and* a timestamp because pids are reused: a run killed hard
-/// enough to skip every destructor would otherwise hand its leftovers to a later process
-/// that drew the same pid, which would then see a dirty scratch and pass or fail wrongly.
+/// Sits directly in the temporary directory: no level here may be shared between users,
+/// and the pid alone is not unique enough, because pids are reused. See DESIGN.md.
 fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -49,10 +42,8 @@ fn root() -> &'static Path {
     })
 }
 
-/// Whether to keep scratch directories, read once.
-///
-/// Reading it per drop would mean a `getenv` on a test thread every time, while other
-/// tests in the same binary call `set_var` — and those two race.
+/// Whether to keep scratch directories. Read once: a `getenv` per drop would race the
+/// `set_var` that other tests in the same binary call.
 fn keep() -> bool {
     static KEEP: OnceLock<bool> = OnceLock::new();
     *KEEP.get_or_init(|| std::env::var_os(KEEP_ENV).is_some())
@@ -139,12 +130,10 @@ impl Drop for Scratch {
 
 /// Remove a tree, putting back any permissions that stop the walk.
 ///
-/// A test that chmods a directory `0o000` and asserts before restoring it leaves, when
-/// that assertion fails, a tree its own owner cannot enter — and `remove_dir_all` then
-/// fails on the one path this crate exists to handle. The retry is what makes the promise
-/// in [`Scratch`]'s documentation true for a panicking test rather than only a passing
-/// one. Anything still left is reported, never panicked on: a panic here would replace
-/// the test's own failure with this one.
+/// A test that chmods a directory `0o000` and panics before restoring it leaves a tree
+/// its own owner cannot enter, which plain `remove_dir_all` cannot remove. Anything still
+/// left after the retry is reported, never panicked on: a panic here would replace the
+/// test's own failure with this one.
 fn remove_tree(path: &Path) {
     if std::fs::remove_dir_all(path).is_ok() {
         return;
@@ -259,9 +248,10 @@ mod tests {
         assert!(!path.exists(), "{} survived the unwind", path.display());
     }
 
-    /// Three tests in this workspace chmod a directory `0o000` and restore it on the line
-    /// after the assertion, so a failing assertion skips the restore. `remove_dir_all`
-    /// alone cannot enter what it is left with.
+    /// Three tests in this workspace chmod a directory `0o000`, call the thing under test,
+    /// and restore it — `scan.rs` twice and `poller.rs` once. The call between the two is
+    /// what can panic, and it skips the restore when it does. `remove_dir_all` alone
+    /// cannot enter what that leaves.
     #[cfg(unix)]
     #[test]
     fn a_directory_nothing_can_enter_is_still_removed() {

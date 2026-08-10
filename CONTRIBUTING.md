@@ -127,8 +127,9 @@ package upgrade restarts it. No unmounting from a `Drop` impl, and rclone must n
 the service's own cgroup.
 
 **`rvt-core`, the service, the tray and `rvt-testutil` link no system C libraries.** Only
-the GTK crate does. That boundary is what lets CI test four of the five crates on a bare
-runner. If a dependency drags one in, CI breaking is the intended alarm — do not work
+the GTK crate will, once it gains `gtk4`; today nothing does, so CI runs the whole
+workspace on a bare runner. That boundary is what keeps those four testable there
+afterwards. If a dependency drags one in, CI breaking is the intended alarm — do not work
 around it.
 
 **Never fake precision the data source cannot support.** How much can be said about

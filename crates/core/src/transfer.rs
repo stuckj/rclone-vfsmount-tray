@@ -292,9 +292,14 @@ impl TransferState {
     ///
     /// **Necessary, not sufficient.** rclone enqueues a file when it is closed, so a write
     /// still in progress is invisible to every rc endpoint and this returns `true` while
-    /// it runs. Stopping the mount then truncates the object at the remote — measured; see
-    /// DESIGN.md and #73. A caller that actually unmounts has to consult the kernel too, and
-    /// #22 is what will make this predicate whole.
+    /// it runs — measured; see DESIGN.md and #73.
+    ///
+    /// The truncation that used to follow does not: `SystemdSupervisor::unmount` has the
+    /// kernel release the mount point before it signals rclone, and `fusermount3 -u`
+    /// refuses a mount with a file open. Acting on this predicate is therefore safe, but
+    /// the predicate still overstates — a mount it calls idle can be refused. Use it to
+    /// decide what to *offer*, never to conclude that an unmount will succeed. #22 is
+    /// what would make it whole.
     pub fn safe_to_unmount(&self) -> bool {
         self.is_idle()
     }

@@ -141,7 +141,7 @@ filesystems.
 | Service restarts (package upgrade) | unaffected — reconciled and adopted on start |
 | Service crashes | unaffected; adopted on restart |
 | Service stopped explicitly | unaffected by default; unmounts only if `unmount_on_service_stop` is on |
-| User clicks Unmount | unmounted, after the pending-uploads check |
+| User clicks Unmount | unmounted, after the pending-uploads check — refused while a file is open, unless forced |
 | Session ends / logout | depends on `loginctl enable-linger`; documented in the README |
 | Suspend / resume | mounts survive; stale handles recovered |
 
@@ -395,24 +395,42 @@ continuously is what inotify is for, in the rest of #22.
 **T4 is therefore strictly better than T2 for this one question**: the single place the
 ladder's ordering does not hold.
 
-On a *live* mount the queue is still taken at its word, and **that blind spot can lose
-data** — the
-kernel does not save us. Measured end to end on rclone v1.75.0, `--vfs-cache-mode writes`,
-15 MB written to a file still open:
+On a *live* mount the queue is still taken at its word, and **that blind spot could lose
+data**. Measured end to end on rclone v1.75.0, `--vfs-cache-mode writes`, 15 MB written to
+a file still open:
 
 1. `fusermount3 -u` does refuse: exit 1, `Device or resource busy`.
-2. But `unmount()` does not start there. It calls `StopUnit` first, and with `KillMode=mixed`
-   that is a SIGTERM. rclone logs `Failed to unmount: … Device or resource busy` and **exits
-   anyway**, in under a second. The mount goes `ENOTCONN` and the writer is severed.
-3. On the next mount with the same `--cache-dir`, rclone uploads the dirty cache item as it
-   stands. The remote received `held.bin` at 15728640 bytes — a truncated object presented
-   as complete.
+2. But `unmount()` did not start there. It called `StopUnit` first, and with
+   `KillMode=mixed` that is a SIGTERM. rclone logs `Failed to unmount: … Device or
+   resource busy` and **exits anyway**, in under a second. The mount goes `ENOTCONN` and
+   the writer is severed.
+3. On the next mount with the same `--cache-dir`, rclone uploads the dirty cache item as
+   it stands. The remote received `held.bin` at 15728640 bytes — a truncated object
+   presented as complete.
 
-So `TransferState::safe_to_unmount()` must **not** be the only gate on the pending-upload
-check: it cannot see an open write, and the unmount path does not fail closed on one.
-Until #22 lands, an unmount that matters should probe with a non-lazy `fusermount3 -u`
-*before* stopping the unit, so the kernel's refusal is consulted while it still means
-something. Tracked as #73.
+### The unmount order
+
+Step 1 is the only signal there is, so `unmount()` asks the kernel **first** (#73). The
+order is: refuse a path this mount does not own, then `fusermount3 -u`, then `StopUnit`.
+
+- The release succeeds — nothing was holding the mount, it is already down, and stopping
+  the unit is bookkeeping.
+- The release returns `EBUSY` — **refuse**, and say so. Nothing has been signalled, so the
+  writer is untouched. This is the only moment at which an open write is visible to us.
+- `force`, which is #18's "unmount anyway" and has already been confirmed with the user,
+  falls through to the old escalation: an escape hatch a busy mount can veto is not one.
+
+Any failure of the release refuses, not only `EBUSY`. The question is whether it is
+*certainly* safe to signal rclone, and anything short of a clean release leaves that
+unknown — so this fails closed, like the cache-mode gate above.
+
+The ownership and source-mismatch checks moved ahead of the release for the same reason:
+refusing after the SIGTERM has gone out refuses nothing.
+
+This does **not** make `TransferState::safe_to_unmount()` whole. That predicate still
+cannot see an open write, so a mount it reports idle can be refused when the unmount is
+attempted; it decides what to *offer*, not what will succeed. #22's watcher is what would
+close the gap in the predicate itself.
 
 ### Two field names that mean less than they say
 

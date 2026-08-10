@@ -177,7 +177,7 @@ fn an_implementer_can_construct_every_state_and_error() {
         },
         SupervisorError::PendingUploads(Pending::new(3, 1_024, 1)),
         SupervisorError::Busy {
-            path: "/mnt/photos".into(),
+            detail: "/mnt/photos was not released: something has a file open under it.".into(),
         },
         SupervisorError::Supervision {
             context: "StartTransientUnit".into(),

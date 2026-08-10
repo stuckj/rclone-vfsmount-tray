@@ -118,9 +118,15 @@ pub enum SupervisorError {
     #[error("{}", pending_summary(.0))]
     PendingUploads(Pending),
 
-    /// The mount point is busy and could not be released.
-    #[error("mount point {path:?} is busy")]
-    Busy { path: String },
+    /// The mount point could not be released — usually because something still has a file
+    /// open under it, which is the one signal that an in-progress write exists at all.
+    ///
+    /// Carries the whole message rather than just the path, and renders it verbatim. What
+    /// a user needs here is the path, what the kernel said, and what to do about it; a
+    /// wrapper around all three reads as a sentence interrupting itself. Construct it with
+    /// a complete sentence that names the path.
+    #[error("{detail}")]
+    Busy { detail: String },
 
     /// Talking to the init system failed.
     #[error("init system error: {context}")]

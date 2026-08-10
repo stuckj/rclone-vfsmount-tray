@@ -41,8 +41,8 @@ enum Release {
     /// the only signal that an open write exists.
     Refuse,
     /// `fusermount3 -z -u`. Detaches whatever is holding it, so a writer mid-file silently
-    /// loses the rest. Never reachable before the unit has been stopped, and only then
-    /// under `force`.
+    /// loses the rest. Reachable only after *our own* unit has been stopped, and only
+    /// under `force` — never on a foreign mount, whose rclone is still alive and serving.
     Detach,
 }
 
@@ -75,8 +75,8 @@ pub struct SystemdSupervisor<M: UnitManager> {
     /// for real needs FUSE, and tier-1 CI has none. Every test arms it, so the real arm is
     /// exercised only by the binary.
     ///
-    /// Shared with the fake unit manager, which empties it on stop: rclone exits on the
-    /// SIGTERM without unmounting, so the point stops being busy and starts being stale.
+    /// Shared with the fake unit manager, which does *not* empty it on stop: killing
+    /// rclone does not make a held mount releasable.
     #[cfg(test)]
     busy_paths: Option<Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>>,
     /// Ordered record of the probe and the unit stop, shared with the fake unit manager.
@@ -167,7 +167,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             // to `-z`. Both measured; see [`Release`].
             if held && how == Release::Refuse {
                 return Err(SupervisorError::Busy {
-                    path: format!(
+                    detail: format!(
                         "{}: fusermount3: failed to unmount {}: Device or resource busy",
                         point.display(),
                         point.display()
@@ -349,9 +349,10 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         let unit = self.units.status(&m.unit_name()).await?;
         Ok(match (live, unit) {
             (true, UnitStatus::Active | UnitStatus::Activating) => MountState::Mounted,
-            // rclone flushes the write-back cache during its stop timeout, so this state
-            // lasts up to 30s of the user's own unmount. Reporting it as anything else
-            // would tell them their mount had become somebody else's mid-operation.
+            // A teardown the user asked for. Reporting it as anything else would tell them
+            // their mount had become somebody else's mid-operation. It can hold the whole
+            // stop timeout when the mount is busy, since rclone's own unmount then fails
+            // and retries.
             (true, UnitStatus::Deactivating) => MountState::Unmounting,
             // Ours, and it died with the kernel entry still there. Still ours.
             (true, UnitStatus::Failed) => MountState::Failed {
@@ -485,7 +486,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         match out {
             Ok(o) if o.status.success() => Ok(()),
             Ok(o) => Err(SupervisorError::Busy {
-                path: format!(
+                detail: format!(
                     "{}: {}",
                     path.display(),
                     String::from_utf8_lossy(&o.stderr).trim()
@@ -507,11 +508,11 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// unchanged: telling someone to close a file when the helper is missing is worse than
     /// saying nothing.
     fn refused(point: &Path, e: SupervisorError) -> SupervisorError {
-        let SupervisorError::Busy { path: reason } = e else {
+        let SupervisorError::Busy { detail: reason } = e else {
             return e;
         };
         SupervisorError::Busy {
-            path: format!(
+            detail: format!(
                 "{} was not released — {reason}. Usually something still has a file open \
                  under it: close that and try again. Unmounting anyway cuts any writer off \
                  mid-file, and rclone then uploads the partial file as if it were complete.",
@@ -520,8 +521,9 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         }
     }
 
-    /// Wait for the unit to stop occupying its name. `StopUnit` only enqueues a job, and
-    /// rclone can hold `TimeoutStopUSec` flushing, so the name outlives the mount point.
+    /// Wait for the unit to stop occupying its name. `StopUnit` only enqueues a job, and a
+    /// busy mount can hold rclone for the whole `TimeoutStopUSec` retrying its own
+    /// unmount, so the name outlives the mount point.
     async fn await_unit_gone(&self, m: &Mount, timeout: Duration) -> Result<(), SupervisorError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -747,18 +749,22 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             if !mountinfo::is_mounted_at(&self.live_mounts(), &point) {
                 return Ok(());
             }
+            // Detaching is only ever right once the writer is already gone, which means
+            // only after *our* unit has been stopped. A foreign mount was never signalled:
+            // its rclone is alive and serving, so `-z` would strand it holding a mount
+            // nothing can see, and the file it is buffering would sit in a cache directory
+            // the user can no longer reach. `force` overrides the refusal to unmount, not
+            // the arithmetic of what unmounting one costs.
+            let may_detach = force && ours;
+
             // Same call as the probe above. Usually a different answer by now — rclone has
             // exited and released it — but not if something still holds a file: measured,
             // a mount stays busy against `-u` after its daemon is dead, because what pins
             // it is the holder's descriptor.
             match self.release_point(&point, Release::Refuse).await {
                 Ok(()) => {}
-                Err(e) if !force => return Err(Self::refused(&point, e)),
+                Err(e) if !may_detach => return Err(Self::refused(&point, e)),
                 Err(_) => {
-                    // The stop above already severed whatever was writing, so there is no
-                    // longer a writer for `-z` to detach from — it removes a mount-table
-                    // entry and nothing else. This is the only reachable `Detach`, and only
-                    // because the damage `Refuse` exists to prevent has already happened.
                     self.release_point(&point, Release::Detach).await?;
                 }
             }
@@ -769,7 +775,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 return self.units.reset_failed(&m.unit_name()).await;
             }
             Err(SupervisorError::Busy {
-                path: format!(
+                detail: format!(
                     "{} is still mounted after fusermount -u; something is holding it open. \
                      A lazy unmount would detach it from processes still writing to it, so \
                      it is not done automatically.",
@@ -1162,10 +1168,10 @@ mod tests {
 
     /// Something holds a file open under `point`, so the kernel refuses to release it.
     ///
-    /// Deliberately *not* wired with [`releasing`]: #73 measured that rclone exits on the
-    /// SIGTERM without unmounting, so the point survives the stop as a stale mount. The
-    /// fake drops it from the busy set on stop, which is what makes the second release
-    /// succeed where the first was refused.
+    /// Deliberately *not* wired with [`releasing`], and the set is not cleared on stop:
+    /// rclone exits on the SIGTERM without unmounting, and the point stays held anyway,
+    /// because the holder's descriptor is what pins it. Both measured — see [`Release`].
+    /// So the second release is refused too, and only `Detach` takes it.
     fn hold_open(s: &SystemdSupervisor<FakeUnits>, point: &Path) {
         s.units.busy.lock().unwrap().insert(point.to_path_buf());
     }
@@ -1214,8 +1220,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_mount_being_torn_down_is_not_reported_as_somebody_elses() {
-        // rclone flushes the write-back cache during its stop timeout, so this state can
-        // last 30s of the user's own unmount.
+        // A busy mount can hold this state for the whole stop timeout, retrying rclone's
+        // own unmount.
         let (_sc, s) = supervisor("tearing", true, &[], UnitStatus::Deactivating);
         assert_eq!(s.state("backup").await.unwrap(), MountState::Unmounting);
     }
@@ -1249,9 +1255,14 @@ mod tests {
         hold_open(&s, &point);
 
         match s.unmount("backup", false).await {
-            Err(SupervisorError::Busy { path }) => {
-                assert!(path.contains(&point.display().to_string()), "{path}");
-                assert!(path.contains("has a file open"), "unhelpful: {path}");
+            Err(SupervisorError::Busy { detail }) => {
+                assert!(detail.contains(&point.display().to_string()), "{detail}");
+                assert!(detail.contains("has a file open"), "unhelpful: {detail}");
+                assert!(
+                    detail.starts_with(&point.display().to_string()),
+                    "the message is rendered verbatim, so it has to open with the path: \
+                     {detail}"
+                );
             }
             other => panic!("a busy mount must be refused, got {other:?}"),
         }
@@ -1281,17 +1292,17 @@ mod tests {
         let hedged = SystemdSupervisor::<FakeUnits>::refused(
             point,
             SupervisorError::Busy {
-                path: "/mnt/backup: fusermount3: failed to unmount: Device or resource busy".into(),
+                detail: "/mnt/backup: fusermount3: failed to unmount: Device or resource busy"
+                    .into(),
             },
         );
         let msg = hedged.to_string();
-        assert!(msg.contains("was not released"), "{msg}");
+        assert!(msg.starts_with("/mnt/backup was not released"), "{msg}");
         assert!(msg.contains("Usually"), "must hedge, not assert: {msg}");
-        assert_eq!(
-            msg.matches("is busy").count(),
-            1,
-            "the reason must not be a whole rendered error nested inside this one: {msg}"
-        );
+        // Rendered verbatim, so it reads as one sentence rather than a sentence quoted
+        // inside another. Both of these are what a wrapper around it would add.
+        assert!(!msg.contains('"'), "no nested quoting: {msg}");
+        assert!(msg.ends_with('.'), "must end as a sentence does: {msg}");
 
         let spawn = SystemdSupervisor::<FakeUnits>::refused(
             point,
@@ -1385,6 +1396,37 @@ mod tests {
                 .any(|e| e.starts_with("Detach")),
             "a non-forced unmount must never detach: {:?}",
             s.events.lock().unwrap()
+        );
+    }
+
+    /// `force` on a *foreign* mount that is held must refuse rather than detach. Nothing
+    /// was signalled — that rclone is not ours to stop — so it is alive and serving, and
+    /// `-z` would strand it holding a mount nothing can see, with whatever it is buffering
+    /// in a cache directory the user can no longer reach. A cwd inside the mount is enough
+    /// to reach this: measured, that alone makes `fusermount3 -u` return EBUSY.
+    #[tokio::test]
+    async fn force_never_detaches_a_mount_whose_unit_was_not_stopped() {
+        let (sc, s) = supervisor("foreignbusy", true, &[], UnitStatus::Inactive);
+        let point = mount_point(&sc);
+        hold_open(&s, &point);
+
+        let e = s
+            .unmount("backup", true)
+            .await
+            .expect_err("a held foreign mount cannot be taken without stranding its rclone");
+        assert!(matches!(e, SupervisorError::Busy { .. }), "{e:?}");
+
+        assert!(
+            s.units.stopped.lock().unwrap().is_empty(),
+            "a foreign unit is not ours to stop"
+        );
+        assert_eq!(
+            s.events.lock().unwrap().as_slice(),
+            &[
+                format!("Refuse {}", point.display()),
+                format!("Refuse {}", point.display()),
+            ],
+            "it must try, and stop at trying — no Detach without a stop of our own"
         );
     }
 

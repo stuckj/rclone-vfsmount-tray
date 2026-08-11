@@ -318,7 +318,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
 
         let mut out = Vec::new();
         for u in loaded {
-            if u.status == UnitStatus::Inactive || configured.contains(&u.name) {
+            if !u.status.is_running() || configured.contains(&u.name) {
                 continue;
             }
             // Nothing to act on without knowing what it serves: stopping a unit whose
@@ -327,7 +327,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
                 continue;
             };
             let point = Self::resolved(serving.mount_point).await;
-            if !mountinfo::is_mounted_at(&live, &point) {
+            // What the unit was started to serve must be what is mounted there now. An
+            // argv proves only where the unit *meant* to mount; on its own it lets a unit
+            // lay claim to whatever turns up at that path later, which after a rename is
+            // the very mount that replaced it.
+            if !live
+                .iter()
+                .any(|e| e.is_rclone() && e.mount_point == point && e.source == serving.fs_spec)
+            {
                 continue;
             }
             out.push(Target {
@@ -343,6 +350,23 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// The orphan holding a mount point, if one is.
     async fn orphan_at(&self, point: &Path) -> Result<Option<Target>, SupervisorError> {
         Ok(self.orphans().await?.into_iter().find(|o| o.point == point))
+    }
+
+    /// Refuse to mount over, or release, a point one of our own units still holds.
+    ///
+    /// Taking it either way would leave that unit running against a path it no longer
+    /// owns, and the user cannot act on a refusal that does not say what is in the way.
+    async fn refuse_to_take_over(&self, name: &str, point: &Path) -> Result<(), SupervisorError> {
+        match self.orphan_at(point).await? {
+            None => Ok(()),
+            Some(o) => Err(SupervisorError::NotManaged(format!(
+                "{name}: {} is still held by {}, left over from a mount this config no \
+                 longer names. Unmount {:?} first.",
+                point.display(),
+                o.unit,
+                o.name
+            ))),
+        }
     }
 
     /// Which unit an unmount request has to act on.
@@ -364,7 +388,11 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         };
 
         let target = Self::target_of(m).await;
-        if self.units.status(&target.unit).await? != UnitStatus::Inactive {
+        // Running under its own name, so it is the unit to act on. `Failed` is not
+        // running: it serves nothing, and whatever holds the point is somebody else — a
+        // check for `Inactive` alone would release an orphan's live mount and then stop
+        // this dead unit instead.
+        if self.units.status(&target.unit).await?.is_running() {
             return Ok(target);
         }
         match self.orphan_at(&target.point).await? {
@@ -685,27 +713,24 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
             let point = Self::resolved_point(m).await;
             if mountinfo::is_mounted_at(&self.live_mounts(), &point) {
-                // A unit of ours under a name the config has dropped. Taking its point —
-                // by releasing it, or by mounting across it — would leave that unit
-                // running against a path it no longer owns. Asked before staleness,
-                // because a stale point is precisely what an orphan whose rclone was
-                // killed leaves behind, and the release below does not ask who owns it.
-                if let Some(o) = self.orphan_at(&point).await? {
-                    return Err(SupervisorError::NotManaged(format!(
-                        "{name}: {} is still held by {}, left over from a mount this config \
-                         no longer names. Unmount {:?} first.",
-                        point.display(),
-                        o.unit,
-                        o.name
-                    )));
-                }
                 // A mount point the kernel still lists but nothing is serving. Left
                 // alone it blocks every future attempt, since rclone cannot mount over
                 // it — so clear it rather than reporting success onto a dead mount.
                 if self.is_stale(&point).await {
+                    // Unless one of our own units under a dropped name is behind it —
+                    // which is what an orphan whose rclone was killed looks like, since
+                    // it is restarting rather than gone. The release does not ask who
+                    // owns the point, so it has to be asked here.
+                    self.refuse_to_take_over(name, &point).await?;
                     self.release_point(&point, Release::Refuse).await?;
                 } else {
-                    match self.units.status(&m.unit_name()).await? {
+                    let status = self.units.status(&m.unit_name()).await?;
+                    // Nothing of ours is running under this name, so something else is
+                    // serving the point. Ask what before starting anything across it.
+                    if !status.is_running() {
+                        self.refuse_to_take_over(name, &point).await?;
+                    }
+                    match status {
                         // Already serving, and it is ours. This is the path taken after a
                         // service restart, when every mount is already up.
                         UnitStatus::Active | UnitStatus::Activating => return Ok(()),
@@ -2219,7 +2244,7 @@ mod tests {
         assert_eq!(
             s.units.stopped.lock().unwrap().as_slice(),
             &["rvt-mount-backup.service".to_string()],
-            "releasing the point without stopping the unit strands rclone"
+            "the unit that owns the point is what has to be stopped"
         );
         assert_eq!(
             s.events.lock().unwrap().as_slice(),
@@ -2313,6 +2338,112 @@ mod tests {
             ),
             other => panic!("expected a refusal naming the orphan, got {other:?}"),
         }
+    }
+
+    /// A unit that failed leaves its argv loaded for the rest of the login session, and
+    /// after a rename that argv names the path the *new* unit now serves. Claiming it
+    /// would put one mount point in the list twice and — because both carry the same
+    /// `remote:path` after a rename, so the source check cannot separate them — make
+    /// `unmount("backup")` tear down the live, healthy mount with no `force` asked for.
+    #[tokio::test]
+    async fn a_dead_unit_does_not_inherit_the_mount_that_replaced_it() {
+        let (sc, s) = renamed("rename-phantom");
+        let point = mount_point(&sc);
+        // The rename has been through a full cycle: the new unit is up and serving, and
+        // the old one is a failed leftover still naming the same path.
+        {
+            let mut loaded = s.units.loaded.lock().unwrap();
+            loaded.clear();
+            loaded.extend([
+                LoadedUnit {
+                    name: "rvt-mount-backup.service".into(),
+                    status: UnitStatus::Failed,
+                    serving: Some(Serving {
+                        fs_spec: "backup:pictures".into(),
+                        mount_point: point.clone(),
+                    }),
+                },
+                LoadedUnit {
+                    name: "rvt-mount-backups.service".into(),
+                    status: UnitStatus::Active,
+                    serving: Some(Serving {
+                        fs_spec: "backup:pictures".into(),
+                        mount_point: point.clone(),
+                    }),
+                },
+            ]);
+        }
+
+        let found = s.reconcile().await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "one mount point must not be listed twice, under two owners: {found:?}"
+        );
+        assert_eq!(found[0].name, "backups");
+        assert_eq!(found[0].state, MountState::Mounted);
+
+        // The idempotent path a service restart takes: already up, and ours.
+        s.mount("backups")
+            .await
+            .expect("a mount already serving under its own unit is already mounted");
+
+        match s.unmount("backup", false).await {
+            Err(SupervisorError::UnknownMount(n)) => assert_eq!(n, "backup"),
+            other => panic!("a dead unit must not be able to unmount a live mount: {other:?}"),
+        }
+        let events = s.events.lock().unwrap().clone();
+        assert!(
+            events.is_empty(),
+            "the live mount must not have been touched: {events:?}"
+        );
+    }
+
+    /// The same missing check, pointed at a stranger's mount. DESIGN.md promises a held
+    /// foreign mount refuses even under `force`, because `-z` would strand an rclone that
+    /// was never signalled — claiming it as an orphan is what would reach that `-z`.
+    #[tokio::test]
+    async fn a_unit_does_not_claim_a_mount_serving_something_else() {
+        let (sc, s) = renamed("rename-notours");
+        let point = mount_point(&sc);
+        // Running, and its argv names the path — but what is mounted there is not what
+        // it was started to serve. The fixture serves `backup:pictures`.
+        s.units.loaded.lock().unwrap()[0].serving = Some(Serving {
+            fs_spec: "somebody-else:docs".into(),
+            mount_point: point.clone(),
+        });
+
+        let found = s.reconcile().await.unwrap();
+        assert!(
+            !found.iter().any(|m| m.state == MountState::Orphaned),
+            "a mount serving something else is not ours to stop: {found:?}"
+        );
+        assert_eq!(s.state("backups").await.unwrap(), MountState::Foreign);
+    }
+
+    /// The redirect has to fire on any unit that is not *running* under the new name, not
+    /// only on one systemd has never heard of. A failed unit serves nothing, so the point
+    /// belongs to the orphan and releasing it is the original #71 damage over again.
+    #[tokio::test]
+    async fn a_failed_unit_under_the_new_name_does_not_capture_the_unmount() {
+        let (sc, s) = renamed("rename-failed-new");
+        releasing(&s);
+        s.units.loaded.lock().unwrap().push(LoadedUnit {
+            name: "rvt-mount-backups.service".into(),
+            status: UnitStatus::Failed,
+            serving: None,
+        });
+
+        s.unmount("backups", false)
+            .await
+            .expect("the orphan still holds the point");
+        assert_eq!(
+            s.units.stopped.lock().unwrap().as_slice(),
+            &["rvt-mount-backup.service".to_string()],
+            "stopping the dead unit under the new name releases the orphan's live mount \
+             and leaves the orphan running"
+        );
+        let _ = mount_point(&sc);
     }
 
     /// Both cases where a unit of ours is loaded but there is nothing to act on: it is

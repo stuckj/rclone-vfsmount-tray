@@ -41,6 +41,22 @@ pub enum UnitStatus {
     Inactive,
 }
 
+impl UnitStatus {
+    /// Whether a process of this unit's is alive, or about to be.
+    ///
+    /// `Failed` is not running: its main process is gone, and `CollectMode`'s default
+    /// keeps the unit loaded afterwards purely so its state and log survive. A failed
+    /// unit therefore cannot be serving anything, however recently it was.
+    ///
+    /// Matched exhaustively so a future variant cannot default to running.
+    pub fn is_running(self) -> bool {
+        match self {
+            UnitStatus::Active | UnitStatus::Activating | UnitStatus::Deactivating => true,
+            UnitStatus::Failed | UnitStatus::Inactive => false,
+        }
+    }
+}
+
 /// What a unit's own argv says it mounts, and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Serving {
@@ -386,10 +402,17 @@ pub mod dbus {
 
                 let mut out = Vec::with_capacity(rows.len());
                 for (name, _, _, active, _, _, path, ..) in rows {
+                    // Only a service has an `ExecStart`. A `.mount` or `.timer` sharing
+                    // the prefix would answer the property read with an interface error
+                    // on every sweep, which is worth neither the round trip nor the log.
+                    let serving = match name.ends_with(".service") {
+                        true => self.serving(path).await,
+                        false => None,
+                    };
                     out.push(LoadedUnit {
                         name,
                         status: unit_status(&active),
-                        serving: self.serving(path).await,
+                        serving,
                     });
                 }
                 Ok(out)

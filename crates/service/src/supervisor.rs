@@ -319,13 +319,15 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// fix, left in place with nothing to show for it.
     async fn orphans(&self) -> Result<Vec<Target>, SupervisorError> {
         let loaded = self.units.list_units(UNIT_PREFIX).await?;
-        let configured: std::collections::HashSet<String> =
-            self.config.mounts.iter().map(|m| m.unit_name()).collect();
         let live = self.live_mounts();
+        let mut configured = Vec::with_capacity(self.config.mounts.len());
+        for m in &self.config.mounts {
+            configured.push((Self::resolved_point(m).await, m.unit_name()));
+        }
 
         let mut out = Vec::new();
         for u in loaded {
-            if !u.status.is_serving() || configured.contains(&u.name) {
+            if !u.status.is_serving() || configured.iter().any(|(_, c)| *c == u.name) {
                 continue;
             }
             // Nothing to act on without knowing what it serves: stopping a unit whose
@@ -340,7 +342,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             // After a rename the old unit and the new one name the same path with the
             // same remote, so nothing about the mount itself separates them: the one to
             // believe is the one whose config entry still exists and whose unit is up.
-            if self.configured_unit_serving_at(&point).await? {
+            if self.configured_unit_serving_at(&configured, &point).await? {
                 continue;
             }
             out.push(Target {
@@ -353,16 +355,39 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         Ok(out)
     }
 
-    /// Whether a configured mount at this point has a unit of its own serving it.
-    async fn configured_unit_serving_at(&self, point: &Path) -> Result<bool, SupervisorError> {
-        for m in &self.config.mounts {
-            if Self::resolved_point(m).await == point
-                && self.units.status(&m.unit_name()).await?.is_serving()
-            {
+    /// Whether a configured mount at one of these points has a unit of its own serving
+    /// it. Points come in already resolved: canonicalising them per candidate would put
+    /// one full probe timeout, and one parked blocking thread, behind every wedged mount
+    /// in the config.
+    async fn configured_unit_serving_at(
+        &self,
+        configured: &[(PathBuf, String)],
+        point: &Path,
+    ) -> Result<bool, SupervisorError> {
+        for (p, unit) in configured {
+            if p == point && self.units.status(unit).await?.is_serving() {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+
+    /// Where a unit of ours actually mounted, from the argv systemd still holds for it.
+    ///
+    /// The one fact about a running mount that neither a config edit nor rclone rewrites.
+    /// `None` when systemd no longer has the unit, or its argv cannot be read.
+    async fn argv_point(&self, unit: &str) -> Result<Option<PathBuf>, SupervisorError> {
+        let Some(serving) = self
+            .units
+            .list_units(UNIT_PREFIX)
+            .await?
+            .into_iter()
+            .find(|u| u.name == unit)
+            .and_then(|u| u.serving)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self::resolved(serving.mount_point).await))
     }
 
     /// The orphan holding a mount point, if one is.
@@ -735,10 +760,12 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 // alone it blocks every future attempt, since rclone cannot mount over
                 // it — so clear it rather than reporting success onto a dead mount.
                 if self.is_stale(&point).await {
-                    // Unless one of our own units under a dropped name is behind it —
-                    // which is what an orphan whose rclone was killed looks like, since
-                    // it is restarting rather than gone. The release does not ask who
-                    // owns the point, so it has to be asked here.
+                    // Unless a unit of ours under a dropped name is still behind it: an
+                    // rclone whose FUSE connection has been aborted answers `ENOTCONN`
+                    // while systemd still reports its unit `active`. The release does not
+                    // ask who owns the point, so it is asked here. A unit that has
+                    // *exited* is not caught — it is no longer serving, by definition —
+                    // and clearing the point it left is the whole purpose of this branch.
                     self.refuse_to_take_over(name, &point).await?;
                     self.release_point(&point, Release::Refuse).await?;
                 } else {
@@ -898,7 +925,13 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 let entry = live_now
                     .iter()
                     .find(|e| e.is_rclone() && e.mount_point == point);
-                if let Some(e) = entry {
+                // Unless the unit's own argv names this very point, which settles it:
+                // that is where this unit actually mounted. Falling back to the source
+                // below is a guess, because rclone records the Fs it resolved rather
+                // than the argument it was given — an `alias` remote reports its backing
+                // path — so on those configs it refuses a mount that is plainly ours.
+                let established = self.argv_point(&unit).await? == Some(point.clone());
+                if let Some(e) = entry.filter(|_| !established) {
                     // `force` is the caller having confirmed with the user, so it overrides
                     // the mismatch as well as the ownership refusal — otherwise #18's
                     // "unmount anyway" cannot work on a foreign mount at all.
@@ -1131,7 +1164,9 @@ fn foreign_name(e: &MountEntry) -> String {
 /// name that does not fit the pattern, which is then not one of ours to act on.
 fn orphan_name(unit: &str) -> Option<String> {
     let name = unit.strip_prefix(UNIT_PREFIX)?.strip_suffix(".service")?;
-    (!name.is_empty()).then(|| name.to_string())
+    // `Config::validate` rejects the same three, since a name is used to build paths.
+    // Nothing this service starts can carry one, so a unit that does was hand-made.
+    (!matches!(name, "" | "." | "..")).then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -2509,6 +2544,40 @@ mod tests {
         );
     }
 
+    /// Reporting it as ours is only half the promise. The pre-flight check that the point
+    /// serves what the mount owns compares the same rewritten source, so on these configs
+    /// it refused the unmount the `Orphaned` row exists to offer — and refused the
+    /// configured mount's own unmount too, which never needed a rename to reach.
+    #[tokio::test]
+    async fn a_rewritten_source_does_not_refuse_the_unmount_of_a_unit_that_owns_the_point() {
+        for (case, unit, addressed) in [
+            ("alias-orphan", "rvt-mount-backup.service", "backup"),
+            ("alias-configured", "rvt-mount-backups.service", "backups"),
+        ] {
+            let (sc, s) = renamed(case);
+            releasing(&s);
+            // What the unit was started with. The fixture's mountinfo reports
+            // `backup:pictures`, as rclone does once it has resolved an alias.
+            s.units.loaded.lock().unwrap()[0] = LoadedUnit {
+                name: unit.into(),
+                status: UnitStatus::Active,
+                serving: Some(Serving {
+                    fs_spec: "ali:".into(),
+                    mount_point: mount_point(&sc),
+                }),
+            };
+
+            s.unmount(addressed, false)
+                .await
+                .unwrap_or_else(|e| panic!("{case}: the unit's argv names this point: {e}"));
+            assert_eq!(
+                s.units.stopped.lock().unwrap().as_slice(),
+                &[unit.to_string()],
+                "{case}"
+            );
+        }
+    }
+
     /// The `Activating` half of the state guard, where nothing else can catch it: a unit
     /// awaiting restart at a path no config entry names. Its previous rclone has already
     /// exited, so whatever the kernel still lists there is a corpse or a stranger, and
@@ -2632,6 +2701,9 @@ mod tests {
             "rvt-mount-.service",
             "rvt-mount-backup.mount",
             "rvt-mount-backup",
+            // Rejected by `Config::validate` too, so nothing of ours is named this.
+            "rvt-mount-..service",
+            "rvt-mount-...service",
         ] {
             assert_eq!(orphan_name(not_ours), None, "{not_ours}");
         }

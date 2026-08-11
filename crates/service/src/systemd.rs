@@ -162,8 +162,11 @@ pub mod dbus {
                     // `RestartSec` or `TimeoutStopSec` property, both are microseconds, and
                     // an unrecognised name fails the whole call rather than being ignored.
                     ("RestartUSec", Value::from(5_000_000_u64)),
-                    // rclone needs a SIGTERM to flush and unmount cleanly; killing the
-                    // whole cgroup immediately would leave the mount point stale.
+                    // rclone unmounts on a SIGTERM; killing the whole cgroup immediately
+                    // would leave the mount point stale. It does *not* flush the
+                    // write-back cache first — measured on v1.75.0, it exits in under a
+                    // second with the queue still full, and the next mount on the same
+                    // `--cache-dir` uploads what was left.
                     ("KillMode", Value::from("mixed")),
                     ("TimeoutStopUSec", Value::from(30_000_000_u64)),
                     // `CollectMode` is deliberately unset: its `inactive` default keeps a

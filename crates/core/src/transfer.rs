@@ -253,7 +253,7 @@ impl TransferState {
     /// For a `minimal` mount: a read-write open goes through the write-back cache and
     /// appears in the queue, while a write-only open of an uncached file streams straight
     /// past it. The entries are real and worth showing; an empty queue still cannot be
-    /// read as "nothing outstanding", which is the reading that gets a file truncated.
+    /// read as "nothing outstanding", which is the reading that calls a busy mount idle.
     pub fn partially_observed(mut self, reason: impl Into<String>) -> Self {
         self.outstanding_known = false;
         self.degraded_reason = Some(reason.into());
@@ -292,9 +292,10 @@ impl TransferState {
     ///
     /// **Necessary, not sufficient.** rclone enqueues a file when it is closed, so a write
     /// still in progress is invisible to every rc endpoint and this returns `true` while
-    /// it runs. Stopping the mount then truncates the object at the remote — measured; see
-    /// DESIGN.md and #73. A caller that actually unmounts has to consult the kernel too, and
-    /// #22 is what will make this predicate whole.
+    /// it runs — measured; see DESIGN.md and #73. Use it to decide what to *offer*: a
+    /// mount it calls idle can still be refused by
+    /// [`crate::supervisor::MountSupervisor::unmount`], which is where the kernel gets
+    /// asked. #22 would let this see an open write itself.
     pub fn safe_to_unmount(&self) -> bool {
         self.is_idle()
     }

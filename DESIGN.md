@@ -141,7 +141,7 @@ filesystems.
 | Service restarts (package upgrade) | unaffected — reconciled and adopted on start |
 | Service crashes | unaffected; adopted on restart |
 | Service stopped explicitly | unaffected by default; unmounts only if `unmount_on_service_stop` is on |
-| User clicks Unmount | unmounted, after the pending-uploads check |
+| User clicks Unmount | unmounted — refused while anything is still using the mount, unless forced. The pending-uploads *warning* is still #19 |
 | Session ends / logout | depends on `loginctl enable-linger`; documented in the README |
 | Suspend / resume | mounts survive; stale handles recovered |
 
@@ -395,24 +395,64 @@ continuously is what inotify is for, in the rest of #22.
 **T4 is therefore strictly better than T2 for this one question**: the single place the
 ladder's ordering does not hold.
 
-On a *live* mount the queue is still taken at its word, and **that blind spot can lose
-data** — the
-kernel does not save us. Measured end to end on rclone v1.75.0, `--vfs-cache-mode writes`,
-15 MB written to a file still open:
+On a *live* mount the queue is still taken at its word, and **that blind spot could lose
+data**. Measured end to end on rclone v1.75.0, `--vfs-cache-mode writes`, 15 MB written to
+a file still open:
 
 1. `fusermount3 -u` does refuse: exit 1, `Device or resource busy`.
-2. But `unmount()` does not start there. It calls `StopUnit` first, and with `KillMode=mixed`
-   that is a SIGTERM. rclone logs `Failed to unmount: … Device or resource busy` and **exits
-   anyway**, in under a second. The mount goes `ENOTCONN` and the writer is severed.
-3. On the next mount with the same `--cache-dir`, rclone uploads the dirty cache item as it
-   stands. The remote received `held.bin` at 15728640 bytes — a truncated object presented
-   as complete.
+2. But `unmount()` did not start there. It called `StopUnit` first, and with
+   `KillMode=mixed` that is a SIGTERM. rclone logs `Failed to unmount: … Device or
+   resource busy` and **exits anyway**, in under a second. The mount goes `ENOTCONN` and
+   the writer is severed.
+3. On the next mount with the same `--cache-dir`, rclone uploads the dirty cache item as
+   it stands. The remote received `held.bin` at 15728640 bytes — a truncated object
+   presented as complete.
 
-So `TransferState::safe_to_unmount()` must **not** be the only gate on the pending-upload
-check: it cannot see an open write, and the unmount path does not fail closed on one.
-Until #22 lands, an unmount that matters should probe with a non-lazy `fusermount3 -u`
-*before* stopping the unit, so the kernel's refusal is consulted while it still means
-something. Tracked as #73.
+### The unmount order
+
+Step 1 is the only signal there is, so `unmount()` asks the kernel **first** (#73):
+ownership and source-mismatch checks, then `fusermount3 -u`, then `StopUnit`. Those checks
+moved ahead of the stop for the same reason as the release did — refusing after the
+SIGTERM has gone out refuses nothing.
+
+- Release succeeds — nothing was holding it, and the stop is bookkeeping.
+- Release fails, point gone anyway — a crash or a concurrent stop won the race.
+- Release fails, point still there — **refuse**, with nothing signalled.
+- `force` (#18) warns and escalates.
+
+`fusermount` reports every non-zero exit alike, so `EBUSY` cannot be told from "not a
+mount point". The refusal therefore fails closed and says what was refused rather than
+asserting why; a failure to *run* it passes through as itself.
+
+#### What `force` has to do
+
+Measured on rclone v1.75.0 and Linux 6.8, 15 MB written to a file still open:
+
+| step | result |
+| --- | --- |
+| `-u`, rclone alive, holder's fd open | refused |
+| SIGTERM → rclone exits without unmounting | point stays in mountinfo |
+| `-u`, rclone **dead**, fd still open | **still refused** |
+| `-u`, after the holder exits | succeeds |
+| `-u -z`, rclone dead, fd open | succeeds |
+
+Row three is the one to know, and the easy one to assume away: killing rclone does not
+free the mount, because the *holder's* descriptor pins it. So `force` is refuse → stop →
+refuse → detach. "Refuse → stop → unmount" would end with the file sacrificed **and** the
+unmount failed. `-z` is reachable only on that last step, where the writer is already
+severed and detaching costs a mount-table entry — hence `Release::Refuse` and
+`Release::Detach` as separate operations rather than a flag.
+
+Detaching is gated on ownership too: a held **foreign** mount refuses even under `force`,
+since its rclone was never signalled and `-z` would strand it serving a mount nothing can
+see. The settle wait after the stop keeps its full length, because a holder letting go
+inside it is the difference between a clean release and having to detach.
+
+`fusermount3` is now required to unmount any live mount. rclone is a static binary that
+execs it to mount anyway, so this adds no dependency.
+
+None of it makes `TransferState::safe_to_unmount()` whole: that still cannot see an open
+write, so a mount it calls idle can be refused. #22 is what would close the gap.
 
 ### Two field names that mean less than they say
 
@@ -490,9 +530,11 @@ boundary at all. Everything below is scoped to that:
   offer, and is not needed. Nothing published over D-Bus carries credentials or full remote
   configuration.
 - **A forced unmount is destructive**, and `force` is an explicit parameter that defaults to
-  off. Being service-side, the pending-uploads check cannot be skipped by a client that simply
-  omits it — but it does not stop a caller that deliberately passes `force = true`. That is a
-  guard against accident and bugs, not against malice.
+  off. Being service-side, the kernel's refusal cannot be skipped by a client that simply
+  omits it — but it does not stop a caller that deliberately passes `force = true`, which
+  logs a warning naming the mount and then severs and detaches. That is a guard against
+  accident and bugs, not against malice. (The pending-uploads check this paragraph used to
+  name is not implemented; it is #19.)
 
   Closing the malice case needs an authorization decision the bus cannot make for us. The
   options are a polkit action for forced unmount, or accepting the risk on the grounds that a

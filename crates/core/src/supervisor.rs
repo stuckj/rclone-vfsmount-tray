@@ -118,9 +118,13 @@ pub enum SupervisorError {
     #[error("{}", pending_summary(.0))]
     PendingUploads(Pending),
 
-    /// The mount point is busy and could not be released.
-    #[error("mount point {path:?} is busy")]
-    Busy { path: String },
+    /// The mount point could not be released — usually a process still using it: an open
+    /// file, a read-only descriptor or a working directory inside it all count. The only
+    /// signal an in-progress write gives.
+    ///
+    /// Rendered verbatim, so `detail` is the whole message.
+    #[error("{detail}")]
+    Busy { detail: String },
 
     /// Talking to the init system failed.
     #[error("init system error: {context}")]
@@ -171,13 +175,15 @@ pub trait MountSupervisor: Send + Sync {
 
     /// Tear down a mount.
     ///
-    /// When the write-back cache still holds unuploaded data, returns
-    /// [`SupervisorError::PendingUploads`] carrying the summary rather than unmounting.
-    /// That is a warning channel, not a veto: nothing is lost by unmounting, since the
-    /// cache is on disk and uploads resume on remount (#19). The caller shows the user
-    /// what is outstanding and, if they choose to proceed, calls again with `force`.
+    /// [`SupervisorError::Busy`] — the kernel would not release the point, which is what
+    /// an in-progress write looks like from outside: rclone queues a file only when it is
+    /// *closed*, so its rc API never reports one. **Forcing past it loses data.** Ask the
+    /// kernel *before* signalling rclone, or the refusal never happens (#73).
     ///
-    /// `force` is always an explicit caller decision — never a default, never inferred.
+    /// [`SupervisorError::PendingUploads`] — data still to send, but on disk and resumed
+    /// on remount, so a warning rather than a veto (#19). Nothing here implements it yet.
+    ///
+    /// `force` is always an explicit caller decision, never inferred.
     fn unmount<'a>(
         &'a self,
         name: &'a str,

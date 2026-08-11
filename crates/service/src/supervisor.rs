@@ -29,21 +29,17 @@ const FS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How hard to try when asking the kernel for a mount point back.
 ///
-/// Measured on rclone v1.75.0 and Linux 6.8, with 15 MB written to a file still open:
-/// `-u` is refused while rclone is alive, and **still refused after rclone has been
-/// killed** — the mount goes `ENOTCONN` but the writer's descriptor keeps pinning it.
-/// Only `-z` takes it. That is why the two are separate operations rather than a flag:
-/// [`Release::Refuse`] is the whole of #73, and [`Release::Detach`] is only correct once
-/// the writer has already been severed and there is nothing left to protect.
+/// Measured on rclone v1.75.0 and Linux 6.8, 15 MB written to a file still open: `-u` is
+/// refused while rclone is alive and **still refused after it is killed** — the writer's
+/// descriptor pins the mount, not the daemon. Only `-z` takes it. Separate operations
+/// rather than a flag because they are not interchangeable. See DESIGN.md.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Release {
-    /// `fusermount3 -u`. Fails with `EBUSY` while any process is using the mount — an
-    /// open descriptor, read or write, or just a working directory inside it. That is the
-    /// only signal an in-progress write ever gives.
+    /// `fusermount3 -u`. Refused while any process is using the mount, which is the only
+    /// signal an in-progress write gives.
     Refuse,
-    /// `fusermount3 -u -z`. Detaches whatever is holding it, so a writer mid-file silently
-    /// loses the rest. Reachable only after *our own* unit has been stopped, and only
-    /// under `force` — never on a foreign mount, whose rclone is still alive and serving.
+    /// `fusermount3 -u -z`. Detaches whatever holds it, so a writer mid-file loses the
+    /// rest. Only after *our own* unit has stopped, and only under `force`.
     Detach,
 }
 
@@ -71,13 +67,9 @@ pub struct SystemdSupervisor<M: UnitManager> {
     /// be tested at all.
     #[cfg(test)]
     stale_paths: std::collections::HashSet<PathBuf>,
-    /// Stands in for the kernel probe. `None` runs the real `fusermount3`; `Some` answers
-    /// from the set, which is how a held mount is expressed — holding one for real needs
-    /// FUSE, and tier-1 CI has none. The `supervisor()` helper arms it; a test that builds
-    /// its own and reaches a release will exec `fusermount3` for real.
-    ///
-    /// Shared with the fake unit manager, which does *not* empty it on stop: killing
-    /// rclone does not make a held mount releasable.
+    /// Stands in for the kernel probe, since holding a mount for real needs FUSE and
+    /// tier-1 CI has none. `None` runs the real `fusermount3`, which is what a test
+    /// building its own supervisor gets. Not emptied on stop — see [`Release`].
     #[cfg(test)]
     busy_paths: Option<Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>>,
     /// Ordered record of the probe and the unit stop, shared with the fake unit manager.
@@ -164,8 +156,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .contains(point);
-            // A held point refuses `-u` whether or not rclone is still alive, and yields
-            // to `-z`. Both measured; see [`Release`].
+            // Held points refuse `-u` alive or dead, and yield to `-z`. See [`Release`].
             if held && how == Release::Refuse {
                 return Err(SupervisorError::Busy {
                     detail: format!(
@@ -505,16 +496,10 @@ impl<M: UnitManager> SystemdSupervisor<M> {
 
     /// Add what to do about it to a refusal the kernel gave.
     ///
-    /// `fusermount` reports every non-zero exit as [`SupervisorError::Busy`], carrying the
-    /// stderr and nothing else, so a refusal cannot be told from "not a mount point" or a
-    /// permission fault — hence "usually". A failure to *run* `fusermount` is a different
-    /// thing and passes through untouched: advice about releasing a mount is nonsense when
-    /// nothing managed to ask.
-    ///
-    /// The advice does not say "close the file", because a file is not what it takes:
-    /// measured, `-u` is refused for a process whose *working directory* is inside the
-    /// mount, and for a read-only descriptor. Someone who closes their editor and retries
-    /// would get the identical refusal and no idea why.
+    /// Hedged with "usually" because `fusermount` reports every non-zero exit the same
+    /// way, so a refusal cannot be told from "not a mount point". A failure to *run* it
+    /// passes through untouched. Not "close the file": measured, a working directory
+    /// inside the mount or a read-only descriptor is enough to be refused.
     fn refused(point: &Path, e: SupervisorError) -> SupervisorError {
         let SupervisorError::Busy { detail: reason } = e else {
             return e;
@@ -681,12 +666,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 return Ok(());
             }
 
-            // Detaching is only ever right once the writer is already gone, which means
-            // only after *our own* unit has been stopped. A foreign mount is not ours to
-            // stop: its rclone would still be alive and serving, so `-z` would strand it
-            // holding a mount nothing can see, with whatever it is buffering in a cache
-            // directory the user can no longer reach. `force` overrides the refusal to
-            // unmount, not the arithmetic of what unmounting one costs.
+            // Detaching is only right once the writer is gone, so: only after we stopped
+            // the unit ourselves. `-z` on a foreign mount would strand a live rclone
+            // serving a mount nothing can see. See DESIGN.md.
             let may_detach = force && ours;
 
             // Ownership was decided from the unit name; the release acts on a path. A

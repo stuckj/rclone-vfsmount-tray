@@ -410,70 +410,49 @@ a file still open:
 
 ### The unmount order
 
-Step 1 is the only signal there is, so `unmount()` asks the kernel **first** (#73). The
-order is: refuse a path this mount does not own, then `fusermount3 -u`, then `StopUnit`.
+Step 1 is the only signal there is, so `unmount()` asks the kernel **first** (#73):
+ownership and source-mismatch checks, then `fusermount3 -u`, then `StopUnit`. Those checks
+moved ahead of the stop for the same reason as the release did — refusing after the
+SIGTERM has gone out refuses nothing.
 
-- The release succeeds — nothing was holding the mount, it is already down, and stopping
-  the unit is bookkeeping.
-- The release fails and the point is **gone anyway** — an rclone crash or a concurrent
-  `systemctl stop` between the liveness read and the release. Not a failure to unmount.
-- The release fails and the point is **still there** — **refuse**. Nothing has been
-  signalled, so the writer is untouched. This is the only moment at which an open write is
-  visible to us at all.
-- `force`, which is #18's "unmount anyway" and has already been confirmed with the user,
-  logs a warning naming the mount and the refusal, then escalates: an escape hatch a busy
-  mount can veto is not one.
+- Release succeeds — nothing was holding it, and the stop is bookkeeping.
+- Release fails, point gone anyway — a crash or a concurrent stop won the race.
+- Release fails, point still there — **refuse**, with nothing signalled.
+- `force` (#18) warns and escalates.
 
-The refusal does not distinguish `EBUSY` from any other non-zero exit, because
-`fusermount` cannot: it reports them all the same way, and the stderr is the only detail
-there is. The question being answered is whether it is *certainly* safe to signal rclone,
-and anything short of a clean release leaves that unknown — so this fails closed, like the
-cache-mode gate above, and the message reports what was refused rather than asserting why.
-A failure to *run* `fusermount` is passed through as itself; advice about closing files
-would be nonsense when nothing was asked.
+`fusermount` reports every non-zero exit alike, so `EBUSY` cannot be told from "not a
+mount point". The refusal therefore fails closed and says what was refused rather than
+asserting why; a failure to *run* it passes through as itself.
 
-#### What `force` actually has to do
+#### What `force` has to do
 
 Measured on rclone v1.75.0 and Linux 6.8, 15 MB written to a file still open:
 
 | step | result |
 | --- | --- |
-| `fusermount3 -u`, rclone alive, holder's fd open | refused |
-| SIGTERM → rclone exits **without** unmounting; the writer is severed | point stays in `/proc/self/mountinfo` |
-| `fusermount3 -u`, rclone **dead**, holder's fd still open | **still refused** |
-| `fusermount3 -u`, after the holder exits | succeeds |
-| `fusermount3 -u -z`, rclone dead, holder's fd open | succeeds |
+| `-u`, rclone alive, holder's fd open | refused |
+| SIGTERM → rclone exits without unmounting | point stays in mountinfo |
+| `-u`, rclone **dead**, fd still open | **still refused** |
+| `-u`, after the holder exits | succeeds |
+| `-u -z`, rclone dead, fd open | succeeds |
 
-The third row is the one that matters and the easy thing to assume away: killing rclone
-does not make the mount releasable, because what pins it is the *holder's* descriptor. So
-`force` cannot be "refuse, then stop, then unmount" — that ends with the file sacrificed
-**and** the unmount failed, which is the worst of both. It is refuse → stop → refuse →
-detach, and `-z` is reachable only on that last step. By then rclone is dead and the
-writer already severed, so detaching removes a mount-table entry and nothing else; before
-that point it would be the very thing this section exists to prevent. `Release::Refuse`
-and `Release::Detach` are separate operations rather than a boolean for that reason.
+Row three is the one to know, and the easy one to assume away: killing rclone does not
+free the mount, because the *holder's* descriptor pins it. So `force` is refuse → stop →
+refuse → detach. "Refuse → stop → unmount" would end with the file sacrificed **and** the
+unmount failed. `-z` is reachable only on that last step, where the writer is already
+severed and detaching costs a mount-table entry — hence `Release::Refuse` and
+`Release::Detach` as separate operations rather than a flag.
 
-That "by then rclone is dead" only holds for a mount whose unit we stopped, so detaching
-is gated on ownership as well as `force`. A **foreign** mount that is held refuses even
-under `force`: its rclone was never signalled, so `-z` would strand it alive and serving a
-mount nothing can see, with whatever it is buffering in a cache directory the user can no
-longer reach. Refusing leaves the user somewhere they can act; detaching does not.
+Detaching is gated on ownership too: a held **foreign** mount refuses even under `force`,
+since its rclone was never signalled and `-z` would strand it serving a mount nothing can
+see. The settle wait after the stop keeps its full length, because a holder letting go
+inside it is the difference between a clean release and having to detach.
 
-The settle wait after the stop is kept at its full length: a holder that lets go inside it
-is the difference between the escalation succeeding cleanly and having to detach.
+`fusermount3` is now required to unmount any live mount. rclone is a static binary that
+execs it to mount anyway, so this adds no dependency.
 
-`fusermount3` (or `fusermount`) is therefore required on the unmount path for any live
-mount, where before a unit stop alone would sometimes do. rclone ships as a static binary
-and links no libfuse — it execs `fusermount3` itself to mount — so this needs nothing that
-was not already there.
-
-The ownership and source-mismatch checks moved ahead of the release for the same reason:
-refusing after the SIGTERM has gone out refuses nothing.
-
-This does **not** make `TransferState::safe_to_unmount()` whole. That predicate still
-cannot see an open write, so a mount it reports idle can be refused when the unmount is
-attempted; it decides what to *offer*, not what will succeed. #22's watcher is what would
-close the gap in the predicate itself.
+None of it makes `TransferState::safe_to_unmount()` whole: that still cannot see an open
+write, so a mount it calls idle can be refused. #22 is what would close the gap.
 
 ### Two field names that mean less than they say
 

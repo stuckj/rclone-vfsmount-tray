@@ -292,16 +292,10 @@ impl TransferState {
     ///
     /// **Necessary, not sufficient.** rclone enqueues a file when it is closed, so a write
     /// still in progress is invisible to every rc endpoint and this returns `true` while
-    /// it runs — measured; see DESIGN.md and #73.
-    ///
-    /// So this decides what to *offer*, never that an unmount will succeed: a mount it
-    /// calls idle can still be refused when one is attempted, and an implementation of
-    /// [`crate::supervisor::MountSupervisor`] is what has to catch that. The one in this
-    /// workspace does — it asks the kernel to release the point before signalling rclone,
-    /// which fails while any process is still using the mount — but that is its guarantee to state, not this
-    /// predicate's, and its `force` path overrides it by design.
-    ///
-    /// #22 is what would let this see an open write itself.
+    /// it runs — measured; see DESIGN.md and #73. Use it to decide what to *offer*: a
+    /// mount it calls idle can still be refused by
+    /// [`crate::supervisor::MountSupervisor::unmount`], which is where the kernel gets
+    /// asked. #22 would let this see an open write itself.
     pub fn safe_to_unmount(&self) -> bool {
         self.is_idle()
     }

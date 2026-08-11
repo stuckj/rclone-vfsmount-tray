@@ -118,15 +118,11 @@ pub enum SupervisorError {
     #[error("{}", pending_summary(.0))]
     PendingUploads(Pending),
 
-    /// The mount point could not be released — usually because some process is still
-    /// using it. A file open under it will do that, but so will a read-only descriptor or
-    /// a working directory inside it; the kernel does not distinguish. This is the one
-    /// signal that an in-progress write exists at all.
+    /// The mount point could not be released — usually a process still using it: an open
+    /// file, a read-only descriptor or a working directory inside it all count. The only
+    /// signal an in-progress write gives.
     ///
-    /// Carries the whole message rather than just the path, and renders it verbatim. What
-    /// a user needs here is the path, what the kernel said, and what to do about it; a
-    /// wrapper around all three reads as a sentence interrupting itself. Construct it with
-    /// a complete sentence that names the path.
+    /// Rendered verbatim, so `detail` is the whole message.
     #[error("{detail}")]
     Busy { detail: String },
 
@@ -179,22 +175,15 @@ pub trait MountSupervisor: Send + Sync {
 
     /// Tear down a mount.
     ///
-    /// Two refusals, and they are not alike.
+    /// [`SupervisorError::Busy`] — the kernel would not release the point, which is what
+    /// an in-progress write looks like from outside: rclone queues a file only when it is
+    /// *closed*, so its rc API never reports one. **Forcing past it loses data.** Ask the
+    /// kernel *before* signalling rclone, or the refusal never happens (#73).
     ///
-    /// [`SupervisorError::Busy`] means the kernel would not give the mount point back,
-    /// which is what an in-progress write looks like from outside: rclone queues a file
-    /// when it is *closed*, so nothing over its rc API reports one. **Forcing past this
-    /// loses data** — the writer is cut off mid-file and rclone then uploads the partial
-    /// file as if it were complete. An implementation must consult the kernel *before* it
-    /// signals rclone, or the refusal never happens; see #73.
+    /// [`SupervisorError::PendingUploads`] — data still to send, but on disk and resumed
+    /// on remount, so a warning rather than a veto (#19). Nothing here implements it yet.
     ///
-    /// [`SupervisorError::PendingUploads`] means the write-back cache holds data that has
-    /// not gone up yet. That one is a warning channel rather than a veto: the cache is on
-    /// disk and uploads resume on remount, so nothing is lost by proceeding (#19). Not yet
-    /// implemented by anything in this workspace.
-    ///
-    /// `force` is always an explicit caller decision — never a default, never inferred —
-    /// and a caller that offers it should say which of the two it is overriding.
+    /// `force` is always an explicit caller decision, never inferred.
     fn unmount<'a>(
         &'a self,
         name: &'a str,

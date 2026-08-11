@@ -95,7 +95,8 @@ pub type Cause = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SupervisorError {
-    /// No mount is configured under that name.
+    /// Nothing answers to that name: no config entry, and no [`MountState::Orphaned`]
+    /// unit either.
     #[error("no mount configured named {0:?}")]
     UnknownMount(String),
 
@@ -191,13 +192,16 @@ pub trait MountSupervisor: Send + Sync {
     /// on remount, so a warning rather than a veto (#19). Nothing here implements it yet.
     ///
     /// `force` is always an explicit caller decision, never inferred.
+    ///
+    /// The name may be a [`MountState::Orphaned`] one, since [`Self::reconcile`] reports
+    /// those and taking one down is the only thing left to do with it.
     fn unmount<'a>(
         &'a self,
         name: &'a str,
         force: bool,
     ) -> BoxFuture<'a, Result<(), SupervisorError>>;
 
-    /// Current state of one mount.
+    /// Current state of one mount, configured or [`MountState::Orphaned`].
     fn state<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<MountState, SupervisorError>>;
 
     /// Reconcile against reality on startup — the service may have restarted while mounts

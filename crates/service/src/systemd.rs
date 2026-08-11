@@ -42,17 +42,19 @@ pub enum UnitStatus {
 }
 
 impl UnitStatus {
-    /// Whether a process of this unit's is alive, or about to be.
+    /// Whether this unit can be what is mounted at a point right now.
     ///
-    /// `Failed` is not running: its main process is gone, and `CollectMode`'s default
-    /// keeps the unit loaded afterwards purely so its state and log survive. A failed
-    /// unit therefore cannot be serving anything, however recently it was.
+    /// `Failed` cannot: its main process is gone, and `CollectMode`'s default keeps the
+    /// unit loaded afterwards purely so its state and log survive. Neither can
+    /// `Activating`, which is both the moments before rclone is exec'd *and* the gap
+    /// systemd leaves before a restart — in that gap the previous rclone has already
+    /// exited, so the unit is running and serving nothing.
     ///
-    /// Matched exhaustively so a future variant cannot default to running.
-    pub fn is_running(self) -> bool {
+    /// Matched exhaustively so a future variant cannot default to serving.
+    pub fn is_serving(self) -> bool {
         match self {
-            UnitStatus::Active | UnitStatus::Activating | UnitStatus::Deactivating => true,
-            UnitStatus::Failed | UnitStatus::Inactive => false,
+            UnitStatus::Active | UnitStatus::Deactivating => true,
+            UnitStatus::Activating | UnitStatus::Failed | UnitStatus::Inactive => false,
         }
     }
 }

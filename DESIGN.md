@@ -222,7 +222,8 @@ systemd user unit, and the target is Linux desktops.
 
 Every unit this service starts is named `rvt-mount-<mount>.service`, and ownership is
 decided from that name: a mount point the kernel lists with no unit of ours behind it
-belongs to somebody else, and is adopted for display but never acted on.
+belongs to somebody else, and is never started, restarted or detached — only adopted for
+display, and released outright if the user forces it (#18).
 
 Building that name from the config entry is not enough on its own, because the config
 changes under running mounts. Rename `backup` to `backups` and `rvt-mount-backup.service`
@@ -242,12 +243,25 @@ resurrected rclone.
 
 The prefix is therefore swept as well as constructed. `ListUnitsByPatterns("rvt-mount-*")`
 lists every unit of ours systemd still holds; one that no config entry names and that is
-still serving is **orphaned** — ours, distinct from foreign, and stoppable. What it serves
-comes from its own `ExecStart` argv, the only place the unit-to-mount-point mapping
+still serving is **orphaned** — ours, distinct from foreign, and stoppable. Where it
+mounts comes from its own `ExecStart` argv, the only place the unit-to-mount-point mapping
 survives a config edit, and a unit whose argv cannot be read is left alone rather than
 guessed at. An orphan then comes down exactly as any mount of ours does, kernel first and
 `StopUnit` second, whether it is addressed by the name its unit runs under or reached
 through the configured mount whose point it is holding.
+
+Deciding that from the argv alone would be too generous, because the argv records where a
+unit *meant* to mount and outlives its rclone. So a unit counts only while systemd reports
+it `active` or `deactivating`, and only if no configured mount at that point has a unit of
+its own up. `activating` is excluded deliberately: it covers the gap before a restart, in
+which the previous rclone has already exited, and a unit on its way out would otherwise
+claim the very mount that replaced it.
+
+What is mounted there is **not** required to match the `remote:path` the unit was given.
+mountinfo carries the Fs rclone resolved rather than the argument it was handed — measured
+on v1.75.0, an `alias` remote mounted as `ali:` reports its backing path, and a trailing
+slash in the argument is dropped. Demanding equality quietly excused every such config
+from the sweep, which is the failure above, left in place with nothing to show for it.
 
 `MountSupervisor` in `rvt-core` exists so this stays reversible. Everything above the trait
 is written against the interface, and the trait is deliberately **dyn-compatible** — its

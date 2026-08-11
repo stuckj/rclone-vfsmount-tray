@@ -320,14 +320,16 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     async fn orphans(&self) -> Result<Vec<Target>, SupervisorError> {
         let loaded = self.units.list_units(UNIT_PREFIX).await?;
         let live = self.live_mounts();
-        let mut configured = Vec::with_capacity(self.config.mounts.len());
-        for m in &self.config.mounts {
-            configured.push((Self::resolved_point(m).await, m.unit_name()));
-        }
+        let ours: std::collections::HashSet<String> =
+            self.config.mounts.iter().map(|m| m.unit_name()).collect();
+        // Resolved only once a candidate has survived everything cheaper. Canonicalising
+        // is a blocking call per configured mount, and a wedged one costs the full probe
+        // timeout and a parked thread — for a sweep that normally finds nothing at all.
+        let mut configured: Option<Vec<(PathBuf, String)>> = None;
 
         let mut out = Vec::new();
         for u in loaded {
-            if !u.status.is_serving() || configured.iter().any(|(_, c)| *c == u.name) {
+            if !u.status.is_serving() || ours.contains(&u.name) {
                 continue;
             }
             // Nothing to act on without knowing what it serves: stopping a unit whose
@@ -342,7 +344,17 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             // After a rename the old unit and the new one name the same path with the
             // same remote, so nothing about the mount itself separates them: the one to
             // believe is the one whose config entry still exists and whose unit is up.
-            if self.configured_unit_serving_at(&configured, &point).await? {
+            let configured = match configured {
+                Some(ref c) => c,
+                None => {
+                    let mut c = Vec::with_capacity(self.config.mounts.len());
+                    for m in &self.config.mounts {
+                        c.push((Self::resolved_point(m).await, m.unit_name()));
+                    }
+                    configured.insert(c)
+                }
+            };
+            if self.configured_unit_serving_at(configured, &point).await? {
                 continue;
             }
             out.push(Target {
@@ -750,7 +762,22 @@ impl<M: UnitManager> SystemdSupervisor<M> {
 impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
     fn mount<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>> {
         Box::pin(async move {
-            let m = self.mount_config(name)?;
+            let m = match self.mount_config(name) {
+                Ok(m) => m,
+                // An orphan answers to its name everywhere else, so saying no mount is
+                // configured under it would be wrong twice over: it is listed, and it is
+                // running. There is simply nothing left describing how to start it.
+                Err(unknown) => {
+                    return match self.orphans().await?.into_iter().find(|o| o.name == name) {
+                        None => Err(unknown),
+                        Some(o) => Err(SupervisorError::NotManaged(format!(
+                            "{name} is a leftover unit, {}, not a configured mount — \
+                             nothing describes what to start. Unmount it instead.",
+                            o.unit
+                        ))),
+                    }
+                }
+            };
             let lock = self.lock_for(name).await;
             let _guard = lock.lock().await;
 
@@ -932,30 +959,40 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 let entry = live_now
                     .iter()
                     .find(|e| e.is_rclone() && e.mount_point == point);
-                // Unless the unit is serving and its own argv names this very point,
-                // which settles it: that is where this unit actually mounted. Falling
-                // back to the source below is a guess, because rclone records the Fs it
-                // resolved rather than the argument it was given — an `alias` remote
-                // reports its backing path — so on those configs it refuses a mount that
-                // is plainly ours.
-                //
-                // Serving, because the argv outlives the rclone: systemd keeps a failed
-                // transient unit loaded on purpose, and its argv still names the point
-                // whatever has since been mounted there by somebody else.
-                let established =
-                    status.is_serving() && self.argv_point(&unit).await? == Some(point.clone());
-                if let Some(e) = entry.filter(|_| !established) {
+                if let Some(e) = entry {
                     // `force` is the caller having confirmed with the user, so it overrides
                     // the mismatch as well as the ownership refusal — otherwise #18's
                     // "unmount anyway" cannot work on a foreign mount at all.
                     if !force && e.source != fs_spec {
-                        return Err(SupervisorError::NotManaged(format!(
-                            "{name}: {} is serving {}, not {} — refusing to unmount something \
-                         this mount does not own",
-                            point.display(),
-                            e.source,
-                            fs_spec
-                        )));
+                        // The source is rclone's record of the Fs it resolved, not the
+                        // argument it was handed — an `alias` remote reports its backing
+                        // path — so a mismatch is not proof of anything on its own. The
+                        // unit's own argv is: if it is serving and it named this very
+                        // point, this is where it mounted. Asked only here, because it
+                        // costs a sweep and only a mismatch makes the answer matter.
+                        //
+                        // Serving, because the argv outlives its rclone: systemd keeps a
+                        // failed transient unit loaded on purpose, still naming the point
+                        // whatever somebody else has mounted there since.
+                        let established = status.is_serving()
+                            && self.argv_point(&unit).await? == Some(point.clone());
+                        if !established {
+                            return Err(SupervisorError::NotManaged(format!(
+                                "{name}: {} is serving {}, not {} — refusing to unmount \
+                                 something this mount does not own",
+                                point.display(),
+                                e.source,
+                                fs_spec
+                            )));
+                        }
+                        tracing::warn!(
+                            mount = %name,
+                            path = %point.display(),
+                            mounted = %e.source,
+                            configured = %fs_spec,
+                            "unmounting on the unit's own argv, over a source that does \
+                             not match what it was started with"
+                        );
                     }
                 }
 
@@ -2413,6 +2450,23 @@ mod tests {
         );
     }
 
+    /// An orphan is listed and can be polled and unmounted under its own name, so
+    /// reporting `mount` on it as an unconfigured name would contradict every other
+    /// answer. It cannot be started — nothing describes it any more — but that is a
+    /// different refusal.
+    #[tokio::test]
+    async fn mounting_an_orphan_says_what_it_is_rather_than_denying_it_exists() {
+        let (_sc, s) = renamed("rename-mount-orphan");
+        match s.mount("backup").await {
+            Err(SupervisorError::NotManaged(msg)) => assert!(
+                msg.contains("rvt-mount-backup.service") && msg.contains("leftover"),
+                "{msg}"
+            ),
+            other => panic!("expected a refusal naming the leftover unit, got {other:?}"),
+        }
+        assert!(s.units.started.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn mounting_over_an_orphan_names_the_unit_in_the_way() {
         let (_sc, s) = renamed("rename-mount");
@@ -2707,9 +2761,10 @@ mod tests {
         );
     }
 
-    /// Both cases where a unit of ours is loaded but there is nothing to act on: it is
-    /// serving nothing, or its argv does not say what it serves. Reporting either as a
-    /// mount would put a row in the list that no action fits.
+    /// Both cases where a unit of ours is loaded but there is nothing to act on: nothing
+    /// is mounted where its argv says, or its argv does not say. Reporting either as a
+    /// mount would put a row in the list that no action fits. (The state gate is pinned
+    /// separately — either condition alone rejects the first of these.)
     #[tokio::test]
     async fn a_loaded_unit_serving_nothing_is_not_an_orphan() {
         let (_sc, s) = renamed("rename-idle");

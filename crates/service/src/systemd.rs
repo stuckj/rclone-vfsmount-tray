@@ -407,9 +407,10 @@ pub mod dbus {
                     // Only a service has an `ExecStart`. A `.mount` or `.timer` sharing
                     // the prefix would answer the property read with an interface error
                     // on every sweep, which is worth neither the round trip nor the log.
-                    let serving = match name.ends_with(".service") {
-                        true => self.serving(path).await,
-                        false => None,
+                    let serving = if name.ends_with(".service") {
+                        self.serving(path).await
+                    } else {
+                        None
                     };
                     out.push(LoadedUnit {
                         name,

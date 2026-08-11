@@ -726,10 +726,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
-        let unit = found
-            .iter()
-            .find(|u| u.name == name)
-            .unwrap_or_else(|| panic!("the unit just started is not in {found:?}"));
+        // Torn down before anything is asserted: the stub sleeps for 30s under
+        // `Restart=on-failure`, so a failing assertion would leave it running and the
+        // next run would start another beside it under a fresh pid.
+        let seen = found.iter().find(|u| u.name == name).cloned();
+        let _ = units.stop(&name).await;
+        let _ = units.reset_failed(&name).await;
+
+        let unit = seen.unwrap_or_else(|| panic!("the unit just started is not in {found:?}"));
         assert_eq!(
             unit.serving,
             Some(Serving {
@@ -739,9 +743,6 @@ mod tests {
             "the mount point has to come back out of the unit's own argv, or an orphan \
              can never be matched to what it is serving"
         );
-
-        let _ = units.stop(&name).await;
-        let _ = units.reset_failed(&name).await;
     }
 
     #[tokio::test]

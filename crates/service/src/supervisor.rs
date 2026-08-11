@@ -869,7 +869,14 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                     // resolves to nothing, so its entry is dropped rather than left to
                     // accumulate one per bad name a client sends.
                     if matches!(e, SupervisorError::UnknownMount(_)) {
-                        self.locks.lock().await.remove(name);
+                        let mut locks = self.locks.lock().await;
+                        // Two references means the map's and this one. Any more and
+                        // somebody is queued on it, and removing it would hand the next
+                        // caller a different mutex for the same name. Every clone is
+                        // taken under this same map lock, so the count cannot move here.
+                        if Arc::strong_count(&lock) == 2 {
+                            locks.remove(name);
+                        }
                     }
                     return Err(e);
                 }
@@ -925,12 +932,18 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 let entry = live_now
                     .iter()
                     .find(|e| e.is_rclone() && e.mount_point == point);
-                // Unless the unit's own argv names this very point, which settles it:
-                // that is where this unit actually mounted. Falling back to the source
-                // below is a guess, because rclone records the Fs it resolved rather
-                // than the argument it was given — an `alias` remote reports its backing
-                // path — so on those configs it refuses a mount that is plainly ours.
-                let established = self.argv_point(&unit).await? == Some(point.clone());
+                // Unless the unit is serving and its own argv names this very point,
+                // which settles it: that is where this unit actually mounted. Falling
+                // back to the source below is a guess, because rclone records the Fs it
+                // resolved rather than the argument it was given — an `alias` remote
+                // reports its backing path — so on those configs it refuses a mount that
+                // is plainly ours.
+                //
+                // Serving, because the argv outlives the rclone: systemd keeps a failed
+                // transient unit loaded on purpose, and its argv still names the point
+                // whatever has since been mounted there by somebody else.
+                let established =
+                    status.is_serving() && self.argv_point(&unit).await? == Some(point.clone());
                 if let Some(e) = entry.filter(|_| !established) {
                     // `force` is the caller having confirmed with the user, so it overrides
                     // the mismatch as well as the ownership refusal — otherwise #18's
@@ -1268,14 +1281,21 @@ mod tests {
     }
 
     fn mountinfo_with(paths: &[&str]) -> String {
+        mountinfo_with_source(paths, "backup:pictures")
+    }
+
+    /// mountinfo carries the Fs rclone resolved, which is not always the `remote:path` a
+    /// unit was given — so a test needs to be able to say what the kernel reports.
+    fn mountinfo_with_source(paths: &[&str], source: &str) -> String {
         let mut s = String::from("28 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw\n");
         for (i, p) in paths.iter().enumerate() {
             s.push_str(&format!(
-                "{} 28 0:5{} / {} rw,relatime shared:7{} - fuse.rclone backup:pictures rw\n",
+                "{} 28 0:5{} / {} rw,relatime shared:7{} - fuse.rclone {} rw\n",
                 150 + i,
                 i,
                 p,
-                i
+                i,
+                source
             ));
         }
         s
@@ -2542,6 +2562,40 @@ mod tests {
                 .any(|m| m.name == "backup" && m.state == MountState::Orphaned),
             "an alias remote's mount is still ours: {found:?}"
         );
+    }
+
+    /// The argv can only vouch for a mount while the unit is still serving it. systemd
+    /// keeps a failed transient unit loaded on purpose, and it answers with the argv it
+    /// was started with — which names the configured point no matter who has mounted
+    /// something there since.
+    #[tokio::test]
+    async fn a_dead_units_argv_does_not_vouch_for_a_strangers_mount() {
+        let (sc, s) = renamed("dead-argv");
+        let point = mount_point(&sc);
+        // The user's own `rclone mount gdrive:docs`, by hand, at the same path.
+        std::fs::write(
+            &s.mountinfo_path,
+            mountinfo_with_source(&[&point.to_string_lossy()], "gdrive:docs"),
+        )
+        .unwrap();
+        s.units.loaded.lock().unwrap()[0] = LoadedUnit {
+            name: "rvt-mount-backups.service".into(),
+            status: UnitStatus::Failed,
+            serving: Some(Serving {
+                fs_spec: "backup:pictures".into(),
+                mount_point: point.clone(),
+            }),
+        };
+
+        match s.unmount("backups", false).await {
+            Err(SupervisorError::NotManaged(msg)) => assert!(
+                msg.contains("gdrive:docs"),
+                "the refusal has to say what is actually there: {msg}"
+            ),
+            other => panic!("a filesystem the user never named was unmounted: {other:?}"),
+        }
+        let events = s.events.lock().unwrap().clone();
+        assert!(events.is_empty(), "nothing may be released: {events:?}");
     }
 
     /// Reporting it as ours is only half the promise. The pre-flight check that the point

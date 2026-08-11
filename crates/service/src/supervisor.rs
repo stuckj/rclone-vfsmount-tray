@@ -305,11 +305,12 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// running and unaccounted for, and the mount point it holds reads as somebody
     /// else's.
     ///
-    /// A unit with nothing at its mount point is skipped whatever state it is in — one
-    /// that failed without ever mounting holds a name no config entry wants and blocks
-    /// nothing. A unit the kernel still lists a mount for is reported even if it has
-    /// failed, because that point has to be released and only its own unit releases it
-    /// cleanly.
+    /// Being named by no config entry is not enough to make a unit the owner of a mount
+    /// point. It must also be running, be serving what it was started to serve, and not
+    /// be shadowing a configured mount whose own unit is up — its argv says only where it
+    /// *meant* to mount, and after a rename the old unit and the new one name the same
+    /// path with the same remote. Without all three, a leftover claims whatever turns up
+    /// at that path later, and stopping it takes down a mount that was never its own.
     async fn orphans(&self) -> Result<Vec<Target>, SupervisorError> {
         let loaded = self.units.list_units(UNIT_PREFIX).await?;
         let configured: std::collections::HashSet<String> =
@@ -337,6 +338,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             {
                 continue;
             }
+            // A configured mount whose own unit is up is the one serving this point, and
+            // after a rename the two are indistinguishable by path and remote alike. The
+            // gap systemd leaves between an rclone exiting and its restart reads as
+            // `Activating`, so "running" alone would let the unit on its way out claim
+            // the mount that replaced it.
+            if self.configured_unit_running_at(&point).await? {
+                continue;
+            }
             out.push(Target {
                 name,
                 unit: u.name,
@@ -345,6 +354,18 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             });
         }
         Ok(out)
+    }
+
+    /// Whether a configured mount at this point has a unit of its own running.
+    async fn configured_unit_running_at(&self, point: &Path) -> Result<bool, SupervisorError> {
+        for m in &self.config.mounts {
+            if Self::resolved_point(m).await == point
+                && self.units.status(&m.unit_name()).await?.is_running()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The orphan holding a mount point, if one is.
@@ -816,7 +837,19 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             let _guard = lock.lock().await;
             // Not always the unit this name's own config entry would build: see
             // `unmount_target`. Everything below acts on what came back.
-            let target = self.unmount_target(name).await?;
+            let target = match self.unmount_target(name).await {
+                Ok(t) => t,
+                Err(e) => {
+                    // `lock_for` inserts on demand, and the name is only known to be good
+                    // once it has resolved. Nothing can ever act under a name that
+                    // resolves to nothing, so its entry is dropped rather than left to
+                    // accumulate one per bad name a client sends.
+                    if matches!(e, SupervisorError::UnknownMount(_)) {
+                        self.locks.lock().await.remove(name);
+                    }
+                    return Err(e);
+                }
+            };
 
             // A redirect acts on a unit the caller's own lock does not guard, and after a
             // rename two names reach the same one — the configured entry and the orphan.
@@ -2399,6 +2432,62 @@ mod tests {
         );
     }
 
+    /// The gap systemd leaves between an rclone exiting and its restart is reported as
+    /// `Activating`, so being "running" does not mean serving anything. If the new unit
+    /// mounted the path during that gap, the old one is on its way out and holds nothing
+    /// — and the two are identical by path and remote, so only the configured unit's own
+    /// state separates them.
+    #[tokio::test]
+    async fn a_unit_awaiting_restart_does_not_claim_the_mount_that_replaced_it() {
+        let (sc, s) = renamed("rename-restart-gap");
+        let point = mount_point(&sc);
+        {
+            let mut loaded = s.units.loaded.lock().unwrap();
+            loaded[0].status = UnitStatus::Activating;
+            loaded.push(LoadedUnit {
+                name: "rvt-mount-backups.service".into(),
+                status: UnitStatus::Active,
+                serving: Some(Serving {
+                    fs_spec: "backup:pictures".into(),
+                    mount_point: point.clone(),
+                }),
+            });
+        }
+
+        let found = s.reconcile().await.unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "the mount belongs to the configured unit serving it: {found:?}"
+        );
+        assert_eq!(found[0].state, MountState::Mounted);
+
+        match s.unmount("backup", false).await {
+            Err(SupervisorError::UnknownMount(n)) => assert_eq!(n, "backup"),
+            other => panic!("a unit awaiting restart must not unmount a live mount: {other:?}"),
+        }
+        let events = s.events.lock().unwrap().clone();
+        assert!(events.is_empty(), "the live mount was touched: {events:?}");
+    }
+
+    /// `lock_for` inserts on demand and nothing evicts, so an unmount that resolves to
+    /// nothing must not leave an entry behind — #40 puts this on D-Bus, where the name
+    /// comes from a client.
+    #[tokio::test]
+    async fn an_unmount_of_a_name_that_resolves_to_nothing_leaves_no_lock() {
+        let (_sc, s) = supervisor("lockleak", false, &[], UnitStatus::Inactive);
+        for n in ["typo", "another", "third"] {
+            match s.unmount(n, false).await {
+                Err(SupervisorError::UnknownMount(_)) => {}
+                other => panic!("expected UnknownMount for {n:?}, got {other:?}"),
+            }
+        }
+        assert!(
+            s.locks.lock().await.is_empty(),
+            "one map entry per bad name a client sends is unbounded growth"
+        );
+    }
+
     /// The same missing check, pointed at a stranger's mount. DESIGN.md promises a held
     /// foreign mount refuses even under `force`, because `-z` would strand an rclone that
     /// was never signalled — claiming it as an orphan is what would reach that `-z`.
@@ -2426,7 +2515,7 @@ mod tests {
     /// belongs to the orphan and releasing it is the original #71 damage over again.
     #[tokio::test]
     async fn a_failed_unit_under_the_new_name_does_not_capture_the_unmount() {
-        let (sc, s) = renamed("rename-failed-new");
+        let (_sc, s) = renamed("rename-failed-new");
         releasing(&s);
         s.units.loaded.lock().unwrap().push(LoadedUnit {
             name: "rvt-mount-backups.service".into(),
@@ -2443,7 +2532,6 @@ mod tests {
             "stopping the dead unit under the new name releases the orphan's live mount \
              and leaves the orphan running"
         );
-        let _ = mount_point(&sc);
     }
 
     /// Both cases where a unit of ours is loaded but there is nothing to act on: it is

@@ -41,6 +41,25 @@ pub enum UnitStatus {
     Inactive,
 }
 
+/// What a unit's own argv says it mounts, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Serving {
+    /// The `remote:path` rclone was given.
+    pub fs_spec: String,
+    pub mount_point: PathBuf,
+}
+
+/// A unit systemd has loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedUnit {
+    pub name: String,
+    pub status: UnitStatus,
+    /// Read back from the unit's argv, for units shaped like the ones this service
+    /// starts. `None` for anything else, and for a read that failed — a unit whose
+    /// mount point cannot be established is left alone rather than guessed at.
+    pub serving: Option<Serving>,
+}
+
 /// Start and stop units.
 ///
 /// Boxed futures for the same reason as `MountSupervisor`: the supervisor holds this as a
@@ -54,6 +73,17 @@ pub trait UnitManager: Send + Sync {
     fn stop<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>>;
 
     fn status<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, Result<UnitStatus, SupervisorError>>;
+
+    /// Every unit systemd currently has loaded whose name begins with `prefix`.
+    ///
+    /// Loaded is the right set: a transient unit that stopped cleanly is collected and
+    /// gone, and one that failed stays — `CollectMode` is left at its default precisely
+    /// so it does. What comes back is therefore every unit of ours still accounted for
+    /// by systemd, whether or not any config entry still names it.
+    fn list_units<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> BoxFuture<'a, Result<Vec<LoadedUnit>, SupervisorError>>;
 
     /// Clear a failed unit so the name can be reused. systemd keeps a failed transient
     /// unit loaded, and `StartTransientUnit` refuses a name that still is.
@@ -88,6 +118,44 @@ pub mod dbus {
         fn reset_failed_unit(&self, name: &str) -> zbus::Result<()>;
 
         fn get_unit(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
+
+        /// Loaded units whose names match any of the globs, optionally narrowed to a set
+        /// of active states. An empty `states` means every state.
+        fn list_units_by_patterns(
+            &self,
+            states: &[&str],
+            patterns: &[&str],
+        ) -> zbus::Result<Vec<UnitRecord>>;
+    }
+
+    /// One row of `ListUnitsByPatterns`, signature `(ssssssouso)`: unit name,
+    /// description, load state, active state, sub state, the unit it is followed by,
+    /// its object path, then the id, type and object path of any queued job.
+    type UnitRecord = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        OwnedObjectPath,
+        u32,
+        String,
+        OwnedObjectPath,
+    );
+
+    /// One `ExecStart=` entry, signature `(sasbttttuii)`: the binary, its full argv,
+    /// whether a non-zero exit is ignored, then start and exit timestamps, the last
+    /// PID, and the exit code and status.
+    type ExecCommand = (String, Vec<String>, bool, u64, u64, u64, u64, u32, i32, i32);
+
+    #[zbus::proxy(
+        interface = "org.freedesktop.systemd1.Service",
+        default_service = "org.freedesktop.systemd1"
+    )]
+    trait Service {
+        #[zbus(property)]
+        fn exec_start(&self) -> zbus::Result<Vec<ExecCommand>>;
     }
 
     #[zbus::proxy(
@@ -119,6 +187,42 @@ pub mod dbus {
             ManagerProxy::new(&self.conn)
                 .await
                 .map_err(|e| supervision("opening the systemd manager interface", e))
+        }
+
+        /// What a unit mounts, read back from the argv systemd holds for it.
+        ///
+        /// `None` rather than an error throughout: this only ever adds detail to a unit
+        /// already listed, and a unit whose argv is not one of ours is not something to
+        /// fail a sweep over.
+        async fn serving(&self, unit: OwnedObjectPath) -> Option<Serving> {
+            let svc = ServiceProxy::builder(&self.conn)
+                .path(unit)
+                .ok()?
+                .build()
+                .await
+                .ok()?;
+            let exec = svc.exec_start().await.ok()?;
+            let (_, argv, ..) = exec.first()?;
+            // argv[0] is the binary, and `Mount::mount_args` puts the subcommand and its
+            // two positional arguments immediately after it.
+            if argv.get(1).map(String::as_str) != Some("mount") {
+                return None;
+            }
+            Some(Serving {
+                fs_spec: argv.get(2)?.clone(),
+                mount_point: PathBuf::from(argv.get(3)?),
+            })
+        }
+    }
+
+    /// systemd's `ActiveState` as this service reads it.
+    fn unit_status(active_state: &str) -> UnitStatus {
+        match active_state {
+            "active" | "reloading" => UnitStatus::Active,
+            "activating" => UnitStatus::Activating,
+            "deactivating" => UnitStatus::Deactivating,
+            "failed" => UnitStatus::Failed,
+            _ => UnitStatus::Inactive,
         }
     }
 
@@ -237,13 +341,31 @@ pub mod dbus {
                     .active_state()
                     .await
                     .map_err(|e| supervision(&format!("reading state of {unit}"), e))?;
-                Ok(match state.as_str() {
-                    "active" | "reloading" => UnitStatus::Active,
-                    "activating" => UnitStatus::Activating,
-                    "deactivating" => UnitStatus::Deactivating,
-                    "failed" => UnitStatus::Failed,
-                    _ => UnitStatus::Inactive,
-                })
+                Ok(unit_status(&state))
+            })
+        }
+
+        fn list_units<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<LoadedUnit>, SupervisorError>> {
+            Box::pin(async move {
+                let mgr = self.manager().await?;
+                let pattern = format!("{prefix}*");
+                let rows = mgr
+                    .list_units_by_patterns(&[], &[&pattern])
+                    .await
+                    .map_err(|e| supervision(&format!("listing units matching {pattern}"), e))?;
+
+                let mut out = Vec::with_capacity(rows.len());
+                for (name, _, _, active, _, _, path, ..) in rows {
+                    out.push(LoadedUnit {
+                        name,
+                        status: unit_status(&active),
+                        serving: self.serving(path).await,
+                    });
+                }
+                Ok(out)
             })
         }
 
@@ -493,6 +615,77 @@ mod tests {
             starts >= 2,
             "the unit ran its pre-start {starts} time(s): systemd either did not restart \
              it, or restarted it without re-running the hook that clears the leftovers"
+        );
+
+        let _ = units.stop(&name).await;
+        let _ = units.reset_failed(&name).await;
+    }
+
+    /// `ListUnitsByPatterns` and the `ExecStart` property are decoded through tuple
+    /// signatures written out by hand, and zbus checks them when the message arrives, not
+    /// when the code is built. A double cannot catch a wrong one — it hands back whatever
+    /// the test constructed — and a silent decode failure would leave the orphan sweep
+    /// finding nothing, for ever.
+    ///
+    /// Swept under its own prefix rather than the real one, so a service running on the
+    /// same machine does not watch a unit appear inside the namespace it owns.
+    #[tokio::test]
+    async fn the_unit_sweep_decodes_what_systemd_actually_sends() {
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+
+        // A stub that ignores its arguments and stays up, so the unit can carry a mount
+        // unit's argv without the payload rejecting it. A unit that fails instead settles
+        // in `failed` on its own schedule and cannot be reliably cleared afterwards.
+        let dir = Scratch::new("sweep");
+        let stub = dir.write("stub", "#!/bin/sh\nexec sleep 30\n");
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("the stub has to be executable");
+
+        let prefix = format!("rvt-sweeptest-{}-", std::process::id());
+        let name = format!("{prefix}one.service");
+        let point = "/nonexistent/rvt-sweeptest";
+        let _ = units.reset_failed(&name).await;
+        let spec = UnitSpec {
+            name: name.clone(),
+            description: "sweep self test".into(),
+            executable: stub,
+            // Shaped like a mount unit's argv, so the mount point can be read back out.
+            args: vec!["mount".into(), "selftest:".into(), point.into()],
+            pre_start: None,
+            umask: 0o022,
+        };
+        if units.start_transient(&spec).await.is_err() {
+            eprintln!("skipped: no systemd user instance");
+            return;
+        }
+
+        let mut found = Vec::new();
+        for _ in 0..20 {
+            found = units
+                .list_units(&prefix)
+                .await
+                .expect("the sweep must decode");
+            if !found.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let unit = found
+            .iter()
+            .find(|u| u.name == name)
+            .unwrap_or_else(|| panic!("the unit just started is not in {found:?}"));
+        assert_eq!(
+            unit.serving,
+            Some(Serving {
+                fs_spec: "selftest:".into(),
+                mount_point: PathBuf::from(point),
+            }),
+            "the mount point has to come back out of the unit's own argv, or an orphan \
+             can never be matched to what it is serving"
         );
 
         let _ = units.stop(&name).await;

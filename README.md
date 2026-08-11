@@ -3,8 +3,9 @@
 A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mountain Duck.
 
 > **Status: early development — not usable yet.** The service finds rclone, reads its own
-> configuration, starts, stops and adopts mounts as systemd user units, and works out what
-> each one still has to upload — over rclone's rc API where it answers, and by reading the
+> configuration, starts, stops and adopts mounts as systemd user units — including its own
+> units that the config no longer names, which is what renaming a mount leaves behind — and
+> works out what each one still has to upload — over rclone's rc API where it answers, and by reading the
 > write-back cache off disk where it does not. What it does not do is *serve*: it
 > reconciles, polls each mount once, logs what it found, and exits. There is no D-Bus
 > surface, and the tray and GTK clients are scaffolding.

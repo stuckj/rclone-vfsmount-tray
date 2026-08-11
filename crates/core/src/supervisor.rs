@@ -47,6 +47,12 @@ pub enum MountState {
     /// a manual invocation. Adopted for display and monitoring only; the supervisor
     /// must not restart or reconfigure it.
     Foreign,
+    /// Serving, started by us, and named by no entry in the config — the mount was
+    /// renamed or deleted while its unit kept running.
+    ///
+    /// Stoppable, because the unit is ours. Not startable: nothing left describes what
+    /// it should be, so taking it down is all that can be done with one.
+    Orphaned,
 }
 
 impl MountState {
@@ -55,7 +61,7 @@ impl MountState {
     /// Matched exhaustively so a future variant cannot silently default to "not live".
     pub fn is_live(&self) -> bool {
         match self {
-            MountState::Mounted | MountState::Foreign => true,
+            MountState::Mounted | MountState::Foreign | MountState::Orphaned => true,
             MountState::Unmounted
             | MountState::Mounting
             | MountState::Unmounting
@@ -72,7 +78,8 @@ impl MountState {
             | MountState::Mounting
             | MountState::Mounted
             | MountState::Unmounting
-            | MountState::Failed { .. } => true,
+            | MountState::Failed { .. }
+            | MountState::Orphaned => true,
             MountState::Foreign => false,
         }
     }
@@ -196,8 +203,10 @@ pub trait MountSupervisor: Send + Sync {
     /// Reconcile against reality on startup — the service may have restarted while mounts
     /// stayed up.
     ///
-    /// Returns every configured mount **plus** every live unmanaged one. A configured mount
-    /// that is down is reported [`MountState::Unmounted`], not omitted.
+    /// Returns every configured mount **plus** every live mount no config entry names:
+    /// [`MountState::Foreign`] for the ones we did not start, [`MountState::Orphaned`]
+    /// for our own units left behind by a rename or a deletion. A configured mount that
+    /// is down is reported [`MountState::Unmounted`], not omitted.
     fn reconcile(&self) -> BoxFuture<'_, Result<Vec<DiscoveredMount>, SupervisorError>>;
 }
 
@@ -211,6 +220,14 @@ mod tests {
         assert!(!MountState::Foreign.is_managed());
         assert!(MountState::Mounted.is_live());
         assert!(MountState::Mounted.is_managed());
+    }
+
+    #[test]
+    fn an_orphaned_unit_is_live_and_ours_to_act_on() {
+        // The whole point of telling it from `Foreign`: it can be stopped by stopping
+        // its unit, where a foreign mount can only be fusermounted.
+        assert!(MountState::Orphaned.is_live());
+        assert!(MountState::Orphaned.is_managed());
     }
 
     #[test]

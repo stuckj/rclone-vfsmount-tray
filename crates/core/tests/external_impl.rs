@@ -152,15 +152,16 @@ fn an_implementer_can_construct_every_state_and_error() {
             reason: "rclone exited 1: mount point busy".into(),
         },
         MountState::Foreign,
+        MountState::Orphaned,
     ];
     assert_eq!(
         states.iter().filter(|s| s.is_live()).count(),
-        2,
-        "only Mounted and Foreign are serving"
+        3,
+        "only Mounted, Foreign and Orphaned are serving"
     );
     assert_eq!(
         states.iter().filter(|s| s.is_managed()).count(),
-        5,
+        6,
         "only Foreign is unmanaged"
     );
 

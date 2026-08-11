@@ -5,6 +5,7 @@
 //! somebody else started the same problem. See DESIGN.md.
 
 use crate::systemd::{UnitManager, UnitSpec, UnitStatus};
+use rvt_core::config::UNIT_PREFIX;
 use rvt_core::mountinfo::{self, MountEntry};
 use rvt_core::supervisor::{
     BoxFuture, DiscoveredMount, MountState, MountSupervisor, SupervisorError,
@@ -41,6 +42,23 @@ enum Release {
     /// `fusermount3 -u -z`. Detaches whatever holds it, so a writer mid-file loses the
     /// rest. Only after *our own* unit has stopped, and only under `force`.
     Detach,
+}
+
+/// The unit an operation acts on, and what is needed to act on it.
+///
+/// A configured mount reduces to one of these, and so does an orphan — a unit of ours
+/// the config no longer names, rebuilt from the argv systemd still holds for it. Past
+/// this point the two are handled identically, which is the whole of #71: an orphan is
+/// stopped by stopping its unit, not by fusermounting the path it serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    /// The mount name, which is also the lock this operation holds.
+    name: String,
+    unit: String,
+    /// Canonicalised, as the kernel reports it.
+    point: PathBuf,
+    /// `remote:path`, to check against what is actually mounted there.
+    fs_spec: String,
 }
 
 /// Starts rclone mounts as transient systemd units.
@@ -255,18 +273,106 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             .ok_or_else(|| SupervisorError::UnknownMount(name.to_string()))
     }
 
-    /// The mount point as the kernel will report it.
+    /// A mount point as the kernel will report it.
     ///
     /// mountinfo records fully resolved paths, so a mount under a symlinked directory
     /// never matches its configured path. Falls back to that path when it cannot be
     /// resolved, the normal case before the directory exists.
-    async fn resolved_point(m: &Mount) -> PathBuf {
-        let raw = m.mount_point.clone();
+    async fn resolved(raw: PathBuf) -> PathBuf {
         let fallback = raw.clone();
         Self::off_thread(move || std::fs::canonicalize(&raw).ok())
             .await
             .flatten()
             .unwrap_or(fallback)
+    }
+
+    async fn resolved_point(m: &Mount) -> PathBuf {
+        Self::resolved(m.mount_point.clone()).await
+    }
+
+    async fn target_of(m: &Mount) -> Target {
+        Target {
+            name: m.name.clone(),
+            unit: m.unit_name(),
+            point: Self::resolved_point(m).await,
+            fs_spec: m.fs_spec(),
+        }
+    }
+
+    /// Every unit of ours that is serving something the config no longer names.
+    ///
+    /// The sweep `UNIT_PREFIX` promises: without it a renamed mount leaves its old unit
+    /// running and unaccounted for, and the mount point it holds reads as somebody
+    /// else's. Units that are loaded but not serving are skipped — a failed one holds a
+    /// name no config entry wants, and blocks nothing.
+    async fn orphans(&self) -> Result<Vec<Target>, SupervisorError> {
+        let loaded = self.units.list_units(UNIT_PREFIX).await?;
+        let configured: std::collections::HashSet<String> =
+            self.config.mounts.iter().map(|m| m.unit_name()).collect();
+        let live = self.live_mounts();
+
+        let mut out = Vec::new();
+        for u in loaded {
+            if u.status == UnitStatus::Inactive || configured.contains(&u.name) {
+                continue;
+            }
+            // Nothing to act on without knowing what it serves: stopping a unit whose
+            // mount point is unknown could take down anything.
+            let (Some(serving), Some(name)) = (u.serving, orphan_name(&u.name)) else {
+                continue;
+            };
+            let point = Self::resolved(serving.mount_point).await;
+            if !mountinfo::is_mounted_at(&live, &point) {
+                continue;
+            }
+            out.push(Target {
+                name,
+                unit: u.name,
+                point,
+                fs_spec: serving.fs_spec,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The orphan holding a mount point, if one is.
+    async fn orphan_at(&self, point: &Path) -> Result<Option<Target>, SupervisorError> {
+        Ok(self.orphans().await?.into_iter().find(|o| o.point == point))
+    }
+
+    /// Which unit an unmount request has to act on.
+    ///
+    /// Usually the one the configured mount names. It can also be an orphan: addressed
+    /// directly, under the name its unit was started with, or reached through a
+    /// configured mount whose point that orphan is the one still holding — what a rename
+    /// leaves behind. Both have to stop the unit. Releasing the path instead leaves
+    /// rclone running with nothing to serve, and systemd restarting it.
+    async fn unmount_target(&self, name: &str) -> Result<Target, SupervisorError> {
+        let Ok(m) = self.mount_config(name) else {
+            return self
+                .orphans()
+                .await?
+                .into_iter()
+                .find(|o| o.name == name)
+                .ok_or_else(|| SupervisorError::UnknownMount(name.to_string()));
+        };
+
+        let target = Self::target_of(m).await;
+        if self.units.status(&target.unit).await? != UnitStatus::Inactive {
+            return Ok(target);
+        }
+        match self.orphan_at(&target.point).await? {
+            Some(o) => {
+                tracing::info!(
+                    mount = %target.name,
+                    unit = %o.unit,
+                    "stopping the unit still holding this mount point; the config no \
+                     longer names it"
+                );
+                Ok(o)
+            }
+            None => Ok(target),
+        }
     }
 
     /// Run a filesystem call off the async executor, and give up on it if it hangs.
@@ -347,10 +453,23 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             (true, UnitStatus::Deactivating) => MountState::Unmounting,
             // Ours, and it died with the kernel entry still there. Still ours.
             (true, UnitStatus::Failed) => MountState::Failed {
-                reason: self.failure_reason(m).await,
+                reason: self.failure_reason(&m.unit_name()).await,
             },
-            // Mounted with no unit of ours at all: somebody else started it.
-            (true, UnitStatus::Inactive) => MountState::Foreign,
+            // Mounted with no unit of ours *under this name*. Either somebody else
+            // started it, or one of our own units is still holding the point under the
+            // name this mount used to have.
+            (true, UnitStatus::Inactive) => match self.orphan_at(&point).await? {
+                Some(o) => MountState::Failed {
+                    reason: format!(
+                        "{} is still served by {}, left over from a mount this config no \
+                         longer names — usually a rename. Unmounting {:?} frees it.",
+                        point.display(),
+                        o.unit,
+                        o.name
+                    ),
+                },
+                None => MountState::Foreign,
+            },
 
             // `Type=exec` reports active as soon as rclone is exec'd, seconds before the
             // mount point answers, so an active unit with nothing mounted yet is coming
@@ -358,7 +477,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             (false, UnitStatus::Active | UnitStatus::Activating) => MountState::Mounting,
             (false, UnitStatus::Deactivating) => MountState::Unmounting,
             (false, UnitStatus::Failed) => MountState::Failed {
-                reason: self.failure_reason(m).await,
+                reason: self.failure_reason(&m.unit_name()).await,
             },
             (false, UnitStatus::Inactive) => MountState::Unmounted,
         })
@@ -379,7 +498,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             // full timeout would only delay showing the user why.
             if self.units.status(&m.unit_name()).await? == UnitStatus::Failed {
                 return Err(SupervisorError::RcloneFailed {
-                    reason: self.failure_reason(m).await,
+                    reason: self.failure_reason(&m.unit_name()).await,
                     source: None,
                 });
             }
@@ -389,7 +508,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
                         "{} did not start serving within {}s. {}",
                         m.mount_point.display(),
                         self.ready_timeout.as_secs(),
-                        self.failure_reason(m).await
+                        self.failure_reason(&m.unit_name()).await
                     )
                     .trim_end()
                     .to_string(),
@@ -400,10 +519,10 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         }
     }
 
-    async fn failure_reason(&self, m: &Mount) -> String {
-        let out = self.units.recent_output(&m.unit_name()).await;
+    async fn failure_reason(&self, unit: &str) -> String {
+        let out = self.units.recent_output(unit).await;
         if out.is_empty() {
-            "rclone logged nothing; check `journalctl --user -u ".to_string() + &m.unit_name() + "`"
+            format!("rclone logged nothing; check `journalctl --user -u {unit}`")
         } else {
             out
         }
@@ -518,16 +637,15 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// Wait for the unit to stop occupying its name. `StopUnit` only enqueues a job, so
     /// the name is still taken when it returns, and a remount straight after would collide
     /// with it.
-    async fn await_unit_gone(&self, m: &Mount, timeout: Duration) -> Result<(), SupervisorError> {
+    async fn await_unit_gone(&self, unit: &str, timeout: Duration) -> Result<(), SupervisorError> {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            match self.units.status(&m.unit_name()).await? {
+            match self.units.status(unit).await? {
                 UnitStatus::Inactive | UnitStatus::Failed => return Ok(()),
                 _ if std::time::Instant::now() >= deadline => {
                     return Err(SupervisorError::Supervision {
                         context: format!(
-                            "{} is still shutting down after {}s",
-                            m.unit_name(),
+                            "{unit} is still shutting down after {}s",
                             timeout.as_secs()
                         ),
                         source: None,
@@ -538,10 +656,10 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         }
     }
 
-    async fn await_gone(&self, m: &Mount, timeout: Duration) -> bool {
+    async fn await_gone(&self, point: &Path, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            if !mountinfo::is_mounted_at(&self.live_mounts(), &Self::resolved_point(m).await) {
+            if !mountinfo::is_mounted_at(&self.live_mounts(), point) {
                 return true;
             }
             if std::time::Instant::now() >= deadline {
@@ -574,17 +692,30 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                         // Still mounted, but on its way out. Waiting is what stops the
                         // remount colliding with the name systemd has not freed yet.
                         UnitStatus::Deactivating => {
-                            self.await_unit_gone(m, self.unit_gone_timeout).await?;
+                            self.await_unit_gone(&m.unit_name(), self.unit_gone_timeout)
+                                .await?;
                         }
                         UnitStatus::Failed => {}
                         UnitStatus::Inactive => {
                             // Something else is mounted there. Reporting success would tell the
                             // user their configured cache mode, read-only flag and rc socket were
                             // applied, when what is serving is a process we did not start.
-                            return Err(SupervisorError::NotManaged(format!(
-                                "{name}: {} is already mounted by something we did not start",
-                                point.display()
-                            )));
+                            return Err(SupervisorError::NotManaged(
+                                match self.orphan_at(&point).await? {
+                                    Some(o) => format!(
+                                        "{name}: {} is still served by {}, left over from a \
+                                         mount this config no longer names. Unmount {:?} first.",
+                                        point.display(),
+                                        o.unit,
+                                        o.name
+                                    ),
+                                    None => format!(
+                                        "{name}: {} is already mounted by something we did not \
+                                         start",
+                                        point.display()
+                                    ),
+                                },
+                            ));
                         }
                     }
                 }
@@ -604,7 +735,8 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // the name, so wait for it rather than reporting a failure the user cannot
             // act on. This is the ordinary remount gesture.
             if unit == UnitStatus::Deactivating {
-                self.await_unit_gone(m, self.unit_gone_timeout).await?;
+                self.await_unit_gone(&m.unit_name(), self.unit_gone_timeout)
+                    .await?;
             }
 
             // rclone binds with a bare listen and dies on EADDRINUSE rather than
@@ -647,20 +779,26 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
         force: bool,
     ) -> BoxFuture<'a, Result<(), SupervisorError>> {
         Box::pin(async move {
-            let m = self.mount_config(name)?;
             let lock = self.lock_for(name).await;
             let _guard = lock.lock().await;
+            // Not always the unit this name's own config entry would build: see
+            // `unmount_target`. Everything below acts on what came back.
+            let Target {
+                name,
+                unit,
+                point,
+                fs_spec,
+            } = self.unmount_target(name).await?;
 
-            let point = Self::resolved_point(m).await;
             let live = mountinfo::is_mounted_at(&self.live_mounts(), &point);
-            let unit = self.units.status(&m.unit_name()).await?;
+            let status = self.units.status(&unit).await?;
             // Anything but Inactive means a unit of ours exists — running, restarting, or
             // failed. Whether the mount point is currently serving is a separate question:
             // a unit can be looping without ever having mounted anything.
-            let ours = unit != UnitStatus::Inactive;
+            let ours = status != UnitStatus::Inactive;
 
             if live && !ours && !force {
-                return Err(SupervisorError::NotManaged(name.to_string()));
+                return Err(SupervisorError::NotManaged(name));
             }
             if !live && !ours {
                 return Ok(());
@@ -684,13 +822,13 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                     // `force` is the caller having confirmed with the user, so it overrides
                     // the mismatch as well as the ownership refusal — otherwise #18's
                     // "unmount anyway" cannot work on a foreign mount at all.
-                    if !force && e.source != m.fs_spec() {
+                    if !force && e.source != fs_spec {
                         return Err(SupervisorError::NotManaged(format!(
                             "{name}: {} is serving {}, not {} — refusing to unmount something \
                          this mount does not own",
                             point.display(),
                             e.source,
-                            m.fs_spec()
+                            fs_spec
                         )));
                     }
                 }
@@ -712,7 +850,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                             // detach itself because this is the decision; by then it has
                             // already happened.
                             tracing::warn!(
-                                mount = name,
+                                mount = %name,
                                 path = %point.display(),
                                 error = %e,
                                 "forced unmount over a refusal to release: anything writing \
@@ -731,16 +869,16 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 // `StopUnit` only enqueues a job, so the unit reaches `failed` — on a
                 // non-zero exit or a stop timeout — after this returns. Clearing before it
                 // settles clears nothing.
-                self.units.stop(&m.unit_name()).await?;
+                self.units.stop(&unit).await?;
                 // The wait is not only for rclone to exit: a holder that lets go inside it
                 // is the difference between the escalation below succeeding and refusing.
-                if !live || self.await_gone(m, self.gone_timeout).await {
+                if !live || self.await_gone(&point, self.gone_timeout).await {
                     // Either nothing was mounted — the path for a unit restart-looping
                     // without ever serving — or the point is released. The name is not
                     // free until systemd finishes the job, and a remount immediately
                     // after would collide.
-                    self.await_unit_gone(m, self.unit_gone_timeout).await?;
-                    return self.units.reset_failed(&m.unit_name()).await;
+                    self.await_unit_gone(&unit, self.unit_gone_timeout).await?;
+                    return self.units.reset_failed(&unit).await;
                 }
             }
 
@@ -760,11 +898,11 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                     self.release_point(&point, Release::Detach).await?;
                 }
             }
-            if self.await_gone(m, Duration::from_secs(10)).await {
+            if self.await_gone(&point, Duration::from_secs(10)).await {
                 // Reaching here means the stop timed out, which is what leaves the unit
                 // `failed`. Without this the mount the user just successfully unmounted
                 // reports as failed on the next poll.
-                return self.units.reset_failed(&m.unit_name()).await;
+                return self.units.reset_failed(&unit).await;
             }
             Err(SupervisorError::Busy {
                 detail: format!(
@@ -779,8 +917,18 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
     fn state<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<MountState, SupervisorError>> {
         Box::pin(async move {
-            let m = self.mount_config(name)?;
-            self.resolve(m).await
+            match self.mount_config(name) {
+                Ok(m) => self.resolve(m).await,
+                // `reconcile` reports orphans, so whatever is listing them has to be
+                // able to poll them too.
+                Err(unknown) => {
+                    if self.orphans().await?.iter().any(|o| o.name == name) {
+                        Ok(MountState::Orphaned)
+                    } else {
+                        Err(unknown)
+                    }
+                }
+            }
         })
     }
 
@@ -795,12 +943,19 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
             // Canonicalised, exactly as `resolve` compares them: matching the raw path
             // would list a mount under a symlinked directory twice.
-            let mut configured: Vec<PathBuf> = Vec::with_capacity(self.config.mounts.len());
+            let mut claimed: Vec<PathBuf> = Vec::with_capacity(self.config.mounts.len());
             for m in &self.config.mounts {
-                configured.push(Self::resolved_point(m).await);
+                claimed.push(Self::resolved_point(m).await);
+            }
+            // Ours, under a name the config dropped. Reported before the sweep below and
+            // counted as claimed, or the same mount point would appear twice: once as
+            // somebody else's, once as ours.
+            for o in self.orphans().await? {
+                claimed.push(o.point);
+                out.push(DiscoveredMount::new(o.name, MountState::Orphaned));
             }
             for e in live.iter().filter(|e| e.is_rclone()) {
-                if configured.contains(&e.mount_point) {
+                if claimed.contains(&e.mount_point) {
                     continue;
                 }
                 out.push(DiscoveredMount::new(foreign_name(e), MountState::Foreign));
@@ -889,9 +1044,20 @@ fn foreign_name(e: &MountEntry) -> String {
     e.mount_point.to_string_lossy().into_owned()
 }
 
+/// The mount name a unit of ours was started for.
+///
+/// `Config::validate` restricts names to the characters a unit name accepts, so for
+/// anything that reached systemd this inverts [`Mount::unit_name`] exactly. `None` for a
+/// name that does not fit the pattern, which is then not one of ours to act on.
+fn orphan_name(unit: &str) -> Option<String> {
+    let name = unit.strip_prefix(UNIT_PREFIX)?.strip_suffix(".service")?;
+    (!name.is_empty()).then(|| name.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::systemd::{LoadedUnit, Serving};
     use rvt_core::config::CacheMode;
     use rvt_testutil::Scratch;
     use std::sync::Mutex;
@@ -900,6 +1066,10 @@ mod tests {
     #[derive(Default)]
     struct FakeUnits {
         status: Mutex<UnitStatus>,
+        /// Units systemd would report as loaded, each answering for its own name. What
+        /// `status` reports covers every other name, which keeps the tests that only
+        /// ever have one unit as they were.
+        loaded: Mutex<Vec<LoadedUnit>>,
         started: Mutex<Vec<UnitSpec>>,
         stopped: Mutex<Vec<String>>,
         reset: Mutex<Vec<String>>,
@@ -932,15 +1102,38 @@ mod tests {
                 if let Some(p) = self.clears_on_stop.lock().unwrap().as_ref() {
                     std::fs::write(p, mountinfo_with(&[])).unwrap();
                 }
-                *self.status.lock().unwrap() = UnitStatus::Inactive;
+                let mut loaded = self.loaded.lock().unwrap();
+                match loaded.iter_mut().find(|u| u.name == unit) {
+                    Some(u) => u.status = UnitStatus::Inactive,
+                    None => *self.status.lock().unwrap() = UnitStatus::Inactive,
+                }
                 Ok(())
             })
         }
         fn status<'a>(
             &'a self,
-            _unit: &'a str,
+            unit: &'a str,
         ) -> BoxFuture<'a, Result<UnitStatus, SupervisorError>> {
-            Box::pin(async move { Ok(*self.status.lock().unwrap()) })
+            Box::pin(async move {
+                let loaded = self.loaded.lock().unwrap();
+                Ok(match loaded.iter().find(|u| u.name == unit) {
+                    Some(u) => u.status,
+                    None => *self.status.lock().unwrap(),
+                })
+            })
+        }
+        fn list_units<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> BoxFuture<'a, Result<Vec<LoadedUnit>, SupervisorError>> {
+            Box::pin(async move {
+                let loaded = self.loaded.lock().unwrap();
+                Ok(loaded
+                    .iter()
+                    .filter(|u| u.name.starts_with(prefix))
+                    .cloned()
+                    .collect())
+            })
         }
         fn reset_failed<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>> {
             Box::pin(async move {
@@ -977,10 +1170,11 @@ mod tests {
         scratch.write(format!("{name}.mountinfo"), contents)
     }
 
-    fn config_with_backup(mount_point: PathBuf) -> Arc<Config> {
-        let mut c = Config::default();
-        c.mounts.push(Mount {
-            name: "backup".into(),
+    /// Serves `backup:pictures`, which is what [`mountinfo_with`] writes as the source,
+    /// so the check that a mount point is serving what its config says survives.
+    fn a_mount(name: &str, mount_point: PathBuf) -> Mount {
+        Mount {
+            name: name.into(),
             remote: "backup".into(),
             path: "pictures".into(),
             mount_point,
@@ -994,7 +1188,12 @@ mod tests {
             gid: None,
             umask: None,
             extra_args: Vec::new(),
-        });
+        }
+    }
+
+    fn config_with_backup(mount_point: PathBuf) -> Arc<Config> {
+        let mut c = Config::default();
+        c.mounts.push(a_mount("backup", mount_point));
         Arc::new(c)
     }
 
@@ -1886,6 +2085,190 @@ mod tests {
         match s.state("nope").await {
             Err(SupervisorError::UnknownMount(n)) => assert_eq!(n, "nope"),
             other => panic!("expected UnknownMount, got {other:?}"),
+        }
+    }
+
+    /// `backup` has been renamed to `backups` in the config and the service restarted.
+    /// The old unit is still up and still serving the same point; nothing answers to the
+    /// new name. #71.
+    fn renamed(tag: &str) -> (Scratch, SystemdSupervisor<FakeUnits>) {
+        let scratch = Scratch::new(tag);
+        let mp = mount_point(&scratch);
+        let mp_str = mp.to_string_lossy().into_owned();
+
+        let events: Arc<Mutex<Vec<String>>> = Arc::default();
+        let busy: Arc<Mutex<std::collections::HashSet<PathBuf>>> = Arc::default();
+        let units = FakeUnits {
+            events: events.clone(),
+            busy: busy.clone(),
+            ..Default::default()
+        };
+        // Nothing under the new name — every unit but the one below reads Inactive.
+        *units.status.lock().unwrap() = UnitStatus::Inactive;
+        units.loaded.lock().unwrap().push(LoadedUnit {
+            name: "rvt-mount-backup.service".into(),
+            status: UnitStatus::Active,
+            serving: Some(Serving {
+                fs_spec: "backup:pictures".into(),
+                mount_point: mp.clone(),
+            }),
+        });
+
+        let mut config = Config::default();
+        config.mounts.push(a_mount("backups", mp.clone()));
+
+        let sup = SystemdSupervisor::new(
+            Arc::new(config),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            scratch.join("run"),
+            PathBuf::from("/nonexistent/config.toml"),
+        )
+        .with_test_overrides(
+            fixture(&scratch, tag, &mountinfo_with(&[&mp_str])),
+            Duration::from_millis(300),
+        )
+        .with_events(events)
+        .with_busy(busy);
+        (scratch, sup)
+    }
+
+    #[tokio::test]
+    async fn a_renamed_mount_does_not_read_as_somebody_elses() {
+        let (_sc, s) = renamed("rename-state");
+        match s.state("backups").await.unwrap() {
+            MountState::Failed { reason } => assert!(
+                reason.contains("rvt-mount-backup.service"),
+                "the reason has to name the unit in the way: {reason}"
+            ),
+            other => panic!("a mount of ours must not read as Foreign, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_unit_a_rename_left_behind_is_reported_as_ours() {
+        let (_sc, s) = renamed("rename-reconcile");
+        let found = s.reconcile().await.unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        let orphan = found
+            .iter()
+            .find(|m| m.name == "backup")
+            .unwrap_or_else(|| panic!("the old unit must be listed: {found:?}"));
+        assert_eq!(orphan.state, MountState::Orphaned);
+        assert!(
+            !found.iter().any(|m| m.state == MountState::Foreign),
+            "the point is held by a unit of ours: listing it as foreign too would put \
+             the same mount in the list twice, under two owners: {found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_orphan_can_be_polled_under_the_name_its_unit_runs_as() {
+        let (_sc, s) = renamed("rename-poll");
+        assert_eq!(s.state("backup").await.unwrap(), MountState::Orphaned);
+    }
+
+    #[tokio::test]
+    async fn unmounting_an_orphan_stops_its_unit() {
+        let (_sc, s) = renamed("rename-unmount-orphan");
+        releasing(&s);
+        s.unmount("backup", false)
+            .await
+            .expect("an orphan is ours to stop");
+        assert_eq!(
+            s.units.stopped.lock().unwrap().as_slice(),
+            &["rvt-mount-backup.service".to_string()]
+        );
+    }
+
+    /// The damage in #71: `backups` read as foreign, so an unmount refused without
+    /// `force` and, with it, released the mount point and left the unit running — where
+    /// systemd's `Restart=on-failure` would bring rclone back onto a path it no longer
+    /// serves.
+    #[tokio::test]
+    async fn unmounting_under_the_new_name_stops_the_unit_holding_the_point() {
+        let (sc, s) = renamed("rename-unmount-new");
+        releasing(&s);
+        s.unmount("backups", false)
+            .await
+            .expect("the point is held by a unit of ours, so no force is needed");
+        assert_eq!(
+            s.units.stopped.lock().unwrap().as_slice(),
+            &["rvt-mount-backup.service".to_string()],
+            "releasing the point without stopping the unit strands rclone"
+        );
+        assert_eq!(
+            s.events.lock().unwrap().as_slice(),
+            &[
+                format!("Refuse {}", mount_point(&sc).display()),
+                "stop rvt-mount-backup.service".to_string(),
+            ],
+            "an orphan comes down the same way any mount of ours does: kernel first"
+        );
+    }
+
+    #[tokio::test]
+    async fn mounting_over_an_orphan_names_the_unit_in_the_way() {
+        let (_sc, s) = renamed("rename-mount");
+        match s.mount("backups").await {
+            Err(SupervisorError::NotManaged(msg)) => assert!(
+                msg.contains("rvt-mount-backup.service"),
+                "the user cannot act on a refusal that does not say what is there: {msg}"
+            ),
+            other => panic!("expected a refusal naming the orphan, got {other:?}"),
+        }
+    }
+
+    /// Both cases where a unit of ours is loaded but there is nothing to act on: it is
+    /// serving nothing, or its argv does not say what it serves. Reporting either as a
+    /// mount would put a row in the list that no action fits.
+    #[tokio::test]
+    async fn a_loaded_unit_serving_nothing_is_not_an_orphan() {
+        let (_sc, s) = renamed("rename-idle");
+        s.units.loaded.lock().unwrap().extend([
+            LoadedUnit {
+                name: "rvt-mount-gone.service".into(),
+                status: UnitStatus::Failed,
+                serving: Some(Serving {
+                    fs_spec: "backup:gone".into(),
+                    mount_point: PathBuf::from("/tmp/never-mounted"),
+                }),
+            },
+            LoadedUnit {
+                name: "rvt-mount-opaque.service".into(),
+                status: UnitStatus::Active,
+                serving: None,
+            },
+        ]);
+        let found = s.reconcile().await.unwrap();
+        assert!(
+            !found.iter().any(|m| m.name == "gone" || m.name == "opaque"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_unit_name_maps_back_to_the_mount_it_was_started_for() {
+        assert_eq!(
+            orphan_name("rvt-mount-backup.service").as_deref(),
+            Some("backup")
+        );
+        // Round trip, since this is what addresses the unit afterwards.
+        assert_eq!(
+            a_mount("my.mount_1-a", PathBuf::from("/mnt")).unit_name(),
+            "rvt-mount-my.mount_1-a.service"
+        );
+        assert_eq!(
+            orphan_name("rvt-mount-my.mount_1-a.service").as_deref(),
+            Some("my.mount_1-a")
+        );
+        for not_ours in [
+            "rclone-backup.service",
+            "rvt-mount-.service",
+            "rvt-mount-backup.mount",
+            "rvt-mount-backup",
+        ] {
+            assert_eq!(orphan_name(not_ours), None, "{not_ours}");
         }
     }
 }

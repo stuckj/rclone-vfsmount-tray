@@ -218,6 +218,27 @@ different file, or none.
 The cost is a dependency on systemd for supervision. Acceptable — the service is already a
 systemd user unit, and the target is Linux desktops.
 
+### The unit prefix is what makes a mount ours
+
+Every unit this service starts is named `rvt-mount-<mount>.service`, and ownership is
+decided from that name: a mount point the kernel lists with no unit of ours behind it
+belongs to somebody else, and is adopted for display but never acted on.
+
+Building that name from the config entry is not enough on its own, because the config
+changes under running mounts. Rename `backup` to `backups` and `rvt-mount-backup.service`
+is still up and still serving the same path while the name now asked about does not exist —
+so the mount reads as *foreign*, an unmount refuses, and forcing one releases the point and
+leaves the unit for systemd to restart onto a path it no longer serves (#71).
+
+The prefix is therefore swept as well as constructed. `ListUnitsByPatterns("rvt-mount-*")`
+lists every unit of ours systemd still holds; one that no config entry names and that is
+still serving is **orphaned** — ours, distinct from foreign, and stoppable. What it serves
+comes from its own `ExecStart` argv, the only place the unit-to-mount-point mapping
+survives a config edit, and a unit whose argv cannot be read is left alone rather than
+guessed at. An orphan then comes down exactly as any mount of ours does, kernel first and
+`StopUnit` second, whether it is addressed by the name its unit runs under or reached
+through the configured mount whose point it is holding.
+
 `MountSupervisor` in `rvt-core` exists so this stays reversible. Everything above the trait
 is written against the interface, and the trait is deliberately **dyn-compatible** — its
 methods return boxed futures rather than `impl Future` — so the implementation can be chosen
@@ -445,7 +466,8 @@ severed and detaching costs a mount-table entry — hence `Release::Refuse` and
 
 Detaching is gated on ownership too: a held **foreign** mount refuses even under `force`,
 since its rclone was never signalled and `-z` would strand it serving a mount nothing can
-see. The settle wait after the stop keeps its full length, because a holder letting go
+see. An orphan is not foreign for this purpose — its unit is stopped like any other of
+ours, so the escalation is reachable. The settle wait after the stop keeps its full length, because a holder letting go
 inside it is the difference between a clean release and having to detach.
 
 `fusermount3` is now required to unmount any live mount. rclone is a static binary that

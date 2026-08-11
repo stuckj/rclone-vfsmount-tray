@@ -303,8 +303,13 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     ///
     /// The sweep `UNIT_PREFIX` promises: without it a renamed mount leaves its old unit
     /// running and unaccounted for, and the mount point it holds reads as somebody
-    /// else's. Units that are loaded but not serving are skipped — a failed one holds a
-    /// name no config entry wants, and blocks nothing.
+    /// else's.
+    ///
+    /// A unit with nothing at its mount point is skipped whatever state it is in — one
+    /// that failed without ever mounting holds a name no config entry wants and blocks
+    /// nothing. A unit the kernel still lists a mount for is reported even if it has
+    /// failed, because that point has to be released and only its own unit releases it
+    /// cleanly.
     async fn orphans(&self) -> Result<Vec<Target>, SupervisorError> {
         let loaded = self.units.list_units(UNIT_PREFIX).await?;
         let configured: std::collections::HashSet<String> =
@@ -345,8 +350,9 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// Usually the one the configured mount names. It can also be an orphan: addressed
     /// directly, under the name its unit was started with, or reached through a
     /// configured mount whose point that orphan is the one still holding — what a rename
-    /// leaves behind. Both have to stop the unit. Releasing the path instead leaves
-    /// rclone running with nothing to serve, and systemd restarting it.
+    /// leaves behind. Both have to stop the unit: taken for foreign instead, the mount
+    /// cannot be unmounted without `force`, and `force` cannot escalate past a holder,
+    /// because [`Release::Detach`] is gated on the mount being ours.
     async fn unmount_target(&self, name: &str) -> Result<Target, SupervisorError> {
         let Ok(m) = self.mount_config(name) else {
             return self
@@ -679,6 +685,20 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
             let point = Self::resolved_point(m).await;
             if mountinfo::is_mounted_at(&self.live_mounts(), &point) {
+                // A unit of ours under a name the config has dropped. Taking its point —
+                // by releasing it, or by mounting across it — would leave that unit
+                // running against a path it no longer owns. Asked before staleness,
+                // because a stale point is precisely what an orphan whose rclone was
+                // killed leaves behind, and the release below does not ask who owns it.
+                if let Some(o) = self.orphan_at(&point).await? {
+                    return Err(SupervisorError::NotManaged(format!(
+                        "{name}: {} is still held by {}, left over from a mount this config \
+                         no longer names. Unmount {:?} first.",
+                        point.display(),
+                        o.unit,
+                        o.name
+                    )));
+                }
                 // A mount point the kernel still lists but nothing is serving. Left
                 // alone it blocks every future attempt, since rclone cannot mount over
                 // it — so clear it rather than reporting success onto a dead mount.
@@ -700,22 +720,10 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                             // Something else is mounted there. Reporting success would tell the
                             // user their configured cache mode, read-only flag and rc socket were
                             // applied, when what is serving is a process we did not start.
-                            return Err(SupervisorError::NotManaged(
-                                match self.orphan_at(&point).await? {
-                                    Some(o) => format!(
-                                        "{name}: {} is still served by {}, left over from a \
-                                         mount this config no longer names. Unmount {:?} first.",
-                                        point.display(),
-                                        o.unit,
-                                        o.name
-                                    ),
-                                    None => format!(
-                                        "{name}: {} is already mounted by something we did not \
-                                         start",
-                                        point.display()
-                                    ),
-                                },
-                            ));
+                            return Err(SupervisorError::NotManaged(format!(
+                                "{name}: {} is already mounted by something we did not start",
+                                point.display()
+                            )));
                         }
                     }
                 }
@@ -783,12 +791,29 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             let _guard = lock.lock().await;
             // Not always the unit this name's own config entry would build: see
             // `unmount_target`. Everything below acts on what came back.
+            let target = self.unmount_target(name).await?;
+
+            // A redirect acts on a unit the caller's own lock does not guard, and after a
+            // rename two names reach the same one — the configured entry and the orphan.
+            // Without this, both run the release-stop-clear sequence at once. Redirects
+            // only ever run configured name to orphan name, never the reverse, so holding
+            // the two in this order cannot cycle.
+            let redirect_lock = if target.name != name {
+                Some(self.lock_for(&target.name).await)
+            } else {
+                None
+            };
+            let _redirect_guard = match redirect_lock.as_ref() {
+                Some(l) => Some(l.lock().await),
+                None => None,
+            };
+
             let Target {
                 name,
                 unit,
                 point,
                 fs_spec,
-            } = self.unmount_target(name).await?;
+            } = target;
 
             let live = mountinfo::is_mounted_at(&self.live_mounts(), &point);
             let status = self.units.status(&unit).await?;
@@ -2181,10 +2206,9 @@ mod tests {
         );
     }
 
-    /// The damage in #71: `backups` read as foreign, so an unmount refused without
-    /// `force` and, with it, released the mount point and left the unit running — where
-    /// systemd's `Restart=on-failure` would bring rclone back onto a path it no longer
-    /// serves.
+    /// The damage in #71: `backups` read as foreign, so unmounting the user's own mount
+    /// refused unless they forced it, and the force released the mount point without ever
+    /// stopping the unit that owned it.
     #[tokio::test]
     async fn unmounting_under_the_new_name_stops_the_unit_holding_the_point() {
         let (sc, s) = renamed("rename-unmount-new");
@@ -2204,6 +2228,78 @@ mod tests {
                 "stop rvt-mount-backup.service".to_string(),
             ],
             "an orphan comes down the same way any mount of ours does: kernel first"
+        );
+    }
+
+    /// The costly half of reading a mount of ours as foreign. `Release::Detach` is gated
+    /// on ownership, so a *busy* orphan could not be brought down at all: the kernel
+    /// refuses `-u` while a holder has it, and `force` had nothing left to escalate to.
+    #[tokio::test]
+    async fn forcing_a_busy_orphan_reaches_the_same_escalation_as_any_mount_of_ours() {
+        let (sc, s) = renamed("rename-force-busy");
+        let point = mount_point(&sc);
+        hold_open(&s, &point);
+
+        s.unmount("backups", true)
+            .await
+            .expect("force must bring down a busy mount of ours, orphan or not");
+
+        let events = s.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                format!("Refuse {}", point.display()),
+                "stop rvt-mount-backup.service".to_string(),
+                format!("Refuse {}", point.display()),
+                format!("Detach {}", point.display()),
+            ],
+            "the unit must be stopped before the detach, exactly as for a configured mount"
+        );
+    }
+
+    /// The stale branch of `mount` releases a mount point without asking who owns it, and
+    /// an orphan whose rclone was killed is exactly a stale point with a unit behind it.
+    #[tokio::test]
+    async fn mounting_over_a_stale_orphan_does_not_release_its_point() {
+        let (sc, s) = renamed("rename-stale");
+        let point = mount_point(&sc);
+        let s = s.with_stale(&[&point]);
+
+        match s.mount("backups").await {
+            Err(SupervisorError::NotManaged(msg)) => assert!(
+                msg.contains("rvt-mount-backup.service"),
+                "the refusal has to name the unit holding it: {msg}"
+            ),
+            other => panic!("expected a refusal naming the orphan, got {other:?}"),
+        }
+        let events = s.events.lock().unwrap().clone();
+        assert!(
+            events.is_empty(),
+            "a point one of our units owns must not be released out from under it: {events:?}"
+        );
+        assert!(s.units.started.lock().unwrap().is_empty());
+    }
+
+    /// After a rename two names reach one unit, so the caller's own lock no longer guards
+    /// what is being stopped.
+    #[tokio::test]
+    async fn a_redirected_unmount_waits_for_the_lock_on_the_unit_it_stops() {
+        let (_sc, s) = renamed("rename-lock");
+        releasing(&s);
+        // Held by whoever is already unmounting the orphan under its own name.
+        let held = s.lock_for("backup").await;
+        let _guard = held.lock().await;
+
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(300), s.unmount("backups", false)).await;
+        assert!(
+            blocked.is_err(),
+            "the redirect ran anyway, so both callers can drive the stop at once"
+        );
+        let stopped = s.units.stopped.lock().unwrap().clone();
+        assert!(
+            stopped.is_empty(),
+            "nothing may be stopped while blocked: {stopped:?}"
         );
     }
 

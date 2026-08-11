@@ -226,9 +226,19 @@ belongs to somebody else, and is adopted for display but never acted on.
 
 Building that name from the config entry is not enough on its own, because the config
 changes under running mounts. Rename `backup` to `backups` and `rvt-mount-backup.service`
-is still up and still serving the same path while the name now asked about does not exist —
-so the mount reads as *foreign*, an unmount refuses, and forcing one releases the point and
-leaves the unit for systemd to restart onto a path it no longer serves (#71).
+is still up and still serving the same path while the name now asked about does not exist,
+so the mount reads as *foreign* — and everything ownership gates then works against the
+user (#71). An unmount refuses; `mount` reports the path as somebody else's; and because
+`Release::Detach` is gated on ownership, `force` on a **busy** mount of theirs dead-ends in
+`Busy` rather than stopping the unit and escalating, which is the one case where forcing
+was the whole point.
+
+Releasing the point without stopping the unit is not, in itself, the disaster it looks
+like. Measured on rclone v1.75.0 and Linux 6.8, against a transient unit carrying the
+properties this service sets: `fusermount3 -u` on a live mount makes rclone exit **0**, so
+`Restart=on-failure` never fires, the unit settles `inactive`/`success` with `NRestarts=0`,
+and systemd collects it. No stray unit is left. The damage is the refusals above, not a
+resurrected rclone.
 
 The prefix is therefore swept as well as constructed. `ListUnitsByPatterns("rvt-mount-*")`
 lists every unit of ours systemd still holds; one that no config entry names and that is
@@ -467,8 +477,9 @@ severed and detaching costs a mount-table entry — hence `Release::Refuse` and
 Detaching is gated on ownership too: a held **foreign** mount refuses even under `force`,
 since its rclone was never signalled and `-z` would strand it serving a mount nothing can
 see. An orphan is not foreign for this purpose — its unit is stopped like any other of
-ours, so the escalation is reachable. The settle wait after the stop keeps its full length, because a holder letting go
-inside it is the difference between a clean release and having to detach.
+ours, so the escalation is reachable. The settle wait after the stop keeps its full length,
+because a holder letting go inside it is the difference between a clean release and having
+to detach.
 
 `fusermount3` is now required to unmount any live mount. rclone is a static binary that
 execs it to mount anyway, so this adds no dependency.

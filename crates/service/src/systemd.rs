@@ -191,17 +191,44 @@ pub mod dbus {
 
         /// What a unit mounts, read back from the argv systemd holds for it.
         ///
-        /// `None` rather than an error throughout: this only ever adds detail to a unit
-        /// already listed, and a unit whose argv is not one of ours is not something to
-        /// fail a sweep over.
+        /// `None` rather than an error: this only adds detail to a unit already listed,
+        /// and a unit whose argv is not one of ours is not something to fail a sweep
+        /// over. A failure to *read* it is different — the unit then goes unrecognised
+        /// and its mount reads as somebody else's, so it is logged rather than passed
+        /// over in the same silence.
         async fn serving(&self, unit: OwnedObjectPath) -> Option<Serving> {
-            let svc = ServiceProxy::builder(&self.conn)
-                .path(unit)
-                .ok()?
-                .build()
-                .await
-                .ok()?;
-            let exec = svc.exec_start().await.ok()?;
+            let name = unit.as_str().to_string();
+            // `CacheProperties::No`: the default caches lazily, which turns each read
+            // into a `PropertiesChanged` match rule plus a `GetAll` of every property on
+            // the interface — measured at ~12 kB against ~390 bytes for this one — for a
+            // proxy that is dropped at the end of this call.
+            let built = match ServiceProxy::builder(&self.conn).path(unit) {
+                Ok(b) => {
+                    b.cache_properties(zbus::proxy::CacheProperties::No)
+                        .build()
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            let svc = match built {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(unit = %name, error = %e, "cannot address this unit");
+                    return None;
+                }
+            };
+            let exec = match svc.exec_start().await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(
+                        unit = %name,
+                        error = %e,
+                        "cannot read this unit's ExecStart, so it cannot be matched to a \
+                         mount point; anything it is serving will read as unmanaged"
+                    );
+                    return None;
+                }
+            };
             let (_, argv, ..) = exec.first()?;
             // argv[0] is the binary, and `Mount::mount_args` puts the subcommand and its
             // two positional arguments immediately after it.

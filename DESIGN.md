@@ -211,7 +211,7 @@ that: a config `Config::validate` rejects stops the service, not the mount carry
 | **T1** | `core/stats` `transferring[]` | per-file names, sizes and progress | Richest, but **does not meet the bar**: it shows transfers that have *started*, so a total taken from it reads zero while gigabytes sit queued — wrong in the unsafe direction. |
 | **T2** | `vfs/queue` (per-fs) | queued items with sizes, and an in-flight flag | **The minimum bar.** |
 | **T3** | `vfs/stats` (per-fs) | counts, and the cache paths | Counts only. Does not meet the bar alone, but hands T4 its roots. |
-| **T4** | Cache directory scan | dirty items and their on-disk sizes | Meets the bar with no rc at all, and is the only tier that survives an unreachable or crashed rclone. |
+| **T4** | Cache directory scan | dirty items and their on-disk sizes | Meets the bar, and is the only tier that survives an unreachable or crashed rclone. Takes its cache roots from T3 today; finding them without rc is the rest of #22. |
 
 T4 is a first-class tier, not a fallback of last resort. Its honest limits: no per-file upload
 progress, no in-flight flag, and an aggregate rate that has to be derived by differencing, so

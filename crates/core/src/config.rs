@@ -325,8 +325,8 @@ impl Mount {
 const MAX_UMASK: u128 = 0o17777777777;
 
 /// The bits a [`Mount::umask`] spells: octal, with an optional leading `0` or `0o`. `None`
-/// if it is not octal, or is longer than the 42 digits this width holds — past that the
-/// distinction [`Config::validate`] draws between the two rules is not worth the arithmetic.
+/// if it is not octal, or overflows this width — which is wide enough that [`MAX_UMASK`] is
+/// what rejects anything a person would plausibly write.
 fn umask_bits(s: &str) -> Option<u128> {
     u128::from_str_radix(s.trim_start_matches("0o"), 8).ok()
 }
@@ -337,8 +337,24 @@ fn umask_bits(s: &str) -> Option<u128> {
 ///
 /// A value that is not octal goes through untouched. [`Config::validate`] rejects those,
 /// so one arriving here came from a `Mount` built in code.
-fn canonical_umask(s: &str) -> String {
+pub fn canonical_umask(s: &str) -> String {
     umask_bits(s).map_or_else(|| s.to_string(), |bits| format!("0{bits:o}"))
+}
+
+/// Whether rclone before 1.68.0 read this `umask` as a *different mask* from the one it
+/// now means — so re-spelling it changes the permissions of files in a mount already
+/// running against such a build.
+///
+/// Base 0 and base 8 agree on anything with a leading zero and on any single digit, so
+/// the spelling `config.example.toml` recommends never trips this.
+pub fn umask_changed_meaning(s: &str) -> bool {
+    let unsigned = s.strip_prefix('+').unwrap_or(s);
+    let read_base_0 = if unsigned.starts_with('0') {
+        umask_bits(s)
+    } else {
+        unsigned.parse::<u128>().ok()
+    };
+    read_base_0 != umask_bits(s)
 }
 
 /// Prefix for every unit this service starts. Also how [`crate::supervisor`] tells its
@@ -614,7 +630,7 @@ impl Config {
                     }
                     Some(bits) if bits > MAX_UMASK => {
                         return Err(ConfigError::Invalid(format!(
-                            "mount {n:?}: umask {u:?} is larger than {MAX_UMASK:o}, which \
+                            "mount {n:?}: umask {u:?} is larger than 0{MAX_UMASK:o}, which \
                              rclone 1.68.0 and later refuse"
                         )))
                     }
@@ -1101,6 +1117,25 @@ mod tests {
             assert!(
                 msg.contains(want),
                 "umask {spelling:?} rejected as {msg:?}, which does not say {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_umask_whose_mask_moved_is_worth_warning_about() {
+        // The warning exists because normalising changes a running mount's permissions.
+        // Firing it for the recommended spelling, which means the same either way, would
+        // teach everyone to ignore it.
+        for quiet in ["0022", "022", "0", "7", "0777", "0o22", "0o755"] {
+            assert!(
+                !umask_changed_meaning(quiet),
+                "umask {quiet:?} means the same on both, so it must not warn"
+            );
+        }
+        for loud in ["22", "12", "63", "755", "1000", "+22"] {
+            assert!(
+                umask_changed_meaning(loud),
+                "umask {loud:?} moved: rclone <1.68.0 read it as decimal"
             );
         }
     }

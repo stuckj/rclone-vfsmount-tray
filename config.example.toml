@@ -99,9 +99,12 @@ auto_mount = true
 #
 # Always octal, whatever rclone would make of it on its own. rclone before 1.68.0 read a
 # value with no leading zero as *decimal*, so "22" meant 0026 there and 0022 everywhere
-# since; this tool now sends the same octal to both. If you tuned a mask by trying values
-# against an older rclone, re-check it — "22" and "0022" were two different masks, and are
-# now one.
+# since; this tool now sends the same octal to both, and says so in the journal when it
+# changes what a mask meant. If you tuned one by trying values against an older rclone,
+# re-check it — "22" and "0022" were two different masks, and are now one.
+#
+# 017777777777 is the largest accepted, because rclone 1.68.0 and later refuse anything
+# above it and would not start the mount.
 # umask = "0022"
 
 # Anything else, passed to rclone verbatim. An escape hatch for flags this tool does not

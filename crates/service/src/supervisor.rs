@@ -857,6 +857,19 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // then never again.
             self.units.reset_failed(&m.unit_name()).await?;
 
+            if let Some(u) = &m.umask {
+                if rvt_core::config::umask_changed_meaning(u) {
+                    tracing::warn!(
+                        mount = %m.name,
+                        configured = %u,
+                        sent = %rvt_core::config::canonical_umask(u),
+                        "umask is now sent as octal; rclone before 1.68.0 read the \
+                         configured spelling as decimal, so permissions inside this mount \
+                         change — see config.example.toml"
+                    );
+                }
+            }
+
             let spec = UnitSpec {
                 name: m.unit_name(),
                 description: format!(

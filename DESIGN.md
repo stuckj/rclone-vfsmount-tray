@@ -602,16 +602,24 @@ Measured:
 | `umask = "22"` | 640 / 751 | 644 / 755 | other gains read |
 | `umask = "63"` | 600 / 700 | 604 / 714 | other gains read; group gains execute on directories |
 | `umask = "12"` | 662 / 763 | 664 / 765 | other **loses write**, gains read |
+| `umask = "755"` | 404 / 414 | 022 / 022 | group and other **gain write**; owner loses read |
 
-So it is not simply a loosening. `"63"` is the case to worry about: a mount someone made
-private by trying values until `stat` showed `600` becomes world-readable. And `"12"` moves in
-both directions at once, which can take write access away from a process that had it.
+So it is not simply a loosening, and the sizes are not small. `"63"` turns a mount someone
+made private by trying values until `stat` showed `600` into a world-readable one. `"12"`
+moves in both directions at once, so it can take write access away from a process that had
+it. `"755"` is the worst and the most likely, being a file *mode* written into a mask field:
+it goes from read-only-to-everyone to writable by group and other, with the owner losing read.
 
 Whether any of that is reachable by another user is `allow_other`'s question, not this one —
 without it the kernel refuses everyone else regardless of the mode. The mask is honoured as
 written either way, which is the field's documented meaning finally being applied; someone who
 arrived at their value by trial and error on an old rclone was reading the mask they could
 see rather than the one they wrote.
+
+Because the config file is not re-read for this, the supervisor logs a warning as it starts
+any mount whose spelling meant something different before 1.68.0. It is deliberately silent
+for a leading-zero value, which means the same on both — a warning that fires for the
+recommended config is one everybody learns to ignore.
 
 ## Security
 

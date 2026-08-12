@@ -72,9 +72,8 @@ pub struct Global {
     pub cache_dir: Option<PathBuf>,
     /// Unmount everything when the service stops.
     ///
-    /// **Off by default, deliberately.** The service restarts for reasons its user did
-    /// not choose — it crashes, and a system update restarts it — and neither may take a
-    /// filesystem with it (#54).
+    /// **Off by default, deliberately.** The service crashes, and it gets restarted, and
+    /// neither may take a filesystem with it (#54).
     pub unmount_on_service_stop: bool,
     pub poll: Poll,
     pub notifications: Notifications,

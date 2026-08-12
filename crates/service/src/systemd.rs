@@ -1,9 +1,9 @@
 //! Starting rclone as a transient systemd user unit.
 //!
 //! Mounts run as units rather than as children of this service, so they outlive it. That
-//! is the whole reason for the systemd dependency: the service restarts for reasons its
-//! user did not choose — it crashes, and a system update restarts it — and nobody expects
-//! either to unmount their filesystems. See DESIGN.md and #54.
+//! is the whole reason for the systemd dependency: the service crashes, and it gets
+//! restarted, and nobody expects either to unmount their filesystems. See DESIGN.md
+//! and #54.
 //!
 //! [`UnitManager`] exists so the supervisor can be tested without a session bus.
 

@@ -124,8 +124,8 @@ These are load-bearing. `DESIGN.md` has the reasoning; this is the short form.
 
 **Mounts belong to the service.** Nothing a client does — including exiting, crashing, or
 never starting — may unmount anything. Restarting the service must not unmount either: it
-crashes, and a system update restarts it. No unmounting from a `Drop` impl, and rclone must
-not live in the service's own cgroup.
+crashes, and it gets restarted. No unmounting from a `Drop` impl, and rclone must not live
+in the service's own cgroup.
 
 **`rvt-core`, the service, the tray and `rvt-testutil` link no system C libraries.** Only
 the GTK crate will, once it gains `gtk4`; today nothing does, so CI runs the whole

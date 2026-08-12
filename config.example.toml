@@ -24,8 +24,8 @@ version = 1
 # Unmount everything when the service stops.
 #
 # Off by default, and worth leaving off. Mounts are deliberately independent of the
-# service's lifetime: it crashes, and a system update restarts it, and neither should
-# pull your filesystems out from under whatever is using them. Unuploaded data is safe
+# service's lifetime: it crashes, and it gets restarted, and neither should pull your
+# filesystems out from under whatever is using them. Unuploaded data is safe
 # either way — rclone's cache is on disk and resumes — but a file being written when the
 # mount goes is truncated where it stood, and an unmount you did not ask for is
 # disruptive regardless.

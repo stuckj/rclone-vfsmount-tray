@@ -128,22 +128,33 @@ cannot walk — which is exactly the case the crate exists to survive.
 Someone who quits the tray to declutter their panel, or whose tray crashes, or who logs into
 a session where the tray never starts, must find every mount exactly as they left it.
 
-The rule extends to the service itself: **restarting the service does not unmount.** The
-service restarts for reasons its user did not choose — it crashes, or a system update
-restarts it, which `nixos-rebuild` does — and neither is a reason to lose a filesystem.
-This service is a young program that polls rclone, walks cache directories and talks
-D-Bus; tying whether your files are reachable to whether it has a bug is far too wide a
-blast radius for what it is.
+The rule extends to the service itself: **restarting the service does not unmount.** It
+crashes: this is a young program that polls rclone, walks cache directories and talks
+D-Bus, and tying whether a filesystem is reachable to whether it has a bug is far too wide
+a blast radius for what it is. It is also restarted by hand, and by whatever is managing
+it.
 
 Nor is an unmount free to take back. rclone exits on `SIGTERM` **without** flushing its
 write-back queue — measured, in [the unmount order](#the-unmount-order) — so an unmount at
 a moment the user did not choose can sever a write in flight. The cache is on disk and
 resumes, but the file that was mid-write does not un-truncate.
 
-Whether a `.deb` or `.rpm` upgrade restarts a systemd *user* service is **not
-established** — the Debian helpers manage system units, and restarting a running user unit
-across sessions is not something packaging normally does. Nothing above rests on it; it is
-recorded here so the question is not mistaken for settled. (#30 is where it gets measured.)
+**Whether a system update restarts this service is not established on any platform it
+ships to.** It is a `systemd --user` service, and that is the distinction every answer
+turns on:
+
+- `.deb` / `.rpm` — the Debian helpers manage *system* units. Restarting a running user
+  unit across sessions is not something packaging normally does. Unverified; #30.
+- NixOS — `nixos-rebuild switch` is long documented as **not** reliably restarting or
+  reloading systemd user services
+  ([nixpkgs#29146](https://github.com/NixOS/nixpkgs/issues/29146)), with
+  `systemctl --user daemon-reload` the usual advice.
+- Home Manager — `systemd.user.startServices = "sd-switch"` **does** restart changed user
+  units on switch, so under that install path an update can restart us. #34.
+
+So it depends on how the user installed, and none of the reasoning above rests on it. It
+is written down as a question rather than deleted, so the next person does not re-derive
+it from scratch.
 
 | Event | Mounts |
 |---|---|

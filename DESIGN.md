@@ -162,7 +162,7 @@ it from scratch.
 | Tray crashes or is `SIGKILL`ed | unaffected |
 | Tray never starts (headless, SSH) | unaffected — the service runs standalone |
 | GTK client opens and closes | unaffected |
-| Service restarts (system update, or by hand) | unaffected — reconciled and adopted on start |
+| Service restarts | unaffected — reconciled and adopted on start |
 | Service crashes | unaffected; adopted on restart |
 | rclone is upgraded | unaffected — each mount keeps serving from the binary it started with, and picks up the new one only when it is next mounted |
 | Service stopped explicitly | unaffected by default; unmounts only if `unmount_on_service_stop` is on |

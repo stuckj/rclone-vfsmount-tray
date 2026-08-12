@@ -312,6 +312,22 @@ impl Mount {
         a.extend(self.extra_args.iter().cloned());
         a
     }
+
+    /// The `umask` spelling this mount actually runs with.
+    ///
+    /// `extra_args` is appended after every composed flag and rclone takes the last
+    /// occurrence, so a `--umask` given there beats the field — and it is passed verbatim,
+    /// which makes it the spelling most likely to mean two things.
+    pub fn effective_umask(&self) -> Option<&str> {
+        let from_extra = self.extra_args.iter().enumerate().rev().find_map(|(i, a)| {
+            a.strip_prefix("--umask=").or_else(|| {
+                (a == "--umask")
+                    .then(|| self.extra_args.get(i + 1).map(String::as_str))
+                    .flatten()
+            })
+        });
+        from_extra.or(self.umask.as_deref())
+    }
 }
 
 /// Largest [`Mount::umask`] rclone will take: from 1.68.0 the flag parses as a *signed*
@@ -320,8 +336,9 @@ impl Mount {
 ///
 /// The ceiling is here rather than at the `0o777` that is all rclone can use, because
 /// every value between the two mounts fine on every supported version — masking `0666`
-/// and `0777` simply discards the extra bits. Refuse only what cannot work: a config this
-/// crate rejects stops the service outright. See DESIGN.md.
+/// and `0777` simply discards the extra bits. Refuse only what cannot work *on any
+/// supported rclone*: a config this crate rejects stops the service outright. See
+/// DESIGN.md.
 const MAX_UMASK: u128 = 0o17777777777;
 
 /// The bits a [`Mount::umask`] spells: octal, with an optional leading `0` or `0o`. `None`
@@ -341,17 +358,23 @@ fn umask_bits(s: &str) -> Option<u128> {
 /// octal. The flag's type changed mid-range and the two parsers disagree about every other
 /// spelling — see DESIGN.md, "`--umask` is two flags wearing one name".
 ///
-/// A value that is not octal goes through untouched. [`Config::validate`] rejects those,
-/// so one arriving here came from a `Mount` built in code.
+/// A value [`Config::validate`] would reject goes through untouched, rather than being
+/// re-spelled into something it never said — reachable only from a `Mount` built in code,
+/// since loading or saving a config validates it.
 fn canonical_umask(s: &str) -> String {
-    umask_bits(s).map_or_else(|| s.to_string(), |bits| format!("0{bits:o}"))
+    match umask_bits(s) {
+        Some(bits) if bits <= MAX_UMASK => format!("0{bits:o}"),
+        _ => s.to_string(),
+    }
 }
 
 /// The two masks an ambiguous `umask` spelling means — as rclone before 1.68.0 read it,
 /// and as every version reads it now — when they are not the same mask.
 ///
-/// `None` when the spelling says one thing to both, which is every value with a leading
-/// zero, so the form `config.example.toml` recommends is never ambiguous.
+/// `None` when the mask now reaching rclone is the one a pre-1.68.0 build read from that
+/// spelling, so there is nothing to tell anyone. That covers every leading-zero value,
+/// including `0o22` — which the old flag read as `0o22` and the new one refuses outright,
+/// so the two parsers do *not* agree about it, but the mask is unchanged either way.
 ///
 /// Both are given as effective masks, the low nine bits rclone keeps when it masks `0666`
 /// and `0777`. That is what makes them comparable — a difference above those bits reaches
@@ -1160,6 +1183,33 @@ mod tests {
                 "umask {loud:?} moved: rclone <1.68.0 read it as decimal"
             );
         }
+    }
+
+    #[test]
+    fn a_umask_in_extra_args_is_the_one_that_takes_effect() {
+        // extra_args lands after the composed flags and rclone takes the last occurrence,
+        // so a mount can be running a mask the `umask` field does not mention.
+        let mut m = a_mount("backup");
+        assert_eq!(m.effective_umask(), None);
+
+        m.umask = Some("0022".into());
+        assert_eq!(m.effective_umask(), Some("0022"));
+
+        m.extra_args = vec!["--umask".into(), "22".into()];
+        assert_eq!(m.effective_umask(), Some("22"), "extra_args wins");
+
+        m.extra_args = vec!["--umask=63".into()];
+        assert_eq!(
+            m.effective_umask(),
+            Some("63"),
+            "the =value form counts too"
+        );
+
+        m.extra_args = vec!["--umask".into(), "7".into(), "--umask".into(), "12".into()];
+        assert_eq!(m.effective_umask(), Some("12"), "the last occurrence wins");
+
+        m.extra_args = vec!["--transfers".into(), "8".into()];
+        assert_eq!(m.effective_umask(), Some("0022"), "back to the field");
     }
 
     #[test]

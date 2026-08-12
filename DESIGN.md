@@ -577,8 +577,9 @@ value that dies on half the range is refused for all of it. What the rule does r
 refusing `0o7777`, which works everywhere and merely wastes bits.
 
 That asymmetry is worth the care because an invalid config is not a local failure.
-`Config::load` fails, so the **service** exits at startup — no tray, no reconcile, no
-auto-mount — over one mount's typo. The mount units themselves survive it: their
+`Config::load` fails, so the **service** exits at startup — no reconcile, no auto-mount, and
+nothing for the tray to talk to — over one mount's typo. The mount units themselves survive
+it: their
 `ExecStartPre` is registered `ignore_errors`, so `prepare-mount` failing does not stop rclone.
 It leaves the preparation undone instead, which is its own problem — the stale socket and
 stale mount point that hook exists to clear are still there, and the next restart is the one
@@ -602,30 +603,40 @@ Measured:
 | `umask = "22"` | 640 / 751 | 644 / 755 | other gains read |
 | `umask = "63"` | 600 / 700 | 604 / 714 | other gains read; group gains execute on directories |
 | `umask = "12"` | 662 / 763 | 664 / 765 | other **loses write**, gains read |
-| `umask = "755"` | 404 / 414 | 022 / 022 | group and other **gain write**; owner loses read |
+| `umask = "755"` | 404 / 414 | 022 / 022 | reported unusable to everyone, owner included |
 
 It moves in both directions, and not by a little: `"12"` takes the reported write bit off
 other while adding read, and `"755"` — a file *mode* written into a mask field, which is the
 likeliest way to end up with a bare-digit value — reports everything in the mount as `022`,
 unusable to its owner on paper.
 
-**On paper is the whole of it. These bits are reported, not enforced.** FUSE checks a file's
-mode only when mounted with `default_permissions`; rclone exposes that as
-`--default-permissions`, leaves it off, and `mount_args` never passes it. Measured on 1.75.0:
+**Almost all of that is reported rather than enforced**, and the exception is narrow enough
+to name. FUSE checks a file's mode only when mounted with `default_permissions`; rclone
+exposes that as `--default-permissions`, leaves it off, and `mount_args` never passes it.
+Measured on 1.75.0:
 
 - `--umask 0777` gives a mount root of `d---------` and files of `----------`, and the owner
   reads and writes them normally.
 - `--uid 4242 --gid 4242 --umask 0077` reports `-rw------- 4242 4242`, and uid 1001 reads the
   contents in full.
-- Add `--default-permissions` to that same command and the read is refused. So the flag is
+- Add `--default-permissions` to that same command and the read is refused. So that flag is
   what would make the mode mean something, and it is not one we pass.
+- `access(2)` is not implemented either, so the kernel answers it "permitted": `[ -w f ]` is
+  **true** for a `----------` file in the mount, where the same mode on ext4 gives false.
 
-What the change really moves, then, is the mode every tool *reads* out of the mount — `ls`,
-`rsync -p`, `tar`, `cp -p`, a script testing `-w`, git's executable bit — and the modes copies
-made from the mount inherit. That is worth telling someone about; it is not an access-control
-change, and reading these rows as one would send a user hunting an exposure that cannot have
-happened. Who can reach the mount at all remains `allow_other`'s question, and with
-`allow_other` set the mode gates nothing either, for the same reason.
+**The exception is the execute bit on regular files**, which `fuse_permission()` checks
+whatever the mount options. `--file-perms 0777` runs a script in the mount; `--file-perms
+0666` refuses the same one. rclone's base for files is `0666` and this tool never composes
+`--file-perms`, so nothing in a mount it builds is executable and the mask cannot move that
+bit — unless `extra_args` supplies `--file-perms`, in which case it can, and that is a real
+permission change rather than a reported one.
+
+Otherwise what moves is the mode tools *read* out of the mount — `ls`, `rsync -p`, `tar`,
+`cp -p` — and, less obviously, **the mode of copies made from it**, which is enforced
+wherever they land: a nightly `rsync -a` out of a mount whose mask went `0o026` → `0o022`
+starts writing `0644` files onto a filesystem that does check. Who can reach the mount at all
+remains `allow_other`'s question, and with `allow_other` set the reported mode gates nothing
+either, for the same reason.
 
 Nothing rewrites the config, so an ambiguous spelling stays in the file and the question
 comes back at every mount. The supervisor therefore logs a warning as it starts any mount
@@ -633,9 +644,15 @@ whose spelling would have meant a different mask before 1.68.0, naming both — 
 and `now`, as effective masks, so that what it prints is always something that can be written
 straight back into the field.
 
-Two things it deliberately does not do. It is silent for a leading-zero value, which means
-the same to both parsers: a warning that fires for the config the example recommends is one
-everybody learns to ignore. And it is not gated on the version of rclone in hand, because
+It reads the mount's **effective** umask, not the field: `extra_args` comes last in the argv
+and rclone takes the last occurrence, so a `--umask` there is both the mask that runs and the
+one still passed verbatim.
+
+Two things it deliberately does not do. It is silent whenever the mask now reaching rclone is
+the one a pre-1.68.0 build read from that spelling — every leading-zero value, `0o22`
+included, even though that one the old flag accepted and the new one refuses outright. A
+warning that fires for the config the example recommends is one everybody learns to ignore.
+And it is not gated on the version of rclone in hand, because
 what it reports is a property of the *spelling* — that config is ambiguous whichever build
 reads it, and the remedy is the same either way. The cost is that someone who has only ever
 run 1.68.0 or later sees a warning about a mask that never moved for them; the two fields are

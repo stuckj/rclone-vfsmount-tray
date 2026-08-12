@@ -861,20 +861,20 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // which is true of the config whichever build reads it, and the advice is the
             // same either way. Naming the version that would disagree is left to the
             // fields, so a reader can tell whether it ever applied to them.
-            if let Some((before, now)) = m
-                .umask
-                .as_deref()
-                .and_then(rvt_core::config::umask_readings)
-            {
-                tracing::warn!(
-                    mount = %m.name,
-                    umask = %m.umask.as_deref().unwrap_or_default(),
-                    before_1_68 = %before,
-                    now = %now,
-                    "ambiguous umask: rclone before 1.68.0 read this spelling as a \
-                     different mask, so the modes reported inside the mount change if it \
-                     was last served by one — write it with a leading zero"
-                );
+            // `effective_umask`, not the field: a `--umask` in `extra_args` is passed
+            // verbatim and wins, so that is the spelling most able to mean two things.
+            if let Some(spelling) = m.effective_umask() {
+                if let Some((before, now)) = rvt_core::config::umask_readings(spelling) {
+                    tracing::warn!(
+                        mount = %m.name,
+                        umask = %spelling,
+                        before_1_68 = %before,
+                        now = %now,
+                        "ambiguous umask: rclone before 1.68.0 read this spelling as a \
+                         different mask, so the modes reported inside the mount change if \
+                         it was last served by one — write one of these two instead"
+                    );
+                }
             }
 
             let spec = UnitSpec {
@@ -1516,12 +1516,24 @@ mod tests {
     async fn starting_a_mount_logs_a_umask_whose_mask_moved() {
         // DESIGN.md and config.example.toml both promise this line. Without a test that
         // reads the log, deleting it leaves the suite green and the promise standing.
-        for (umask, expect) in [("22", true), ("0022", false)] {
-            let scratch = Scratch::new(&format!("umasklog-{umask}"));
+        // The third case is the one the field alone cannot see: extra_args comes last in
+        // the argv, so its `--umask` is the mask the mount actually runs with.
+        for (case, umask, extra, expect) in [
+            ("bare", "22", vec![], true),
+            ("zero", "0022", vec![], false),
+            (
+                "extra",
+                "0022",
+                vec!["--umask".to_string(), "22".to_string()],
+                true,
+            ),
+        ] {
+            let scratch = Scratch::new(&format!("umasklog-{case}"));
             let mp = mount_point(&scratch);
             let mut config = Config::default();
             let mut m = a_mount("backup", mp);
             m.umask = Some(umask.into());
+            m.extra_args = extra;
             config.mounts.push(m);
 
             let units = FakeUnits::default();
@@ -1553,7 +1565,7 @@ mod tests {
             assert_eq!(
                 text.contains("ambiguous umask"),
                 expect,
-                "umask {umask:?} logged: {text}"
+                "the {case} case logged: {text}"
             );
             if expect {
                 assert!(

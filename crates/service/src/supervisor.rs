@@ -857,17 +857,24 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // then never again.
             self.units.reset_failed(&m.unit_name()).await?;
 
-            if let Some(u) = &m.umask {
-                if rvt_core::config::umask_changed_meaning(u) {
-                    tracing::warn!(
-                        mount = %m.name,
-                        configured = %u,
-                        sent = %rvt_core::config::canonical_umask(u),
-                        "umask is now sent as octal; rclone before 1.68.0 read the \
-                         configured spelling as decimal, so permissions inside this mount \
-                         change — see config.example.toml"
-                    );
-                }
+            // Not gated on the rclone in hand: this says the *spelling* is ambiguous,
+            // which is true of the config whichever build reads it, and the advice is the
+            // same either way. Naming the version that would disagree is left to the
+            // fields, so a reader can tell whether it ever applied to them.
+            if let Some((before, now)) = m
+                .umask
+                .as_deref()
+                .and_then(rvt_core::config::umask_readings)
+            {
+                tracing::warn!(
+                    mount = %m.name,
+                    umask = %m.umask.as_deref().unwrap_or_default(),
+                    before_1_68 = %before,
+                    sent = %now,
+                    "ambiguous umask: rclone before 1.68.0 read this spelling as a \
+                     different mask, so permissions inside the mount change if it was \
+                     last served by one — write it with a leading zero"
+                );
             }
 
             let spec = UnitSpec {
@@ -1482,6 +1489,79 @@ mod tests {
             s.units.reset.lock().unwrap().as_slice(),
             &["rvt-mount-backup.service".to_string()]
         );
+    }
+
+    /// Collects whatever `tracing` writes while it is the thread's default subscriber.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn starting_a_mount_logs_a_umask_whose_mask_moved() {
+        // DESIGN.md and config.example.toml both promise this line. Without a test that
+        // reads the log, deleting it leaves the suite green and the promise standing.
+        for (umask, expect) in [("22", true), ("0022", false)] {
+            let scratch = Scratch::new(&format!("umasklog-{umask}"));
+            let mp = mount_point(&scratch);
+            let mut config = Config::default();
+            let mut m = a_mount("backup", mp);
+            m.umask = Some(umask.into());
+            config.mounts.push(m);
+
+            let units = FakeUnits::default();
+            *units.status.lock().unwrap() = UnitStatus::Inactive;
+            let s = SystemdSupervisor::new(
+                Arc::new(config),
+                PathBuf::from("/usr/bin/rclone"),
+                units,
+                scratch.join("run"),
+                PathBuf::from("/nonexistent/config.toml"),
+            )
+            .with_test_overrides(
+                fixture(&scratch, "umasklog", &mountinfo_with(&[])),
+                Duration::from_millis(50),
+            );
+
+            let log = Captured::default();
+            {
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(log.clone())
+                        .with_ansi(false)
+                        .finish(),
+                );
+                let _ = s.mount("backup").await;
+            }
+
+            let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                text.contains("ambiguous umask"),
+                expect,
+                "umask {umask:?} logged: {text}"
+            );
+            if expect {
+                assert!(
+                    text.contains("before_1_68=026") && text.contains("sent=022"),
+                    "the line must name both masks, got: {text}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

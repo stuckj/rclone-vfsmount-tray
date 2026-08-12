@@ -328,7 +328,13 @@ const MAX_UMASK: u128 = 0o17777777777;
 /// if it is not octal, or overflows this width — which is wide enough that [`MAX_UMASK`] is
 /// what rejects anything a person would plausibly write.
 fn umask_bits(s: &str) -> Option<u128> {
-    u128::from_str_radix(s.trim_start_matches("0o"), 8).ok()
+    match u128::from_str_radix(s.trim_start_matches("0o"), 8) {
+        Ok(bits) => Some(bits),
+        // Saturate, so that a wall of octal digits is reported as too large — which it is
+        // — rather than as not octal, which it plainly is not.
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => Some(u128::MAX),
+        Err(_) => None,
+    }
 }
 
 /// `--umask` in the one spelling every supported rclone reads the same way: leading-zero
@@ -337,24 +343,26 @@ fn umask_bits(s: &str) -> Option<u128> {
 ///
 /// A value that is not octal goes through untouched. [`Config::validate`] rejects those,
 /// so one arriving here came from a `Mount` built in code.
-pub fn canonical_umask(s: &str) -> String {
+fn canonical_umask(s: &str) -> String {
     umask_bits(s).map_or_else(|| s.to_string(), |bits| format!("0{bits:o}"))
 }
 
-/// Whether rclone before 1.68.0 read this `umask` as a *different mask* from the one it
-/// now means — so re-spelling it changes the permissions of files in a mount already
-/// running against such a build.
+/// The two masks an ambiguous `umask` spelling means — as rclone before 1.68.0 read it,
+/// and as every version reads it now — when they are not the same mask.
 ///
-/// Base 0 and base 8 agree on anything with a leading zero and on any single digit, so
-/// the spelling `config.example.toml` recommends never trips this.
-pub fn umask_changed_meaning(s: &str) -> bool {
+/// `None` when the spelling says one thing to both, which is every value with a leading
+/// zero, so the form `config.example.toml` recommends is never ambiguous. Only the low
+/// nine bits are compared, because rclone masks `0666` and `0777` and discards the rest:
+/// a difference above them reaches no file.
+pub fn umask_readings(s: &str) -> Option<(String, String)> {
+    let now = umask_bits(s)?;
     let unsigned = s.strip_prefix('+').unwrap_or(s);
-    let read_base_0 = if unsigned.starts_with('0') {
-        umask_bits(s)
+    let before = if unsigned.starts_with('0') {
+        now
     } else {
-        unsigned.parse::<u128>().ok()
+        unsigned.parse::<u128>().ok()?
     };
-    read_base_0 != umask_bits(s)
+    (before & 0o777 != now & 0o777).then(|| (format!("0{before:o}"), format!("0{now:o}")))
 }
 
 /// Prefix for every unit this service starts. Also how [`crate::supervisor`] tells its
@@ -1123,18 +1131,25 @@ mod tests {
 
     #[test]
     fn only_a_umask_whose_mask_moved_is_worth_warning_about() {
-        // The warning exists because normalising changes a running mount's permissions.
-        // Firing it for the recommended spelling, which means the same either way, would
-        // teach everyone to ignore it.
-        for quiet in ["0022", "022", "0", "7", "0777", "0o22", "0o755"] {
-            assert!(
-                !umask_changed_meaning(quiet),
-                "umask {quiet:?} means the same on both, so it must not warn"
+        // Firing for the recommended spelling, which means the same either way, would
+        // teach everyone to ignore the warning. `2160` is the other silent case: the two
+        // readings differ, but only above the nine bits that reach a file.
+        for quiet in ["0022", "022", "0", "7", "0777", "0o22", "0o755", "2160"] {
+            assert_eq!(
+                umask_readings(quiet),
+                None,
+                "umask {quiet:?} is the same mask either way, so it must not warn"
             );
         }
-        for loud in ["22", "12", "63", "755", "1000", "+22"] {
+        // Both readings, so the log line can name them: decimal 63 is 0o77.
+        assert_eq!(
+            umask_readings("63"),
+            Some(("077".into(), "063".into())),
+            "the warning has to say which mask it was and which it now is"
+        );
+        for loud in ["22", "12", "755", "1000", "+22"] {
             assert!(
-                umask_changed_meaning(loud),
+                umask_readings(loud).is_some(),
                 "umask {loud:?} moved: rclone <1.68.0 read it as decimal"
             );
         }

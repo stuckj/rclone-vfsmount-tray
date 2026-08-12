@@ -616,10 +616,17 @@ written either way, which is the field's documented meaning finally being applie
 arrived at their value by trial and error on an old rclone was reading the mask they could
 see rather than the one they wrote.
 
-Because the config file is not re-read for this, the supervisor logs a warning as it starts
-any mount whose spelling meant something different before 1.68.0. It is deliberately silent
-for a leading-zero value, which means the same on both — a warning that fires for the
-recommended config is one everybody learns to ignore.
+Nothing rewrites the config, so an ambiguous spelling stays in the file and the question
+comes back at every mount. The supervisor therefore logs a warning as it starts any mount
+whose spelling would have meant a different mask before 1.68.0, naming both — `before_1_68`
+and `sent` — so the reader can see what the mask was and restore it if they want it.
+
+Two things it deliberately does not do. It is silent for a leading-zero value, which means
+the same to both parsers: a warning that fires for the config the example recommends is one
+everybody learns to ignore. And it is not gated on the version of rclone in hand, because
+what it reports is a property of the *spelling* — true of that config whichever build reads
+it — and because the supervisor is handed a path, not a version. Which mask a given run
+actually used is what the two fields let the reader work out.
 
 ## Security
 

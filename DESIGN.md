@@ -540,6 +540,33 @@ pinned, since it needs a capture taken while a remote is refusing writes:
   four minutes, backing off to a 64 s delay and reaching `tries: 7`, left
   `diskCache.erroredFiles` at 0 throughout. `tries` is the only signal that a file is stuck.
 
+### `--umask` is two flags wearing one name
+
+Measured (#69) against the official `linux-amd64` builds on Linux 6.8, mounting `:memory:`
+so that no on-disk permission can stand in for the computed one. Modes are of a file and a
+directory created inside the mount:
+
+| rclone | how the flag parses | `--umask 0022` | `--umask 22` | `--umask 0o22` |
+|---|---|---|---|---|
+| 1.61.0 – **1.67.0** | pflag `int` → `ParseInt(s, 0, 64)` | 644 / 755 | **640 / 751** | 644 / 755 |
+| **1.68.0** – 1.75.0 | `vfscommon.FileMode` → `ParseInt(s, 8, 32)` | 644 / 755 | 644 / 755 | **mount fails** |
+
+1.67.0 is the last release of the first kind and 1.68.0 the first of the second, with no
+1.67.x between them. Every minor from 1.61 to 1.75 was checked for the flag's type, and both
+ends of each row for the modes.
+
+Base 0 is Go's own literal rule: a leading `0` is octal, bare digits are decimal, `0x` is
+hex. So `--umask 22` masks `0o26` on the old flag and `0o22` on the new one — a difference of
+group-write on every file in the mount, which nothing reports. `0o22` is worse in the other
+direction: accepted by the old flag, and on the new one a parse error that stops the mount.
+
+Hence `canonical_umask` in `rvt-core`, which re-spells whatever the config says as
+leading-zero octal — the one form both parsers take and agree on. **The version does not
+enter into it.** Feature detection is the rule here (see the capability ladder), and this is
+the same instinct applied where there is nothing to detect: an argv that is right for every
+supported version is still right when the binary is replaced between discovery and the next
+mount.
+
 ## Security
 
 rclone's own documentation is explicit that rc access is equivalent to shell access as the

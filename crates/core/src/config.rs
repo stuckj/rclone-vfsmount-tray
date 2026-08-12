@@ -205,12 +205,10 @@ pub struct Mount {
     pub uid: Option<u32>,
     #[serde(default)]
     pub gid: Option<u32>,
-    /// Octal, as a string, so `0022` survives a round trip.
-    ///
-    /// Passed to rclone's `--umask` verbatim. Older rclone registers that flag as an
-    /// integer and parses it base-10, so `"0022"` is read as decimal 22 there rather than
-    /// octal — see #69. Leaving this unset avoids the question entirely and is what the
-    /// example config does.
+    /// Octal, as a string, so `0022` survives a round trip. A leading `0` or `0o` is
+    /// optional — the value is re-spelled by [`canonical_umask`] before it reaches
+    /// rclone, so every spelling of the same bits means the same thing on every
+    /// supported version.
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -291,7 +289,7 @@ impl Mount {
         }
         if let Some(umask) = &self.umask {
             a.push("--umask".into());
-            a.push(umask.clone());
+            a.push(canonical_umask(umask));
         }
 
         // The rc socket is what every tier above T4 talks to, so it is not optional and
@@ -311,6 +309,26 @@ impl Mount {
         a.extend(self.extra_args.iter().cloned());
         a
     }
+}
+
+/// The bits a [`Mount::umask`] spells, in each form the config accepts: octal digits,
+/// with an optional leading `0`, or behind a `0o` prefix.
+fn umask_bits(s: &str) -> Option<u32> {
+    u32::from_str_radix(s.trim_start_matches("0o"), 8).ok()
+}
+
+/// `--umask` in the one spelling every supported rclone reads the same way.
+///
+/// Through 1.67.0 the flag is a pflag `int`, parsed by `strconv.ParseInt(s, 0, 64)`: base
+/// **0**, so a leading `0` means octal, bare digits mean decimal, and `0x` means hex. From
+/// 1.68.0 it is a `vfscommon.FileMode`, always base 8, and `0o` is a parse error that
+/// stops the mount before it starts. Leading-zero octal is the only spelling both accept
+/// *and* agree on, so that is what gets sent, whatever the user wrote.
+///
+/// A value that is not octal at all goes through untouched: [`Config::validate`] rejects
+/// those, so one arriving here came from a `Mount` built in code.
+pub fn canonical_umask(s: &str) -> String {
+    umask_bits(s).map_or_else(|| s.to_string(), |bits| format!("0{bits:o}"))
 }
 
 /// Prefix for every unit this service starts. Also how [`crate::supervisor`] tells its
@@ -578,7 +596,7 @@ impl Config {
                 )));
             }
             if let Some(u) = &m.umask {
-                if u32::from_str_radix(u.trim_start_matches("0o"), 8).is_err() {
+                if umask_bits(u).is_none() {
                     return Err(ConfigError::Invalid(format!(
                         "mount {n:?}: umask {u:?} is not octal"
                     )));
@@ -959,12 +977,61 @@ mod tests {
             "--allow-other",
             "--uid 1000",
             "--gid 1000",
-            "--umask 0022",
+            "--umask 022",
             "--vfs-cache-max-size 10G",
             "--vfs-cache-max-age 24h",
         ] {
             assert!(full.contains(present), "{present} missing from: {full}");
         }
+    }
+
+    /// The argv value for a `umask`, or `None` if the flag was not composed.
+    fn umask_arg(spelling: &str) -> Option<String> {
+        let mut m = a_mount("backup");
+        m.umask = Some(spelling.into());
+        let a = m.mount_args(Path::new("/run/s.sock"));
+        let i = a.iter().position(|x| x == "--umask")?;
+        a.get(i + 1).cloned()
+    }
+
+    #[test]
+    fn every_spelling_of_a_umask_reaches_rclone_as_the_same_octal() {
+        // rclone ≤1.67.0 parses this flag base-0 and ≥1.68.0 base-8, so a bare `22` is
+        // decimal there and octal here — two different masks from one config. Sending the
+        // leading-zero form is what removes the version from the question.
+        for spelling in ["22", "022", "0022", "00022", "0o22", "0o0022"] {
+            assert_eq!(
+                umask_arg(spelling).as_deref(),
+                Some("022"),
+                "umask {spelling:?} must reach rclone as 022"
+            );
+        }
+    }
+
+    #[test]
+    fn a_composed_umask_always_leads_with_a_zero() {
+        // Without the leading zero, rclone ≤1.67.0 reads the value as decimal. Four-digit
+        // masks are the case a fixed-width format silently gets wrong.
+        for spelling in ["0", "7", "077", "0777", "1000", "07777"] {
+            let arg = umask_arg(spelling).expect("--umask must be composed");
+            assert!(
+                arg.starts_with('0'),
+                "umask {spelling:?} composed as {arg:?}, which rclone <=1.67.0 reads base-10"
+            );
+            assert_eq!(
+                u32::from_str_radix(&arg, 8).ok(),
+                umask_bits(spelling),
+                "umask {spelling:?} composed as {arg:?}, which is a different mask"
+            );
+        }
+    }
+
+    #[test]
+    fn a_umask_that_is_not_octal_is_left_alone_for_validate_to_catch() {
+        assert_eq!(umask_arg("rwxr").as_deref(), Some("rwxr"));
+        let mut c = with(vec![mount("a", "/mnt/one")]);
+        c.mounts[0].umask = Some("rwxr".into());
+        assert!(c.validate().is_err(), "validate must reject it");
     }
 
     #[test]

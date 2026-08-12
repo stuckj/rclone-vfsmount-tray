@@ -205,13 +205,8 @@ pub struct Mount {
     pub uid: Option<u32>,
     #[serde(default)]
     pub gid: Option<u32>,
-    /// A file mode mask, octal, as a string so `0022` survives a round trip. A leading
-    /// `0` or `0o` is optional. Only the low nine bits do anything — rclone masks `0666`
-    /// and `0777` with it — and `017777777777` is the largest accepted, above which
-    /// rclone 1.68.0 and later refuse the flag outright.
-    ///
-    /// `canonical_umask` re-spells it before it reaches rclone, so every spelling of the
-    /// same bits means the same thing on every supported version.
+    /// A file mode mask, octal, as a string so `0022` survives a round trip. A leading `0`
+    /// or `0o` is optional; it is re-spelled before it reaches rclone. See DESIGN.md.
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -313,11 +308,8 @@ impl Mount {
         a
     }
 
-    /// The `umask` spelling this mount actually runs with.
-    ///
-    /// `extra_args` is appended after every composed flag and rclone takes the last
-    /// occurrence, so a `--umask` given there beats the field — and it is passed verbatim,
-    /// which makes it the spelling most likely to mean two things.
+    /// The `umask` spelling this mount runs with: `extra_args` comes last in the argv and
+    /// rclone takes the last occurrence, so a `--umask` there beats the field.
     pub fn effective_umask(&self) -> Option<&str> {
         let from_extra = self.extra_args.iter().enumerate().rev().find_map(|(i, a)| {
             a.strip_prefix("--umask=").or_else(|| {
@@ -330,37 +322,22 @@ impl Mount {
     }
 }
 
-/// Largest [`Mount::umask`] rclone will take: from 1.68.0 the flag parses as a *signed*
-/// 32-bit int, and a value past this is refused at flag-parse time, so the mount never
-/// starts.
-///
-/// The ceiling is here rather than at the `0o777` that is all rclone can use, because
-/// every value between the two mounts fine on every supported version — masking `0666`
-/// and `0777` simply discards the extra bits. Refuse only what cannot work *on any
-/// supported rclone*: a config this crate rejects stops the service outright. See
-/// DESIGN.md.
+/// Largest `umask` rclone will accept. See DESIGN.md, "`--umask` is two flags wearing one
+/// name", for why it is not the `0o777` that is all rclone can use.
 const MAX_UMASK: u128 = 0o17777777777;
 
-/// The bits a [`Mount::umask`] spells: octal, with an optional leading `0` or `0o`. `None`
-/// only if it is not octal at all, so [`MAX_UMASK`] is what rejects a value for being too
-/// large, however many digits it runs to.
+/// The bits a [`Mount::umask`] spells. Too many digits saturates rather than failing, so
+/// [`MAX_UMASK`] is what rejects an oversized value and `None` always means "not octal".
 fn umask_bits(s: &str) -> Option<u128> {
     match u128::from_str_radix(s.trim_start_matches("0o"), 8) {
         Ok(bits) => Some(bits),
-        // Saturate, so that a wall of octal digits is reported as too large — which it is
-        // — rather than as not octal, which it plainly is not.
         Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => Some(u128::MAX),
         Err(_) => None,
     }
 }
 
-/// `--umask` in the one spelling every supported rclone reads the same way: leading-zero
-/// octal. The flag's type changed mid-range and the two parsers disagree about every other
-/// spelling — see DESIGN.md, "`--umask` is two flags wearing one name".
-///
-/// A value [`Config::validate`] would reject goes through untouched, rather than being
-/// re-spelled into something it never said — reachable only from a `Mount` built in code,
-/// since loading or saving a config validates it.
+/// `--umask` as leading-zero octal, the one spelling every supported rclone reads alike.
+/// Anything [`Config::validate`] would reject passes through untouched. See DESIGN.md.
 fn canonical_umask(s: &str) -> String {
     match umask_bits(s) {
         Some(bits) if bits <= MAX_UMASK => format!("0{bits:o}"),
@@ -368,18 +345,8 @@ fn canonical_umask(s: &str) -> String {
     }
 }
 
-/// The two masks an ambiguous `umask` spelling means — as rclone before 1.68.0 read it,
-/// and as every version reads it now — when they are not the same mask.
-///
-/// `None` when the mask now reaching rclone is the one a pre-1.68.0 build read from that
-/// spelling, so there is nothing to tell anyone. That covers every leading-zero value,
-/// including `0o22` — which the old flag read as `0o22` and the new one refuses outright,
-/// so the two parsers do *not* agree about it, but the mask is unchanged either way.
-///
-/// Both are given as effective masks, the low nine bits rclone keeps when it masks `0666`
-/// and `0777`. That is what makes them comparable — a difference above those bits reaches
-/// no file — and it is what makes either safe to write back into the field, which a raw
-/// reading of a large value would not be.
+/// The effective masks an ambiguous `umask` means to rclone before 1.68.0 and to rclone
+/// now, when those differ. See DESIGN.md.
 pub fn umask_readings(s: &str) -> Option<(String, String)> {
     let now = umask_bits(s)? & 0o777;
     let unsigned = s.strip_prefix('+').unwrap_or(s);
@@ -1065,9 +1032,6 @@ mod tests {
 
     #[test]
     fn every_spelling_of_a_umask_reaches_rclone_as_the_same_octal() {
-        // rclone ≤1.67.0 parses this flag base-0 and ≥1.68.0 base-8, so a bare `22` is
-        // decimal there and octal here — two different masks from one config. Sending the
-        // leading-zero form is what removes the version from the question.
         for spelling in ["22", "022", "0022", "00022", "0o22", "0o0022"] {
             assert_eq!(
                 umask_arg(spelling).as_deref(),
@@ -1079,8 +1043,7 @@ mod tests {
 
     #[test]
     fn a_composed_umask_always_leads_with_a_zero() {
-        // Without the leading zero, rclone ≤1.67.0 reads the value as decimal. The last
-        // two are the widths a fixed-width format silently gets wrong.
+        // The last two are the widths a fixed-width format gets wrong.
         for (spelling, want) in [
             ("0", "00"),
             ("7", "07"),
@@ -1099,12 +1062,8 @@ mod tests {
 
     #[test]
     fn validate_accepts_every_spelling_a_config_can_already_hold() {
-        // The composing tests reach past validate, so without this nothing stops the two
-        // from drifting: a validate that demanded a leading zero would break every config
-        // saying `22` and leave them green.
-        // The last four are values rclone takes on every supported version. Refusing one
-        // would invalidate a working config, and an invalid config stops the service —
-        // no tray, no reconcile, no auto-mount — over one mount's typo.
+        // The composing tests reach past validate, so only this stops a tightening there
+        // from silently invalidating configs that already load.
         for spelling in [
             "0",
             "22",
@@ -1135,10 +1094,6 @@ mod tests {
             ("rwxr", "not octal"),
             ("", "not octal"),
             ("08", "not octal"),
-            // rclone ≥1.68.0 parses the flag as a *signed* 32-bit int, so one past that
-            // is refused at flag-parse time and the mount dies. 1.67.0 mounts it, and so
-            // did this validator — refused anyway, since which rclone will exec is not
-            // knowable here.
             ("20000000000", "larger than"),
             ("7777777777777777777777", "larger than"),
         ] {
@@ -1157,11 +1112,8 @@ mod tests {
 
     #[test]
     fn only_a_umask_whose_mask_moved_is_worth_warning_about() {
-        // Firing for the recommended spelling, which means the same either way, would
-        // teach everyone to ignore the warning. `2160` is the other silent case: the two
-        // readings differ, but only above the nine bits that reach a file.
-        // `+022` is the case that separates "leading zero" from "leading character": a
-        // sign in front of one is still octal to both parsers.
+        // `2160` differs only above the nine bits that reach a file; `+022` is the only
+        // spelling that separates a leading zero from a leading character.
         for quiet in [
             "0022", "022", "0", "7", "0777", "0o22", "0o755", "2160", "+022",
         ] {
@@ -1171,7 +1123,6 @@ mod tests {
                 "umask {quiet:?} is the same mask either way, so it must not warn"
             );
         }
-        // Both readings, so the log line can name them: decimal 63 is 0o77.
         assert_eq!(
             umask_readings("63"),
             Some(("077".into(), "063".into())),
@@ -1187,8 +1138,6 @@ mod tests {
 
     #[test]
     fn a_umask_in_extra_args_is_the_one_that_takes_effect() {
-        // extra_args lands after the composed flags and rclone takes the last occurrence,
-        // so a mount can be running a mask the `umask` field does not mention.
         let mut m = a_mount("backup");
         assert_eq!(m.effective_umask(), None);
 

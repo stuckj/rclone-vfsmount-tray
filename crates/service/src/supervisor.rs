@@ -857,12 +857,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // then never again.
             self.units.reset_failed(&m.unit_name()).await?;
 
-            // Not gated on the rclone in hand: this says the *spelling* is ambiguous,
-            // which is true of the config whichever build reads it, and the advice is the
-            // same either way. Naming the version that would disagree is left to the
-            // fields, so a reader can tell whether it ever applied to them.
-            // `effective_umask`, not the field: a `--umask` in `extra_args` is passed
-            // verbatim and wins, so that is the spelling most able to mean two things.
+            // Deliberately not gated on the rclone in hand — see DESIGN.md.
             if let Some(spelling) = m.effective_umask() {
                 if let Some((before, now)) = rvt_core::config::umask_readings(spelling) {
                     tracing::warn!(
@@ -1514,10 +1509,7 @@ mod tests {
 
     #[tokio::test]
     async fn starting_a_mount_logs_a_umask_whose_mask_moved() {
-        // DESIGN.md and config.example.toml both promise this line. Without a test that
-        // reads the log, deleting it leaves the suite green and the promise standing.
-        // The third case is the one the field alone cannot see: extra_args comes last in
-        // the argv, so its `--umask` is the mask the mount actually runs with.
+        // Reads the log rather than the predicate, so that deleting the line fails here.
         for (case, umask, extra, expect) in [
             ("bare", "22", vec![], true),
             ("zero", "0022", vec![], false),

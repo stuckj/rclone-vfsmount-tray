@@ -94,21 +94,13 @@ auto_mount = true
 # uid = 1000
 # gid = 1000
 
-# Masks the permissions of everything in the mount: files are 0666 and directories 0777
-# with these bits cleared, so "0022" gives 0644 and 0755. These modes are mostly what the
-# mount reports rather than what it enforces — that needs FUSE's default_permissions, which
-# rclone leaves off — but they are inherited by copies made out of the mount, where they do
-# apply. Use allow_other, not this, to decide who can reach the mount at all.
+# Masks permissions inside the mount: files are 0666 and directories 0777 with these bits
+# cleared, so "0022" gives 0644 and 0755. Reported rather than enforced — allow_other is
+# what decides who can reach a mount.
 #
-# Always octal, whatever rclone would make of it on its own. rclone before 1.68.0 read a
-# value with no leading zero as *decimal*, so "22" meant 0026 there and 0022 everywhere
-# since; this tool now sends the same octal to both. A value with no leading zero that you
-# tuned against an older rclone therefore reports different modes now — the journal names
-# the old mask and the new one as the mount starts, and the old one is what to write here
-# to keep what you had.
-#
-# 017777777777 is the largest accepted, because rclone 1.68.0 and later refuse anything
-# above it and would not start the mount.
+# Write it octal, with the leading zero. rclone before 1.68.0 read "22" as decimal, so a
+# value tuned against one of those means something else now; the journal says so as the
+# mount starts, and names the mask to write if you want the old modes back.
 # umask = "0022"
 
 # Anything else, passed to rclone verbatim. An escape hatch for flags this tool does not

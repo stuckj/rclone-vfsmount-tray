@@ -540,123 +540,29 @@ pinned, since it needs a capture taken while a remote is refusing writes:
   four minutes, backing off to a 64 s delay and reaching `tries: 7`, left
   `diskCache.erroredFiles` at 0 throughout. `tries` is the only signal that a file is stuck.
 
-### `--umask` is two flags wearing one name
+### `--umask` means different things to different rclones
 
-Measured (#69) against the official `linux-amd64` builds on Linux 6.8, mounting `:memory:`
-so that no on-disk permission can stand in for the computed one. Modes are of a file and a
-directory created inside the mount:
+rclone changed `--umask` from an integer flag to an octal one at 1.68.0, inside the range we
+support, and the two disagree about most spellings: a bare `22` is one mask on an older build
+and a different one on a newer, and a spelling one accepts can stop the other from mounting.
 
-| rclone | how the flag parses | `--umask 0022` | `--umask 22` | `--umask 0o22` |
-|---|---|---|---|---|
-| 1.61.0 – **1.67.0** | pflag `int` → `ParseInt(s, 0, 64)` | 644 / 755 | **640 / 751** | 644 / 755 |
-| **1.68.0** – 1.75.0 | `vfscommon.FileMode` → `ParseInt(s, 8, 32)` | 644 / 755 | 644 / 755 | **mount fails** |
+**Compose flags in the form every supported version reads alike, rather than branching on the
+version.** Feature detection is the rule elsewhere (see the capability ladder); this is the
+same instinct where there is nothing to detect, and it keeps the argv right even when the
+binary is replaced between discovery and the next mount. For `--umask` that form is
+leading-zero octal. `extra_args` stays verbatim, as everywhere.
 
-1.67.0 is the last release of the first kind and 1.68.0 the first of the second, with no
-1.67.x between them. Every minor from 1.61 to 1.75 was checked for the flag's type, and both
-ends of each row for the modes.
+Validation refuses a mask no supported rclone would accept, and deliberately nothing more.
+Tightening past that is not free: a config `Config::load` rejects stops the whole service,
+not the one mount carrying the typo.
 
-Base 0 is Go's own literal rule: a leading `0` is octal, bare digits are decimal, `0x` is
-hex. So `--umask 22` masks `0o026` on the old flag and `0o022` on the new one. The bit that
-moves is **other-read** — group-write is stripped either way — so the old flag's reading is
-the *tighter* of the two, and nothing reports the difference. `0o22` goes wrong in the other
-direction: accepted by the old flag, and on the new one a parse error that stops the mount.
+Normalising changes the modes an existing mount reports, so the supervisor warns when a
+configured spelling used to mean something else. Those modes are reported rather than
+enforced — FUSE checks them only under `default_permissions`, which rclone leaves off — so
+`allow_other`, not the mask, is what decides who can reach a mount.
 
-A third spelling still stops it. From 1.68.0 the flag is parsed as a **signed** 32-bit int,
-so a mask above `0o17777777777` is refused outright — `--umask 020000000000` fails to start
-on 1.68.0 and mounts happily on 1.67.0. `Config::validate` refuses those, rather than
-canonicalising a value into a flag rclone will throw out.
-
-The ceiling sits there and not at the `0o777` that is all rclone can *use*. Everything
-between the two mounts fine on every supported version, because masking `0666` and `0777`
-discards the extra bits — `--umask 07777` and `--umask 0777` produce identical modes.
-
-The rule is **refuse only what cannot work on a supported rclone**, and it is deliberately
-not "refuse nothing that works today": a mask above `i32::MAX` did load before, and still
-mounts on 1.67.0, but which rclone will exec is not knowable when the config is read, so a
-value that dies on half the range is refused for all of it. What the rule does rule out is
-refusing `0o7777`, which works everywhere and merely wastes bits.
-
-That asymmetry is worth the care because an invalid config is not a local failure.
-`Config::load` fails, so the **service** exits at startup — no reconcile, no auto-mount, and
-nothing for the tray to talk to — over one mount's typo. The mount units themselves survive
-it: their
-`ExecStartPre` is registered `ignore_errors`, so `prepare-mount` failing does not stop rclone.
-It leaves the preparation undone instead, which is its own problem — the stale socket and
-stale mount point that hook exists to clear are still there, and the next restart is the one
-that fails.
-
-Hence `canonical_umask` in `rvt-core`, which re-spells the `umask` **field** as leading-zero
-octal — the one form both parsers take and agree on. `extra_args` is exempt by design: it is
-the verbatim escape hatch, so `--umask` given that way still means whatever the running
-rclone thinks it means. **The version does not enter into it.** Feature detection is the rule
-here (see the capability ladder), and this is the same instinct applied where there is
-nothing to detect: an argv that is right for every supported version is still right when the
-binary is replaced between discovery and the next mount.
-
-One consequence is worth stating plainly, because it changes the permissions reported for
-files that already exist. A bare-digit umask on rclone ≤1.67.0 was being read as decimal, so
-normalising it changes the mask on the next remount, with no config edit and no prompt.
-Measured:
-
-| config | before, on ≤1.67.0 | after, on any version | what moves |
-|---|---|---|---|
-| `umask = "22"` | 640 / 751 | 644 / 755 | other gains read |
-| `umask = "63"` | 600 / 700 | 604 / 714 | other gains read; group gains execute on directories |
-| `umask = "12"` | 662 / 763 | 664 / 765 | other **loses write**, gains read |
-| `umask = "755"` | 404 / 414 | 022 / 022 | reported unusable to everyone, owner included |
-
-It moves in both directions, and not by a little: `"12"` takes the reported write bit off
-other while adding read, and `"755"` — a file *mode* written into a mask field, which is the
-likeliest way to end up with a bare-digit value — reports everything in the mount as `022`,
-unusable to its owner on paper.
-
-**Almost all of that is reported rather than enforced**, and the exception is narrow enough
-to name. FUSE checks a file's mode only when mounted with `default_permissions`; rclone
-exposes that as `--default-permissions`, leaves it off, and `mount_args` never passes it.
-Measured on 1.75.0:
-
-- `--umask 0777` gives a mount root of `d---------` and files of `----------`, and the owner
-  reads and writes them normally.
-- `--uid 4242 --gid 4242 --umask 0077` reports `-rw------- 4242 4242`, and uid 1001 reads the
-  contents in full.
-- Add `--default-permissions` to that same command and the read is refused. So that flag is
-  what would make the mode mean something, and it is not one we pass.
-- `access(2)` is not implemented either, so the kernel answers it "permitted": `[ -w f ]` is
-  **true** for a `----------` file in the mount, where the same mode on ext4 gives false.
-
-**The exception is the execute bit on regular files**, which `fuse_permission()` checks
-whatever the mount options. `--file-perms 0777` runs a script in the mount; `--file-perms
-0666` refuses the same one. rclone's base for files is `0666` and this tool never composes
-`--file-perms`, so nothing in a mount it builds is executable and the mask cannot move that
-bit — unless `extra_args` supplies `--file-perms`, in which case it can, and that is a real
-permission change rather than a reported one.
-
-Otherwise what moves is the mode tools *read* out of the mount — `ls`, `rsync -p`, `tar`,
-`cp -p` — and, less obviously, **the mode of copies made from it**, which is enforced
-wherever they land: a nightly `rsync -a` out of a mount whose mask went `0o026` → `0o022`
-starts writing `0644` files onto a filesystem that does check. Who can reach the mount at all
-remains `allow_other`'s question, and with `allow_other` set the reported mode gates nothing
-either, for the same reason.
-
-Nothing rewrites the config, so an ambiguous spelling stays in the file and the question
-comes back at every mount. The supervisor therefore logs a warning as it starts any mount
-whose spelling would have meant a different mask before 1.68.0, naming both — `before_1_68`
-and `now`, as effective masks, so that what it prints is always something that can be written
-straight back into the field.
-
-It reads the mount's **effective** umask, not the field: `extra_args` comes last in the argv
-and rclone takes the last occurrence, so a `--umask` there is both the mask that runs and the
-one still passed verbatim.
-
-Two things it deliberately does not do. It is silent whenever the mask now reaching rclone is
-the one a pre-1.68.0 build read from that spelling — every leading-zero value, `0o22`
-included, even though that one the old flag accepted and the new one refuses outright. A
-warning that fires for the config the example recommends is one everybody learns to ignore.
-And it is not gated on the version of rclone in hand, because
-what it reports is a property of the *spelling* — that config is ambiguous whichever build
-reads it, and the remedy is the same either way. The cost is that someone who has only ever
-run 1.68.0 or later sees a warning about a mask that never moved for them; the two fields are
-what let them work that out.
+The version boundary, the per-version modes, and how they were measured are recorded in #69
+and #92.
 
 ## Security
 

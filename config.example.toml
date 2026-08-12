@@ -93,6 +93,15 @@ auto_mount = true
 # allow_other = false      # needs user_allow_other in /etc/fuse.conf
 # uid = 1000
 # gid = 1000
+
+# Masks the permissions of everything in the mount: files are 0666 and directories 0777
+# with these bits cleared, so "0022" gives 0644 and 0755.
+#
+# Always octal, whatever rclone would make of it on its own. rclone before 1.68.0 read a
+# value with no leading zero as *decimal*, so "22" meant 0026 there and 0022 everywhere
+# since; this tool now sends the same octal to both. If you tuned a mask by trying values
+# against an older rclone, re-check it — "22" and "0022" were two different masks, and are
+# now one.
 # umask = "0022"
 
 # Anything else, passed to rclone verbatim. An escape hatch for flags this tool does not

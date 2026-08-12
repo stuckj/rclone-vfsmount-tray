@@ -207,7 +207,8 @@ pub struct Mount {
     pub gid: Option<u32>,
     /// A file mode mask, octal, as a string so `0022` survives a round trip. A leading
     /// `0` or `0o` is optional. Only the low nine bits do anything — rclone masks `0666`
-    /// and `0777` with it — but anything rclone accepts is accepted here.
+    /// and `0777` with it — and `017777777777` is the largest accepted, above which
+    /// rclone 1.68.0 and later refuse the flag outright.
     ///
     /// `canonical_umask` re-spells it before it reaches rclone, so every spelling of the
     /// same bits means the same thing on every supported version.
@@ -319,14 +320,13 @@ impl Mount {
 ///
 /// The ceiling is here rather than at the `0o777` that is all rclone can use, because
 /// every value between the two mounts fine on every supported version — masking `0666`
-/// and `0777` simply discards the extra bits. Refusing one would invalidate a config that
-/// works today, and a config this crate refuses stops the whole service, not one mount.
+/// and `0777` simply discards the extra bits. Refuse only what cannot work: a config this
+/// crate rejects stops the service outright. See DESIGN.md.
 const MAX_UMASK: u128 = 0o17777777777;
 
 /// The bits a [`Mount::umask`] spells: octal, with an optional leading `0` or `0o`. `None`
-/// only if it is not octal at all — the width is wide enough that [`MAX_UMASK`] is what
-/// rejects a large value, so [`Config::validate`] can say which of the two rules was
-/// broken.
+/// if it is not octal, or is longer than the 42 digits this width holds — past that the
+/// distinction [`Config::validate`] draws between the two rules is not worth the arithmetic.
 fn umask_bits(s: &str) -> Option<u128> {
     u128::from_str_radix(s.trim_start_matches("0o"), 8).ok()
 }
@@ -1048,13 +1048,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_every_spelling_the_umask_field_advertises() {
+    fn validate_accepts_every_spelling_a_config_can_already_hold() {
         // The composing tests reach past validate, so without this nothing stops the two
         // from drifting: a validate that demanded a leading zero would break every config
         // saying `22` and leave them green.
         // The last four are values rclone takes on every supported version. Refusing one
-        // would invalidate a working config, and an invalid config stops the service and
-        // every mount's ExecStartPre, not just the mount that carries it.
+        // would invalidate a working config, and an invalid config stops the service —
+        // no tray, no reconcile, no auto-mount — over one mount's typo.
         for spelling in [
             "0",
             "22",
@@ -1086,7 +1086,9 @@ mod tests {
             ("", "not octal"),
             ("08", "not octal"),
             // rclone ≥1.68.0 parses the flag as a *signed* 32-bit int, so one past that
-            // is refused at flag-parse time and the mount dies. 1.67.0 mounts it.
+            // is refused at flag-parse time and the mount dies. 1.67.0 mounts it, and so
+            // did this validator — refused anyway, since which rclone will exec is not
+            // knowable here.
             ("20000000000", "larger than"),
             ("7777777777777777777777", "larger than"),
         ] {

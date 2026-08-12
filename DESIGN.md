@@ -568,11 +568,21 @@ canonicalising a value into a flag rclone will throw out.
 
 The ceiling sits there and not at the `0o777` that is all rclone can *use*. Everything
 between the two mounts fine on every supported version, because masking `0666` and `0777`
-discards the extra bits — `--umask 07777` and `--umask 0777` produce identical modes. Refusing
-one would invalidate a config that works today, and an invalid config is not a local failure:
-`Config::load` fails, so the service exits at startup and every mount's `ExecStartPre` fails
-with it, including mounts that set no umask at all. Validation earns that blast radius only
-for values that cannot work.
+discards the extra bits — `--umask 07777` and `--umask 0777` produce identical modes.
+
+The rule is **refuse only what cannot work on a supported rclone**, and it is deliberately
+not "refuse nothing that works today": a mask above `i32::MAX` did load before, and still
+mounts on 1.67.0, but which rclone will exec is not knowable when the config is read, so a
+value that dies on half the range is refused for all of it. What the rule does rule out is
+refusing `0o7777`, which works everywhere and merely wastes bits.
+
+That asymmetry is worth the care because an invalid config is not a local failure.
+`Config::load` fails, so the **service** exits at startup — no tray, no reconcile, no
+auto-mount — over one mount's typo. The mount units themselves survive it: their
+`ExecStartPre` is registered `ignore_errors`, so `prepare-mount` failing does not stop rclone.
+It leaves the preparation undone instead, which is its own problem — the stale socket and
+stale mount point that hook exists to clear are still there, and the next restart is the one
+that fails.
 
 Hence `canonical_umask` in `rvt-core`, which re-spells the `umask` **field** as leading-zero
 octal — the one form both parsers take and agree on. `extra_args` is exempt by design: it is
@@ -590,7 +600,7 @@ Measured:
 | config | before, on ≤1.67.0 | after, on any version | what moves |
 |---|---|---|---|
 | `umask = "22"` | 640 / 751 | 644 / 755 | other gains read |
-| `umask = "63"` | 600 / 700 | 604 / 714 | other gains read and execute, group gains execute |
+| `umask = "63"` | 600 / 700 | 604 / 714 | other gains read; group gains execute on directories |
 | `umask = "12"` | 662 / 763 | 664 / 765 | other **loses write**, gains read |
 
 So it is not simply a loosening. `"63"` is the case to worry about: a mount someone made

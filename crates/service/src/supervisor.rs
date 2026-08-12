@@ -857,6 +857,21 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // then never again.
             self.units.reset_failed(&m.unit_name()).await?;
 
+            // Deliberately not gated on the rclone in hand — see DESIGN.md.
+            if let Some(spelling) = m.effective_umask() {
+                if let Some((before, now)) = rvt_core::config::umask_readings(spelling) {
+                    tracing::warn!(
+                        mount = %m.name,
+                        umask = %spelling,
+                        before_1_68 = %before,
+                        now = %now,
+                        "ambiguous umask: rclone before 1.68.0 read this spelling as a \
+                         different mask, so the modes reported inside the mount change if \
+                         it was last served by one — write one of these two instead"
+                    );
+                }
+            }
+
             let spec = UnitSpec {
                 name: m.unit_name(),
                 description: format!(
@@ -1469,6 +1484,88 @@ mod tests {
             s.units.reset.lock().unwrap().as_slice(),
             &["rvt-mount-backup.service".to_string()]
         );
+    }
+
+    /// Collects whatever `tracing` writes while it is the thread's default subscriber.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn starting_a_mount_logs_a_umask_whose_mask_moved() {
+        // Reads the log rather than the predicate, so that deleting the line fails here.
+        for (case, umask, extra, expect) in [
+            ("bare", "22", vec![], true),
+            ("zero", "0022", vec![], false),
+            (
+                "extra",
+                "0022",
+                vec!["--umask".to_string(), "22".to_string()],
+                true,
+            ),
+        ] {
+            let scratch = Scratch::new(&format!("umasklog-{case}"));
+            let mp = mount_point(&scratch);
+            let mut config = Config::default();
+            let mut m = a_mount("backup", mp);
+            m.umask = Some(umask.into());
+            m.extra_args = extra;
+            config.mounts.push(m);
+
+            let units = FakeUnits::default();
+            *units.status.lock().unwrap() = UnitStatus::Inactive;
+            let s = SystemdSupervisor::new(
+                Arc::new(config),
+                PathBuf::from("/usr/bin/rclone"),
+                units,
+                scratch.join("run"),
+                PathBuf::from("/nonexistent/config.toml"),
+            )
+            .with_test_overrides(
+                fixture(&scratch, "umasklog", &mountinfo_with(&[])),
+                Duration::from_millis(50),
+            );
+
+            let log = Captured::default();
+            {
+                let _guard = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .with_writer(log.clone())
+                        .with_ansi(false)
+                        .finish(),
+                );
+                let _ = s.mount("backup").await;
+            }
+
+            let text = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert_eq!(
+                text.contains("ambiguous umask"),
+                expect,
+                "the {case} case logged: {text}"
+            );
+            if expect {
+                assert!(
+                    text.contains("before_1_68=026") && text.contains("now=022"),
+                    "the line must name both masks, got: {text}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

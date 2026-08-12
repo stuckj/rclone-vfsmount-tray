@@ -93,6 +93,14 @@ auto_mount = true
 # allow_other = false      # needs user_allow_other in /etc/fuse.conf
 # uid = 1000
 # gid = 1000
+
+# Masks permissions inside the mount: files are 0666 and directories 0777 with these bits
+# cleared, so "0022" gives 0644 and 0755. Reported rather than enforced — allow_other is
+# what decides who can reach a mount.
+#
+# Write it octal, with the leading zero. rclone before 1.68.0 read "22" as decimal, so a
+# value tuned against one of those means something else now; the journal says so as the
+# mount starts, and names the mask to write if you want the old modes back.
 # umask = "0022"
 
 # Anything else, passed to rclone verbatim. An escape hatch for flags this tool does not

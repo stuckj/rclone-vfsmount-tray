@@ -301,6 +301,12 @@ How much can be said about pending uploads depends on what rclone will tell us, 
 Feature-detect with `rc/list`, which enumerates the commands a build actually registers —
 not by comparing version numbers, which only guesses.
 
+The same applies to composing flags. rclone has changed what a flag *means* inside the
+supported range — `--umask` did at 1.68.0 (#69) — so send the spelling every supported
+version reads alike, rather than branching on a version discovered at start-up that need not
+be the binary which ends up running. Refuse a value no supported version accepts, and nothing
+beyond that: a config `Config::validate` rejects stops the service, not the mount carrying it.
+
 | Tier | Source | Gives | Notes |
 |---|---|---|---|
 | **T1** | `core/stats` `transferring[]` | `{name, size}` always; `{bytes, percentage, speed, speedAvg, eta, group}` once rclone attaches accounting; `srcFs`/`dstFs` when a source/destination exists | Per-file progress bars. **Confirmed available** for VFS write-back uploads (#9). **Does not meet the bar**, despite being the most detailed tier: it shows transfers that have *started*, and lags `vfs/queue` by `--vfs-write-back`, so a total taken from it reads zero while gigabytes sit queued — wrong in the unsafe direction. Mixes directions — see below. Treat every field but `name` and `size` as optional. |

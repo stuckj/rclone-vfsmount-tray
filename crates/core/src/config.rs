@@ -205,12 +205,8 @@ pub struct Mount {
     pub uid: Option<u32>,
     #[serde(default)]
     pub gid: Option<u32>,
-    /// Octal, as a string, so `0022` survives a round trip.
-    ///
-    /// Passed to rclone's `--umask` verbatim. Older rclone registers that flag as an
-    /// integer and parses it base-10, so `"0022"` is read as decimal 22 there rather than
-    /// octal — see #69. Leaving this unset avoids the question entirely and is what the
-    /// example config does.
+    /// A file mode mask, octal, as a string so `0022` survives a round trip. A leading `0`
+    /// or `0o` is optional; it is re-spelled before it reaches rclone. See DESIGN.md.
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -291,7 +287,7 @@ impl Mount {
         }
         if let Some(umask) = &self.umask {
             a.push("--umask".into());
-            a.push(umask.clone());
+            a.push(canonical_umask(umask));
         }
 
         // The rc socket is what every tier above T4 talks to, so it is not optional and
@@ -311,6 +307,55 @@ impl Mount {
         a.extend(self.extra_args.iter().cloned());
         a
     }
+
+    /// The `umask` spelling this mount runs with: `extra_args` comes last in the argv and
+    /// rclone takes the last occurrence, so a `--umask` there beats the field.
+    pub fn effective_umask(&self) -> Option<&str> {
+        let from_extra = self.extra_args.iter().enumerate().rev().find_map(|(i, a)| {
+            a.strip_prefix("--umask=").or_else(|| {
+                (a == "--umask")
+                    .then(|| self.extra_args.get(i + 1).map(String::as_str))
+                    .flatten()
+            })
+        });
+        from_extra.or(self.umask.as_deref())
+    }
+}
+
+/// Largest `umask` rclone will accept. See DESIGN.md, "`--umask` is two flags wearing one
+/// name", for why it is not the `0o777` that is all rclone can use.
+const MAX_UMASK: u128 = 0o17777777777;
+
+/// The bits a [`Mount::umask`] spells. Too many digits saturates rather than failing, so
+/// [`MAX_UMASK`] is what rejects an oversized value and `None` always means "not octal".
+fn umask_bits(s: &str) -> Option<u128> {
+    match u128::from_str_radix(s.trim_start_matches("0o"), 8) {
+        Ok(bits) => Some(bits),
+        Err(e) if *e.kind() == std::num::IntErrorKind::PosOverflow => Some(u128::MAX),
+        Err(_) => None,
+    }
+}
+
+/// `--umask` as leading-zero octal, the one spelling every supported rclone reads alike.
+/// Anything [`Config::validate`] would reject passes through untouched. See DESIGN.md.
+fn canonical_umask(s: &str) -> String {
+    match umask_bits(s) {
+        Some(bits) if bits <= MAX_UMASK => format!("0{bits:o}"),
+        _ => s.to_string(),
+    }
+}
+
+/// The effective masks an ambiguous `umask` means to rclone before 1.68.0 and to rclone
+/// now, when those differ. See DESIGN.md.
+pub fn umask_readings(s: &str) -> Option<(String, String)> {
+    let now = umask_bits(s)? & 0o777;
+    let unsigned = s.strip_prefix('+').unwrap_or(s);
+    let before = if unsigned.starts_with('0') {
+        now
+    } else {
+        unsigned.parse::<u128>().ok()? & 0o777
+    };
+    (before != now).then(|| (format!("0{before:o}"), format!("0{now:o}")))
 }
 
 /// Prefix for every unit this service starts. Also how [`crate::supervisor`] tells its
@@ -578,10 +623,19 @@ impl Config {
                 )));
             }
             if let Some(u) = &m.umask {
-                if u32::from_str_radix(u.trim_start_matches("0o"), 8).is_err() {
-                    return Err(ConfigError::Invalid(format!(
-                        "mount {n:?}: umask {u:?} is not octal"
-                    )));
+                match umask_bits(u) {
+                    None => {
+                        return Err(ConfigError::Invalid(format!(
+                            "mount {n:?}: umask {u:?} is not octal"
+                        )))
+                    }
+                    Some(bits) if bits > MAX_UMASK => {
+                        return Err(ConfigError::Invalid(format!(
+                            "mount {n:?}: umask {u:?} is larger than 0{MAX_UMASK:o}, which \
+                             rclone 1.68.0 and later refuse"
+                        )))
+                    }
+                    Some(_) => {}
                 }
             }
         }
@@ -959,12 +1013,157 @@ mod tests {
             "--allow-other",
             "--uid 1000",
             "--gid 1000",
-            "--umask 0022",
+            "--umask 022",
             "--vfs-cache-max-size 10G",
             "--vfs-cache-max-age 24h",
         ] {
             assert!(full.contains(present), "{present} missing from: {full}");
         }
+    }
+
+    /// The argv value for a `umask`, or `None` if the flag was not composed.
+    fn umask_arg(spelling: &str) -> Option<String> {
+        let mut m = a_mount("backup");
+        m.umask = Some(spelling.into());
+        let a = m.mount_args(Path::new("/run/s.sock"));
+        let i = a.iter().position(|x| x == "--umask")?;
+        a.get(i + 1).cloned()
+    }
+
+    #[test]
+    fn every_spelling_of_a_umask_reaches_rclone_as_the_same_octal() {
+        for spelling in ["22", "022", "0022", "00022", "0o22", "0o0022"] {
+            assert_eq!(
+                umask_arg(spelling).as_deref(),
+                Some("022"),
+                "umask {spelling:?} must reach rclone as 022"
+            );
+        }
+    }
+
+    #[test]
+    fn a_composed_umask_always_leads_with_a_zero() {
+        // The last two are the widths a fixed-width format gets wrong.
+        for (spelling, want) in [
+            ("0", "00"),
+            ("7", "07"),
+            ("077", "077"),
+            ("0777", "0777"),
+            ("1000", "01000"),
+            ("07777", "07777"),
+        ] {
+            assert_eq!(
+                umask_arg(spelling).as_deref(),
+                Some(want),
+                "umask {spelling:?} must reach rclone as {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_every_spelling_a_config_can_already_hold() {
+        // The composing tests reach past validate, so only this stops a tightening there
+        // from silently invalidating configs that already load.
+        for spelling in [
+            "0",
+            "22",
+            "022",
+            "0022",
+            "0o22",
+            "777",
+            "0777",
+            "1000",
+            "07777",
+            "+22",
+            "017777777777",
+        ] {
+            let mut c = with(vec![mount("a", "/mnt/one")]);
+            c.mounts[0].umask = Some(spelling.into());
+            assert!(
+                c.validate().is_ok(),
+                "validate must accept umask {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_umask_rclone_would_refuse() {
+        // These go through `mount_args` untouched, so validate is the only thing between
+        // them and an rclone that will not start.
+        for (spelling, want) in [
+            ("rwxr", "not octal"),
+            ("", "not octal"),
+            ("08", "not octal"),
+            ("20000000000", "larger than"),
+            ("7777777777777777777777", "larger than"),
+        ] {
+            let mut c = with(vec![mount("a", "/mnt/one")]);
+            c.mounts[0].umask = Some(spelling.into());
+            let msg = match c.validate() {
+                Err(e) => e.to_string(),
+                Ok(()) => panic!("validate must reject umask {spelling:?}"),
+            };
+            assert!(
+                msg.contains(want),
+                "umask {spelling:?} rejected as {msg:?}, which does not say {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_umask_whose_mask_moved_is_worth_warning_about() {
+        // `2160` differs only above the nine bits that reach a file; `+022` is the only
+        // spelling that separates a leading zero from a leading character.
+        for quiet in [
+            "0022", "022", "0", "7", "0777", "0o22", "0o755", "2160", "+022",
+        ] {
+            assert_eq!(
+                umask_readings(quiet),
+                None,
+                "umask {quiet:?} is the same mask either way, so it must not warn"
+            );
+        }
+        assert_eq!(
+            umask_readings("63"),
+            Some(("077".into(), "063".into())),
+            "the warning has to say which mask it was and which it now is"
+        );
+        for loud in ["22", "12", "755", "1000", "+22"] {
+            assert!(
+                umask_readings(loud).is_some(),
+                "umask {loud:?} moved: rclone <1.68.0 read it as decimal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_umask_in_extra_args_is_the_one_that_takes_effect() {
+        let mut m = a_mount("backup");
+        assert_eq!(m.effective_umask(), None);
+
+        m.umask = Some("0022".into());
+        assert_eq!(m.effective_umask(), Some("0022"));
+
+        m.extra_args = vec!["--umask".into(), "22".into()];
+        assert_eq!(m.effective_umask(), Some("22"), "extra_args wins");
+
+        m.extra_args = vec!["--umask=63".into()];
+        assert_eq!(
+            m.effective_umask(),
+            Some("63"),
+            "the =value form counts too"
+        );
+
+        m.extra_args = vec!["--umask".into(), "7".into(), "--umask".into(), "12".into()];
+        assert_eq!(m.effective_umask(), Some("12"), "the last occurrence wins");
+
+        m.extra_args = vec!["--transfers".into(), "8".into()];
+        assert_eq!(m.effective_umask(), Some("0022"), "back to the field");
+    }
+
+    #[test]
+    fn a_umask_that_is_not_octal_is_left_alone_for_validate_to_catch() {
+        assert_eq!(umask_arg("rwxr").as_deref(), Some("rwxr"));
     }
 
     #[test]

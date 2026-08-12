@@ -563,9 +563,16 @@ direction: accepted by the old flag, and on the new one a parse error that stops
 
 A third spelling still stops it. From 1.68.0 the flag is parsed as a **signed** 32-bit int,
 so a mask above `0o17777777777` is refused outright — `--umask 020000000000` fails to start
-on 1.68.0 and mounts happily on 1.67.0. Nothing above `0o777` can mean anything, since rclone
-only ever masks `0666` and `0777` with it, so `Config::validate` rejects those rather than
+on 1.68.0 and mounts happily on 1.67.0. `Config::validate` refuses those, rather than
 canonicalising a value into a flag rclone will throw out.
+
+The ceiling sits there and not at the `0o777` that is all rclone can *use*. Everything
+between the two mounts fine on every supported version, because masking `0666` and `0777`
+discards the extra bits — `--umask 07777` and `--umask 0777` produce identical modes. Refusing
+one would invalidate a config that works today, and an invalid config is not a local failure:
+`Config::load` fails, so the service exits at startup and every mount's `ExecStartPre` fails
+with it, including mounts that set no umask at all. Validation earns that blast radius only
+for values that cannot work.
 
 Hence `canonical_umask` in `rvt-core`, which re-spells the `umask` **field** as leading-zero
 octal — the one form both parsers take and agree on. `extra_args` is exempt by design: it is
@@ -575,13 +582,26 @@ here (see the capability ladder), and this is the same instinct applied where th
 nothing to detect: an argv that is right for every supported version is still right when the
 binary is replaced between discovery and the next mount.
 
-One consequence is worth stating plainly, because it changes permissions on files that
-already exist. A config saying `umask = "22"` on rclone ≤1.67.0 was getting `0o026`, not the
-`0o022` it asked for. Once this normalisation is in, that mount's files are created `0644`
-where they used to be `0640`: **other-read is granted** on the next remount, with no config
-edit and no prompt. That is the field's documented meaning finally being honoured, but it is
-a loosening, and a user who arrived at `22` by trial and error on an old rclone got the
-stricter mask they could see rather than the one they wrote.
+One consequence is worth stating plainly, because it changes the permissions reported for
+files that already exist. A bare-digit umask on rclone ≤1.67.0 was being read as decimal, so
+normalising it changes the mask on the next remount, with no config edit and no prompt.
+Measured:
+
+| config | before, on ≤1.67.0 | after, on any version | what moves |
+|---|---|---|---|
+| `umask = "22"` | 640 / 751 | 644 / 755 | other gains read |
+| `umask = "63"` | 600 / 700 | 604 / 714 | other gains read and execute, group gains execute |
+| `umask = "12"` | 662 / 763 | 664 / 765 | other **loses write**, gains read |
+
+So it is not simply a loosening. `"63"` is the case to worry about: a mount someone made
+private by trying values until `stat` showed `600` becomes world-readable. And `"12"` moves in
+both directions at once, which can take write access away from a process that had it.
+
+Whether any of that is reachable by another user is `allow_other`'s question, not this one —
+without it the kernel refuses everyone else regardless of the mode. The mask is honoured as
+written either way, which is the field's documented meaning finally being applied; someone who
+arrived at their value by trial and error on an old rclone was reading the mask they could
+see rather than the one they wrote.
 
 ## Security
 

@@ -206,10 +206,11 @@ pub struct Mount {
     #[serde(default)]
     pub gid: Option<u32>,
     /// A file mode mask, octal, as a string so `0022` survives a round trip. A leading
-    /// `0` or `0o` is optional, and `0777` is the largest accepted.
+    /// `0` or `0o` is optional. Only the low nine bits do anything — rclone masks `0666`
+    /// and `0777` with it — but anything rclone accepts is accepted here.
     ///
-    /// [`canonical_umask`] re-spells it before it reaches rclone, so every spelling of
-    /// the same bits means the same thing on every supported version.
+    /// `canonical_umask` re-spells it before it reaches rclone, so every spelling of the
+    /// same bits means the same thing on every supported version.
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -312,20 +313,22 @@ impl Mount {
     }
 }
 
-/// Largest [`Mount::umask`] that means anything: rclone masks `0666` and `0777` with it,
-/// so every bit above these is discarded, and a value carrying them is a mistake rather
-/// than a stricter mask.
-const MAX_UMASK: u64 = 0o777;
+/// Largest [`Mount::umask`] rclone will take: from 1.68.0 the flag parses as a *signed*
+/// 32-bit int, and a value past this is refused at flag-parse time, so the mount never
+/// starts.
+///
+/// The ceiling is here rather than at the `0o777` that is all rclone can use, because
+/// every value between the two mounts fine on every supported version — masking `0666`
+/// and `0777` simply discards the extra bits. Refusing one would invalidate a config that
+/// works today, and a config this crate refuses stops the whole service, not one mount.
+const MAX_UMASK: u128 = 0o17777777777;
 
-/// The bits a [`Mount::umask`] spells: octal digits, optionally behind one `0o`. `None`
-/// if it is not octal at all — the [`MAX_UMASK`] range is [`Config::validate`]'s to check,
-/// so that it can say which of the two is wrong.
-fn umask_bits(s: &str) -> Option<u64> {
-    let digits = s.strip_prefix("0o").unwrap_or(s);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    u64::from_str_radix(digits, 8).ok()
+/// The bits a [`Mount::umask`] spells: octal, with an optional leading `0` or `0o`. `None`
+/// only if it is not octal at all — the width is wide enough that [`MAX_UMASK`] is what
+/// rejects a large value, so [`Config::validate`] can say which of the two rules was
+/// broken.
+fn umask_bits(s: &str) -> Option<u128> {
+    u128::from_str_radix(s.trim_start_matches("0o"), 8).ok()
 }
 
 /// `--umask` in the one spelling every supported rclone reads the same way: leading-zero
@@ -334,7 +337,7 @@ fn umask_bits(s: &str) -> Option<u64> {
 ///
 /// A value that is not octal goes through untouched. [`Config::validate`] rejects those,
 /// so one arriving here came from a `Mount` built in code.
-pub fn canonical_umask(s: &str) -> String {
+fn canonical_umask(s: &str) -> String {
     umask_bits(s).map_or_else(|| s.to_string(), |bits| format!("0{bits:o}"))
 }
 
@@ -609,13 +612,10 @@ impl Config {
                             "mount {n:?}: umask {u:?} is not octal"
                         )))
                     }
-                    // Above 0777 rclone ignores the extra bits but does not always accept
-                    // them: from 1.68.0 the flag parses as a signed 32-bit int, and a
-                    // value past that is refused at flag-parse time, so the mount never
-                    // starts. Refusing here says so while the config is being read.
                     Some(bits) if bits > MAX_UMASK => {
                         return Err(ConfigError::Invalid(format!(
-                            "mount {n:?}: umask {u:?} sets bits above {MAX_UMASK:04o}"
+                            "mount {n:?}: umask {u:?} is larger than {MAX_UMASK:o}, which \
+                             rclone 1.68.0 and later refuse"
                         )))
                     }
                     Some(_) => {}
@@ -1030,8 +1030,7 @@ mod tests {
     #[test]
     fn a_composed_umask_always_leads_with_a_zero() {
         // Without the leading zero, rclone ≤1.67.0 reads the value as decimal. The last
-        // pair is past what validate accepts and reachable only from a `Mount` built in
-        // code, but they are the widths a fixed-width format silently gets wrong.
+        // two are the widths a fixed-width format silently gets wrong.
         for (spelling, want) in [
             ("0", "00"),
             ("7", "07"),
@@ -1053,7 +1052,22 @@ mod tests {
         // The composing tests reach past validate, so without this nothing stops the two
         // from drifting: a validate that demanded a leading zero would break every config
         // saying `22` and leave them green.
-        for spelling in ["0", "22", "022", "0022", "0o22", "777", "0777"] {
+        // The last four are values rclone takes on every supported version. Refusing one
+        // would invalidate a working config, and an invalid config stops the service and
+        // every mount's ExecStartPre, not just the mount that carries it.
+        for spelling in [
+            "0",
+            "22",
+            "022",
+            "0022",
+            "0o22",
+            "777",
+            "0777",
+            "1000",
+            "07777",
+            "+22",
+            "017777777777",
+        ] {
             let mut c = with(vec![mount("a", "/mnt/one")]);
             c.mounts[0].umask = Some(spelling.into());
             assert!(
@@ -1064,20 +1078,17 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_umask_that_is_not_a_mode() {
-        // Both go through `mount_args` untouched, so validate is the only thing between
-        // them and an rclone that refuses to start.
+    fn validate_rejects_a_umask_rclone_would_refuse() {
+        // These go through `mount_args` untouched, so validate is the only thing between
+        // them and an rclone that will not start.
         for (spelling, want) in [
             ("rwxr", "not octal"),
             ("", "not octal"),
-            ("+22", "not octal"),
-            ("0o0o22", "not octal"),
             ("08", "not octal"),
-            // rclone ≥1.68.0 parses the flag as a signed 32-bit int, so this one is not
-            // merely meaningless — it is refused at flag-parse time and the mount dies.
-            ("20000000000", "above 0777"),
-            ("1000", "above 0777"),
-            ("07777", "above 0777"),
+            // rclone ≥1.68.0 parses the flag as a *signed* 32-bit int, so one past that
+            // is refused at flag-parse time and the mount dies. 1.67.0 mounts it.
+            ("20000000000", "larger than"),
+            ("7777777777777777777777", "larger than"),
         ] {
             let mut c = with(vec![mount("a", "/mnt/one")]);
             c.mounts[0].umask = Some(spelling.into());

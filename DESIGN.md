@@ -556,16 +556,32 @@ directory created inside the mount:
 ends of each row for the modes.
 
 Base 0 is Go's own literal rule: a leading `0` is octal, bare digits are decimal, `0x` is
-hex. So `--umask 22` masks `0o26` on the old flag and `0o22` on the new one — a difference of
-group-write on every file in the mount, which nothing reports. `0o22` is worse in the other
+hex. So `--umask 22` masks `0o026` on the old flag and `0o022` on the new one. The bit that
+moves is **other-read** — group-write is stripped either way — so the old flag's reading is
+the *tighter* of the two, and nothing reports the difference. `0o22` goes wrong in the other
 direction: accepted by the old flag, and on the new one a parse error that stops the mount.
 
-Hence `canonical_umask` in `rvt-core`, which re-spells whatever the config says as
-leading-zero octal — the one form both parsers take and agree on. **The version does not
-enter into it.** Feature detection is the rule here (see the capability ladder), and this is
-the same instinct applied where there is nothing to detect: an argv that is right for every
-supported version is still right when the binary is replaced between discovery and the next
-mount.
+A third spelling still stops it. From 1.68.0 the flag is parsed as a **signed** 32-bit int,
+so a mask above `0o17777777777` is refused outright — `--umask 020000000000` fails to start
+on 1.68.0 and mounts happily on 1.67.0. Nothing above `0o777` can mean anything, since rclone
+only ever masks `0666` and `0777` with it, so `Config::validate` rejects those rather than
+canonicalising a value into a flag rclone will throw out.
+
+Hence `canonical_umask` in `rvt-core`, which re-spells the `umask` **field** as leading-zero
+octal — the one form both parsers take and agree on. `extra_args` is exempt by design: it is
+the verbatim escape hatch, so `--umask` given that way still means whatever the running
+rclone thinks it means. **The version does not enter into it.** Feature detection is the rule
+here (see the capability ladder), and this is the same instinct applied where there is
+nothing to detect: an argv that is right for every supported version is still right when the
+binary is replaced between discovery and the next mount.
+
+One consequence is worth stating plainly, because it changes permissions on files that
+already exist. A config saying `umask = "22"` on rclone ≤1.67.0 was getting `0o026`, not the
+`0o022` it asked for. Once this normalisation is in, that mount's files are created `0644`
+where they used to be `0640`: **other-read is granted** on the next remount, with no config
+edit and no prompt. That is the field's documented meaning finally being honoured, but it is
+a loosening, and a user who arrived at `22` by trial and error on an old rclone got the
+stricter mask they could see rather than the one they wrote.
 
 ## Security
 

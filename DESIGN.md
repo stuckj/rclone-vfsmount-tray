@@ -128,9 +128,22 @@ cannot walk — which is exactly the case the crate exists to survive.
 Someone who quits the tray to declutter their panel, or whose tray crashes, or who logs into
 a session where the tray never starts, must find every mount exactly as they left it.
 
-The rule extends to the service itself: **restarting the service does not unmount.** A
-package upgrade restarts the service, and nobody expects `apt upgrade` to unmount their
-filesystems.
+The rule extends to the service itself: **restarting the service does not unmount.** The
+service restarts for reasons its user did not choose — it crashes, or a system update
+restarts it, which `nixos-rebuild` does — and neither is a reason to lose a filesystem.
+This service is a young program that polls rclone, walks cache directories and talks
+D-Bus; tying whether your files are reachable to whether it has a bug is far too wide a
+blast radius for what it is.
+
+Nor is an unmount free to take back. rclone exits on `SIGTERM` **without** flushing its
+write-back queue — measured, in [the unmount order](#the-unmount-order) — so an unmount at
+a moment the user did not choose can sever a write in flight. The cache is on disk and
+resumes, but the file that was mid-write does not un-truncate.
+
+Whether a `.deb` or `.rpm` upgrade restarts a systemd *user* service is **not
+established** — the Debian helpers manage system units, and restarting a running user unit
+across sessions is not something packaging normally does. Nothing above rests on it; it is
+recorded here so the question is not mistaken for settled. (#30 is where it gets measured.)
 
 | Event | Mounts |
 |---|---|
@@ -138,8 +151,9 @@ filesystems.
 | Tray crashes or is `SIGKILL`ed | unaffected |
 | Tray never starts (headless, SSH) | unaffected — the service runs standalone |
 | GTK client opens and closes | unaffected |
-| Service restarts (package upgrade) | unaffected — reconciled and adopted on start |
+| Service restarts (system update, or by hand) | unaffected — reconciled and adopted on start |
 | Service crashes | unaffected; adopted on restart |
+| rclone is upgraded | unaffected — each mount keeps serving from the binary it started with, and picks up the new one only when it is next mounted |
 | Service stopped explicitly | unaffected by default; unmounts only if `unmount_on_service_stop` is on |
 | User clicks Unmount | unmounted — refused while anything is still using the mount, unless forced. The pending-uploads *warning* is still #19 |
 | Session ends / logout | depends on `loginctl enable-linger`; documented in the README |

@@ -325,8 +325,8 @@ impl Mount {
 const MAX_UMASK: u128 = 0o17777777777;
 
 /// The bits a [`Mount::umask`] spells: octal, with an optional leading `0` or `0o`. `None`
-/// if it is not octal, or overflows this width — which is wide enough that [`MAX_UMASK`] is
-/// what rejects anything a person would plausibly write.
+/// only if it is not octal at all, so [`MAX_UMASK`] is what rejects a value for being too
+/// large, however many digits it runs to.
 fn umask_bits(s: &str) -> Option<u128> {
     match u128::from_str_radix(s.trim_start_matches("0o"), 8) {
         Ok(bits) => Some(bits),
@@ -351,18 +351,21 @@ fn canonical_umask(s: &str) -> String {
 /// and as every version reads it now — when they are not the same mask.
 ///
 /// `None` when the spelling says one thing to both, which is every value with a leading
-/// zero, so the form `config.example.toml` recommends is never ambiguous. Only the low
-/// nine bits are compared, because rclone masks `0666` and `0777` and discards the rest:
-/// a difference above them reaches no file.
+/// zero, so the form `config.example.toml` recommends is never ambiguous.
+///
+/// Both are given as effective masks, the low nine bits rclone keeps when it masks `0666`
+/// and `0777`. That is what makes them comparable — a difference above those bits reaches
+/// no file — and it is what makes either safe to write back into the field, which a raw
+/// reading of a large value would not be.
 pub fn umask_readings(s: &str) -> Option<(String, String)> {
-    let now = umask_bits(s)?;
+    let now = umask_bits(s)? & 0o777;
     let unsigned = s.strip_prefix('+').unwrap_or(s);
     let before = if unsigned.starts_with('0') {
         now
     } else {
-        unsigned.parse::<u128>().ok()?
+        unsigned.parse::<u128>().ok()? & 0o777
     };
-    (before & 0o777 != now & 0o777).then(|| (format!("0{before:o}"), format!("0{now:o}")))
+    (before != now).then(|| (format!("0{before:o}"), format!("0{now:o}")))
 }
 
 /// Prefix for every unit this service starts. Also how [`crate::supervisor`] tells its
@@ -1134,7 +1137,11 @@ mod tests {
         // Firing for the recommended spelling, which means the same either way, would
         // teach everyone to ignore the warning. `2160` is the other silent case: the two
         // readings differ, but only above the nine bits that reach a file.
-        for quiet in ["0022", "022", "0", "7", "0777", "0o22", "0o755", "2160"] {
+        // `+022` is the case that separates "leading zero" from "leading character": a
+        // sign in front of one is still octal to both parsers.
+        for quiet in [
+            "0022", "022", "0", "7", "0777", "0o22", "0o755", "2160", "+022",
+        ] {
             assert_eq!(
                 umask_readings(quiet),
                 None,

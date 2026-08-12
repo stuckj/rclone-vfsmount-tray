@@ -604,29 +604,42 @@ Measured:
 | `umask = "12"` | 662 / 763 | 664 / 765 | other **loses write**, gains read |
 | `umask = "755"` | 404 / 414 | 022 / 022 | group and other **gain write**; owner loses read |
 
-So it is not simply a loosening, and the sizes are not small. `"63"` turns a mount someone
-made private by trying values until `stat` showed `600` into a world-readable one. `"12"`
-moves in both directions at once, so it can take write access away from a process that had
-it. `"755"` is the worst and the most likely, being a file *mode* written into a mask field:
-it goes from read-only-to-everyone to writable by group and other, with the owner losing read.
+It moves in both directions, and not by a little: `"12"` takes the reported write bit off
+other while adding read, and `"755"` — a file *mode* written into a mask field, which is the
+likeliest way to end up with a bare-digit value — reports everything in the mount as `022`,
+unusable to its owner on paper.
 
-Whether any of that is reachable by another user is `allow_other`'s question, not this one —
-without it the kernel refuses everyone else regardless of the mode. The mask is honoured as
-written either way, which is the field's documented meaning finally being applied; someone who
-arrived at their value by trial and error on an old rclone was reading the mask they could
-see rather than the one they wrote.
+**On paper is the whole of it. These bits are reported, not enforced.** FUSE checks a file's
+mode only when mounted with `default_permissions`; rclone exposes that as
+`--default-permissions`, leaves it off, and `mount_args` never passes it. Measured on 1.75.0:
+
+- `--umask 0777` gives a mount root of `d---------` and files of `----------`, and the owner
+  reads and writes them normally.
+- `--uid 4242 --gid 4242 --umask 0077` reports `-rw------- 4242 4242`, and uid 1001 reads the
+  contents in full.
+- Add `--default-permissions` to that same command and the read is refused. So the flag is
+  what would make the mode mean something, and it is not one we pass.
+
+What the change really moves, then, is the mode every tool *reads* out of the mount — `ls`,
+`rsync -p`, `tar`, `cp -p`, a script testing `-w`, git's executable bit — and the modes copies
+made from the mount inherit. That is worth telling someone about; it is not an access-control
+change, and reading these rows as one would send a user hunting an exposure that cannot have
+happened. Who can reach the mount at all remains `allow_other`'s question, and with
+`allow_other` set the mode gates nothing either, for the same reason.
 
 Nothing rewrites the config, so an ambiguous spelling stays in the file and the question
 comes back at every mount. The supervisor therefore logs a warning as it starts any mount
 whose spelling would have meant a different mask before 1.68.0, naming both — `before_1_68`
-and `sent` — so the reader can see what the mask was and restore it if they want it.
+and `now`, as effective masks, so that what it prints is always something that can be written
+straight back into the field.
 
 Two things it deliberately does not do. It is silent for a leading-zero value, which means
 the same to both parsers: a warning that fires for the config the example recommends is one
 everybody learns to ignore. And it is not gated on the version of rclone in hand, because
-what it reports is a property of the *spelling* — true of that config whichever build reads
-it — and because the supervisor is handed a path, not a version. Which mask a given run
-actually used is what the two fields let the reader work out.
+what it reports is a property of the *spelling* — that config is ambiguous whichever build
+reads it, and the remedy is the same either way. The cost is that someone who has only ever
+run 1.68.0 or later sees a warning about a mask that never moved for them; the two fields are
+what let them work that out.
 
 ## Security
 

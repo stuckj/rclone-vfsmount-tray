@@ -870,10 +870,10 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                     mount = %m.name,
                     umask = %m.umask.as_deref().unwrap_or_default(),
                     before_1_68 = %before,
-                    sent = %now,
+                    now = %now,
                     "ambiguous umask: rclone before 1.68.0 read this spelling as a \
-                     different mask, so permissions inside the mount change if it was \
-                     last served by one — write it with a leading zero"
+                     different mask, so the modes reported inside the mount change if it \
+                     was last served by one — write it with a leading zero"
                 );
             }
 
@@ -1557,7 +1557,7 @@ mod tests {
             );
             if expect {
                 assert!(
-                    text.contains("before_1_68=026") && text.contains("sent=022"),
+                    text.contains("before_1_68=026") && text.contains("now=022"),
                     "the line must name both masks, got: {text}"
                 );
             }

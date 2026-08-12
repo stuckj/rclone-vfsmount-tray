@@ -50,8 +50,9 @@ Three processes:
 | `rclone-vfsmount-tray` | The tray icon. A client. |
 | `rclone-vfsmount-tray-gtk` | The configuration and transfer windows. Also a client. |
 
-**Mounts belong to the service, so quitting the tray will not unmount anything** — neither
-will restarting the service for a package upgrade. That is the central design guarantee.
+**Mounts belong to the service, so quitting the tray will not unmount anything** — and
+neither will restarting the service, whether it crashed or you restarted it deliberately.
+That is the central design guarantee.
 Each mount runs as its own transient systemd user unit, which is what makes it outlive the
 process that started it; see [DESIGN.md](DESIGN.md) for the full lifetime matrix. The
 supervisor implements and unit-tests it today; asserting the whole matrix against a real

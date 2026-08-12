@@ -128,9 +128,33 @@ cannot walk — which is exactly the case the crate exists to survive.
 Someone who quits the tray to declutter their panel, or whose tray crashes, or who logs into
 a session where the tray never starts, must find every mount exactly as they left it.
 
-The rule extends to the service itself: **restarting the service does not unmount.** A
-package upgrade restarts the service, and nobody expects `apt upgrade` to unmount their
-filesystems.
+The rule extends to the service itself: **restarting the service does not unmount.** It
+crashes: this is a young program that polls rclone, walks cache directories and talks
+D-Bus, and tying whether a filesystem is reachable to whether it has a bug is far too wide
+a blast radius for what it is. It is also restarted by hand, and by whatever is managing
+it.
+
+Nor is an unmount free to take back. rclone exits on `SIGTERM` **without** flushing its
+write-back queue — measured, in [the unmount order](#the-unmount-order) — so an unmount at
+a moment the user did not choose can sever a write in flight. The cache is on disk and
+resumes, but the file that was mid-write does not un-truncate.
+
+**Whether a system update restarts this service is not established on any platform it
+ships to.** It is a `systemd --user` service, and that is the distinction every answer
+turns on:
+
+- `.deb` / `.rpm` — the Debian helpers manage *system* units. Restarting a running user
+  unit across sessions is not something packaging normally does. Unverified; #30.
+- NixOS — `nixos-rebuild switch` is long documented as **not** reliably restarting or
+  reloading systemd user services
+  ([nixpkgs#29146](https://github.com/NixOS/nixpkgs/issues/29146)), with
+  `systemctl --user daemon-reload` the usual advice.
+- Home Manager — `systemd.user.startServices = "sd-switch"` **does** restart changed user
+  units on switch, so under that install path an update can restart us. #34.
+
+So it depends on how the user installed, and none of the reasoning above rests on it. It
+is written down as a question rather than deleted, so the next person does not re-derive
+it from scratch.
 
 | Event | Mounts |
 |---|---|
@@ -138,8 +162,9 @@ filesystems.
 | Tray crashes or is `SIGKILL`ed | unaffected |
 | Tray never starts (headless, SSH) | unaffected — the service runs standalone |
 | GTK client opens and closes | unaffected |
-| Service restarts (package upgrade) | unaffected — reconciled and adopted on start |
+| Service restarts | unaffected — reconciled and adopted on start |
 | Service crashes | unaffected; adopted on restart |
+| rclone is upgraded | unaffected — each mount keeps serving from the binary it started with, and picks up the new one only when it is next mounted |
 | Service stopped explicitly | unaffected by default; unmounts only if `unmount_on_service_stop` is on |
 | User clicks Unmount | unmounted — refused while anything is still using the mount, unless forced. The pending-uploads *warning* is still #19 |
 | Session ends / logout | depends on `loginctl enable-linger`; documented in the README |

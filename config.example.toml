@@ -24,10 +24,11 @@ version = 1
 # Unmount everything when the service stops.
 #
 # Off by default, and worth leaving off. Mounts are deliberately independent of the
-# service's lifetime: a package upgrade restarts it, and that should not pull your
-# filesystems out from under whatever is using them. Unuploaded data is safe either
-# way — rclone's cache is on disk and resumes — but an unmount you did not ask for is
-# still disruptive.
+# service's lifetime: it crashes, and it gets restarted, and neither should pull your
+# filesystems out from under whatever is using them. Unuploaded data is safe
+# either way — rclone's cache is on disk and resumes — but a file being written when the
+# mount goes is truncated where it stood, and an unmount you did not ask for is
+# disruptive regardless.
 unmount_on_service_stop = false
 
 [global.poll]

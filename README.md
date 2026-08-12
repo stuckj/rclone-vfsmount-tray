@@ -2,70 +2,51 @@
 
 A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mountain Duck.
 
-> **Status: early development — not usable yet.** The service finds rclone, reads its own
-> configuration, starts, stops and adopts mounts as systemd user units, and works out what
-> each one still has to upload — over rclone's rc API where it answers, and by reading the
-> write-back cache off disk where it does not. Adoption covers its own units that the
-> config no longer names, which is what renaming a mount leaves behind.
-> What it does not do is *serve*: it
-> reconciles, polls each mount once, logs what it found, and exits. There is no D-Bus
-> surface, and the tray and GTK clients are scaffolding.
-> See the [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1).
+> **Status: early development — not usable yet.** There is no tray icon and no window. What
+> works today is the service underneath: it finds rclone, reads its configuration, starts,
+> stops and adopts mounts as systemd user units, and works out what each one still has to
+> upload. It then logs what it found and exits — it does not stay running, and nothing
+> connects to it yet. Follow the
+> [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1) for progress.
 
-## What it will do
+## What it does
 
-A GUI for rclone mounts, in the spirit of Mountain Duck. rclone already does the hard part —
-mounting remote storage as a local filesystem with on-demand block access and a write-back
-cache, across ~70 backends. This wraps that:
+rclone can mount cloud storage — Google Drive, S3, Dropbox, around 70 services — as a folder
+on your machine, downloading files as you open them and uploading changes in the background.
+It does that well, but it is a command-line tool.
 
-- **Manage mounts** — create, edit and delete mount configs; mount and unmount them
-- **See their state** — what is up, what is not, and what went wrong
-- **See data moving** — uploads out of the write-back cache and downloads into it, with
-  per-file progress where rclone reports it
-- **Later** — file manager integration to mark files local or cloud-only
+This is the missing front end:
 
-The third point is the thinnest-covered today: existing rclone GUIs show `core/stats` job
-progress, which covers explicit `copy`/`sync` but not data that moved through a mount, so
-the write-back queue is effectively invisible. Nothing is *lost* when you unmount with a
-full queue — rclone's cache is on disk and resumes — but you have no way to know whether
-your data has reached the remote, or when it will.
+- **Manage your mounts** — add, edit and remove them; connect and disconnect with a click
+- **See their state** — what is connected, what is not, and what went wrong
+- **See your data moving** — what is still uploading, how far along it is, and when it is
+  safe to close the laptop
+- **Later** — marks in your file manager showing which files are local and which are still
+  in the cloud
 
-That queue is now modelled, at whichever fidelity the rclone in front of it supports, and
-every figure carries whether it can be trusted: a number this project cannot stand behind
-is reported as unknown rather than as zero. A file still being *written* is the exception
-worth knowing about: rclone only queues a file when it is closed, so no rc endpoint sees
-an open write and the queue reads empty throughout it. Unmounting therefore asks the
-kernel to release the mount point *before* it signals rclone, and refuses while any process
-is still using the mount. Signalling first severed the writer and published the truncated
-cache item as though it were complete — measured, in
-[#73](https://github.com/stuckj/rclone-vfsmount-tray/issues/73).
+That third point is the one that is missing everywhere else. When you save a file to an
+rclone mount, it lands in a local cache first and uploads afterwards. Nothing is lost if you
+disconnect before that finishes — the cache is on disk, and rclone picks up where it left off
+next time. But no existing tool tells you whether your work has actually reached the cloud,
+or how long it will take. This one is built around answering that, and around never showing
+you a number it cannot stand behind: if it does not know, it says so instead of showing zero.
 
 ## How it is put together
 
-Three processes:
+A background **service** owns the mounts and does the work. The tray icon and the settings
+window are both just clients that talk to it.
 
-| | |
-|---|---|
-| `rclone-vfsmount-trayd` | A systemd **user** service. Owns the mounts, watches upload state, serves D-Bus. Runs headless — no graphical session needed. |
-| `rclone-vfsmount-tray` | The tray icon. A client. |
-| `rclone-vfsmount-tray-gtk` | The configuration and transfer windows. Also a client. |
-
-**Mounts belong to the service, so quitting the tray will not unmount anything** — and
-neither will restarting the service, whether it crashed or you restarted it deliberately.
-That is the central design guarantee.
-Each mount runs as its own transient systemd user unit, which is what makes it outlive the
-process that started it; see [DESIGN.md](DESIGN.md) for the full lifetime matrix. The
-supervisor implements and unit-tests it today; asserting the whole matrix against a real
-rclone is [#38](https://github.com/stuckj/rclone-vfsmount-tray/issues/38).
-
-The service is designed to run with no tray at all, which is the sensible configuration on a
-headless box.
+That split buys you the main guarantee: **quitting the tray never disconnects anything.**
+Neither does restarting the service, or the service crashing. Each mount runs on its own, and
+keeps running until you say otherwise. The service also runs perfectly well with no tray at
+all, which is what you want on a machine you only ever reach over SSH.
 
 ## Installing
 
-Not yet published. Once 0.1.0 ships there will be apt, dnf/yum, Homebrew and Nix channels.
+Not yet published. Once 0.1.0 ships there will be apt, dnf/yum, Homebrew and Nix packages.
 
-### From source
+For now, build it from source. You will need a [Rust toolchain](https://rustup.rs), plus
+`rclone` and `fuse3` installed to actually mount anything.
 
 ```sh
 git clone https://github.com/stuckj/rclone-vfsmount-tray
@@ -73,39 +54,51 @@ cd rclone-vfsmount-tray
 cargo build --release
 ```
 
-Requires a Rust toolchain. Note that `rust-toolchain.toml` pins `stable`, so rustup will
-use current stable regardless of what you have installed; the declared MSRV of **1.87** is
-enforced by a dedicated CI job rather than by local builds. Every crate except the GTK
-client links no system C libraries, so a bare `cargo build` needs nothing else. The GTK
-client is excluded from the workspace's default members and built explicitly:
+The binaries land in `target/release/`. Nothing else needs installing — the build pulls in no
+system libraries.
 
-```sh
-cargo build -p rclone-vfsmount-tray-gtk
+## Configuring it
+
+Mounts are described in a TOML file at:
+
+```
+~/.config/rclone-vfsmount-tray/config.toml
 ```
 
-It will need the GTK4 development headers once it gains its `gtk4` dependency; today it has
-none and builds anywhere.
+Copy [`config.example.toml`](config.example.toml) there and edit it — it documents every
+option inline. A minimal mount needs three things:
 
-At runtime you will need `rclone` and `fuse3`.
+```toml
+version = 1
 
-## Development
-
-```sh
-cargo test --locked           # everything but the GTK client — no system deps needed
-cargo clippy --all-targets
-cargo fmt --all
+[[mount]]
+name = "photos"                          # a short identifier
+remote = "backup"                        # an rclone remote, without the ":"
+mount_point = "/home/you/mnt/photos"     # where it appears on your machine
 ```
 
-The tests in `crates/core/tests/fixtures.rs` parse `testdata/`, which holds real responses
-captured from a live rclone v1.75.0. Each fixture is checked for the keys the model
-*silently dropped* — not just that it parsed — so a renamed or removed field fails a test
-that names it, rather than defaulting quietly and letting the tray stop showing progress.
-That check is the point; a plain parse-and-round-trip would pass either way.
+`rclone listremotes` shows the remotes you already have; `rclone config` is what creates new
+ones. **This file never contains passwords or keys** — those stay in rclone's own
+configuration, and this project never reads them.
+
+The graphical editor is not built yet, so this file is the way to set things up today. The
+service reads it at start-up and does not watch it, so restart the service after editing.
+
+## Running it
+
+```sh
+./target/release/rclone-vfsmount-trayd --foreground
+```
+
+Today that reconciles your mounts against the config, reports what each one has left to
+upload, and exits. Add `--log-level debug` for detail, or `--config <path>` to point it at a
+different file. Running it as a proper background service, with the tray attached, is what
+0.1.0 is for.
 
 ## Documentation
 
-- [DESIGN.md](DESIGN.md) — architecture, the capability ladder, the security model, and the
-  reasoning behind the decisions
+- [DESIGN.md](DESIGN.md) — how the pieces fit together and why
+- [CONTRIBUTING.md](CONTRIBUTING.md) — building, testing and submitting changes
 - [Roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1)
 
 ## License
@@ -117,3 +110,5 @@ MIT — see [LICENSE](LICENSE).
 Mountain Duck® is a registered trademark of iterate GmbH. This project is not affiliated
 with, endorsed by, or derived from Mountain Duck; the name is used only to describe the kind
 of tool this is.
+</content>
+</invoke>

@@ -33,7 +33,7 @@ impl Tier {
     /// Only `vfs/queue` and the disk scan carry one: `core/stats` lags `vfs/queue` by
     /// `--vfs-write-back`, so a total taken from it reads zero while gigabytes are still
     /// queued, and T3 gives counts without bytes. A T1 or T3 build is not stuck — see
-    /// [`Capabilities::rc_can_answer_outstanding`]. DESIGN.md has the measurements.
+    /// [`Capabilities::rc_can_answer_outstanding`]. #9 has the measurements.
     ///
     /// A property of the tier, not of a reading. **"Is it safe to unmount" is
     /// [`crate::transfer::TransferState::safe_to_unmount`]**, which also weighs whether

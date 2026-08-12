@@ -166,7 +166,7 @@ impl CacheMode {
     /// enqueues a file when it is **closed**, so an open write sits dirty in the cache and
     /// absent from the queue for as long as it takes to write. Nothing over rc sees that —
     /// a non-empty cache does not imply it, since a clean entry lingers for
-    /// `--vfs-cache-max-age` and under `full` a plain read creates one. See DESIGN.md.
+    /// `--vfs-cache-max-age` and under `full` a plain read creates one (#21).
     pub fn all_writes_queued(self) -> bool {
         matches!(self, CacheMode::Writes | CacheMode::Full)
     }
@@ -322,8 +322,9 @@ impl Mount {
     }
 }
 
-/// Largest `umask` rclone will accept. See DESIGN.md, "`--umask` is two flags wearing one
-/// name", for why it is not the `0o777` that is all rclone can use.
+/// Largest `umask` rclone will accept — `i32::MAX`, since 1.68.0 parses the flag as a
+/// signed 32-bit octal. Only the low nine bits mean anything, but refusing a value rclone
+/// itself takes is not this project's call (#69).
 const MAX_UMASK: u128 = 0o17777777777;
 
 /// The bits a [`Mount::umask`] spells. Too many digits saturates rather than failing, so

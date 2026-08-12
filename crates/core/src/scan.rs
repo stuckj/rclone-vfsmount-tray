@@ -28,8 +28,8 @@ use std::path::Path;
 const MAX_DESCRIPTOR: u64 = 64 * 1024;
 
 /// How many entries a single scan will look at before giving up, reported as
-/// [`CacheScan::truncated`]. See DESIGN.md for why a bounded walk is preferred to an
-/// unbounded one here.
+/// [`CacheScan::truncated`]. A cache larger than this reports itself incomplete rather
+/// than stalling a poll; under `full` every file ever *read* is an entry.
 const MAX_ENTRIES: usize = 50_000;
 
 /// One file the cache is holding that has not reached the remote.

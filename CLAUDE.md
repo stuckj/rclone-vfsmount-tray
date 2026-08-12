@@ -22,6 +22,31 @@ The service and the clients communicate over D-Bus, not by linking.
 `crates/gtk` is excluded from `default-members`, so a bare `cargo build` works without GTK
 headers.
 
+## What goes in which document
+
+**`README.md`** — for a user, who is probably not an engineer. What the project does, how
+to install it, how to use it. It links to the others rather than repeating them.
+
+**`CONTRIBUTING.md`** — how to work on the project: checkout, the checks, the toolchain
+specifics that trip people up, how to submit. No design content.
+
+**`DESIGN.md`** — directional only: how the application *should* work. Components,
+boundaries, who owns what across them, and the decisions that constrain future work,
+including ones not built yet. It changes when that direction changes — a component added
+or removed, a boundary moved, a responsibility reassigned — and not otherwise. A thousand
+code changes can leave it untouched.
+
+**The code** — the authority on how the application *actually* works.
+
+Detail belongs one layer below wherever it is tempting to put it. A measurement goes in a
+test that fails when it stops being true, and in the dated PR or issue — not in
+`DESIGN.md`, which cannot fail and will outlive the measurement. A mechanism goes in the
+code — not in `DESIGN.md`, which will drift from it. `DESIGN.md` says a thing can fail and
+gives an example or two *as examples*; it does not catalogue the ways.
+
+The corollary for both prose and comments: do not describe the same mechanism twice. See
+"Documentation restated in many places" below for what that has already cost here.
+
 ## Invariants
 
 **Mounts belong to the service.** No client action — exiting, crashing, never starting —

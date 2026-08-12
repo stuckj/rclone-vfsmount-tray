@@ -34,7 +34,7 @@ static LIVE: Mutex<usize> = Mutex::new(0);
 /// bytes of the socket budget above — makes a repeat improbable rather than impossible.
 /// Two processes collide only on the same pid *and* start times an exact multiple of
 /// 4.295s apart. [`create_exclusive`] is what catches that, rather than this. See
-/// DESIGN.md.
+/// `CONTRIBUTING.md`.
 fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {

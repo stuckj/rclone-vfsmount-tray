@@ -124,9 +124,11 @@ async fn main() -> anyhow::Result<()> {
     // the log before there is anywhere to publish them. The loop that keeps this current,
     // and the D-Bus surface that serves it, are #40.
     //
-    // `Mounted` rather than `is_live()`, which also admits `Foreign`. We did not start a
-    // foreign mount, so none of our rc sockets addresses it and its own is unknown by
-    // definition. Reaching it at all is #70.
+    // `Mounted` rather than `is_live()`, which also admits `Foreign` and `Orphaned`. We
+    // did not start a foreign mount, so none of our rc sockets addresses it and its own is
+    // unknown by definition; reaching it at all is #70. An orphan does still answer on the
+    // socket it was started with, but the config no longer describes it, so there is
+    // nothing here to report it against.
     for m in found
         .iter()
         .filter(|m| matches!(m.state, rvt_core::supervisor::MountState::Mounted))

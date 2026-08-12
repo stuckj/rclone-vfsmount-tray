@@ -47,6 +47,12 @@ pub enum MountState {
     /// a manual invocation. Adopted for display and monitoring only; the supervisor
     /// must not restart or reconfigure it.
     Foreign,
+    /// Serving, started by us, and named by no entry in the config — the mount was
+    /// renamed or deleted while its unit kept running.
+    ///
+    /// Stoppable, because the unit is ours. Not startable: nothing left describes what
+    /// it should be, so taking it down is all that can be done with one.
+    Orphaned,
 }
 
 impl MountState {
@@ -55,7 +61,7 @@ impl MountState {
     /// Matched exhaustively so a future variant cannot silently default to "not live".
     pub fn is_live(&self) -> bool {
         match self {
-            MountState::Mounted | MountState::Foreign => true,
+            MountState::Mounted | MountState::Foreign | MountState::Orphaned => true,
             MountState::Unmounted
             | MountState::Mounting
             | MountState::Unmounting
@@ -72,7 +78,8 @@ impl MountState {
             | MountState::Mounting
             | MountState::Mounted
             | MountState::Unmounting
-            | MountState::Failed { .. } => true,
+            | MountState::Failed { .. }
+            | MountState::Orphaned => true,
             MountState::Foreign => false,
         }
     }
@@ -88,7 +95,8 @@ pub type Cause = Box<dyn std::error::Error + Send + Sync>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SupervisorError {
-    /// No mount is configured under that name.
+    /// Nothing answers to that name: no config entry, and no [`MountState::Orphaned`]
+    /// unit either.
     #[error("no mount configured named {0:?}")]
     UnknownMount(String),
 
@@ -184,20 +192,28 @@ pub trait MountSupervisor: Send + Sync {
     /// on remount, so a warning rather than a veto (#19). Nothing here implements it yet.
     ///
     /// `force` is always an explicit caller decision, never inferred.
+    ///
+    /// The name may be a [`MountState::Orphaned`] one, since [`Self::reconcile`] reports
+    /// those and taking one down is the only thing left to do with it.
     fn unmount<'a>(
         &'a self,
         name: &'a str,
         force: bool,
     ) -> BoxFuture<'a, Result<(), SupervisorError>>;
 
-    /// Current state of one mount.
+    /// Current state of one mount, configured or [`MountState::Orphaned`].
     fn state<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<MountState, SupervisorError>>;
 
     /// Reconcile against reality on startup — the service may have restarted while mounts
     /// stayed up.
     ///
-    /// Returns every configured mount **plus** every live unmanaged one. A configured mount
-    /// that is down is reported [`MountState::Unmounted`], not omitted.
+    /// Returns every configured mount, plus a row for every live mount that no
+    /// *configured unit* is serving: [`MountState::Foreign`] for the ones we did not
+    /// start, [`MountState::Orphaned`] for our own units left running under a name the
+    /// config has since renamed or dropped. A rename therefore reports the path twice —
+    /// once for the config entry that wants it, once for the unit that still holds it.
+    /// A configured mount that is down is reported [`MountState::Unmounted`], not
+    /// omitted.
     fn reconcile(&self) -> BoxFuture<'_, Result<Vec<DiscoveredMount>, SupervisorError>>;
 }
 
@@ -211,6 +227,14 @@ mod tests {
         assert!(!MountState::Foreign.is_managed());
         assert!(MountState::Mounted.is_live());
         assert!(MountState::Mounted.is_managed());
+    }
+
+    #[test]
+    fn an_orphaned_unit_is_live_and_ours_to_act_on() {
+        // The whole point of telling it from `Foreign`: it can be stopped by stopping
+        // its unit, where a foreign mount can only be fusermounted.
+        assert!(MountState::Orphaned.is_live());
+        assert!(MountState::Orphaned.is_managed());
     }
 
     #[test]

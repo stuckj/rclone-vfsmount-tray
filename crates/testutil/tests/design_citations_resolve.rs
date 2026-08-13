@@ -4,9 +4,10 @@
 //! as authoritative and sends the reader to a section that no longer says the thing. The
 //! citations wrap across rustdoc lines, so the text is rejoined before matching.
 //!
-//! Two kinds of citation are out of reach and would pass unchecked: one written in a
-//! `/* */` block comment, and one in a `.md` file, since only `crates/**/*.rs` is walked.
-//! Neither exists today.
+//! Three kinds of citation are out of reach and would pass unchecked: one in a `/* */`
+//! block comment; one in a `.md` file, since only `crates/**/*.rs` is walked; and one that
+//! names a section without quoting it, which there is no way to tell from prose. None
+//! exists today — quote the section name and this guard covers it.
 
 use std::path::{Path, PathBuf};
 
@@ -87,6 +88,9 @@ fn the_guard_still_detects_what_it_is_looking_for() {
         "/// heading\", and done.\n",
         "/// Then DESIGN.md's \"third\".\n",
         "/// Then the \"fourth\" section of DESIGN.md.\n",
+        // Longer than WINDOW: real headings usually are, and only the closing quote is
+        // near the mention.
+        "/// And the \"a heading far longer than the window is wide\" section of DESIGN.md.\n",
         "const N: usize = 1; // see DESIGN.md, \"fifth\"\n",
         "const U: &str = \"unix://sock\"; // and DESIGN.md, \"sixth\"\n",
     );
@@ -97,6 +101,7 @@ fn the_guard_still_detects_what_it_is_looking_for() {
             "a wrapped heading",
             "third",
             "fourth",
+            "a heading far longer than the window is wide",
             "fifth",
             "sixth"
         ]
@@ -267,11 +272,17 @@ fn quoted_after(text: &str, from: usize) -> Option<String> {
 }
 
 /// `the "…" section of DESIGN.md` — the quote precedes the mention.
+///
+/// Only the *closing* quote has to be within `WINDOW`; the opening one is sought back as
+/// far as `LONGEST`, since it is the heading's own length that separates them and most
+/// real headings are longer than the window.
 fn quoted_before(text: &str, to: usize) -> Option<String> {
-    let window = &text[floor(text, to.saturating_sub(WINDOW))..to];
-    let close = window.rfind('"')?;
-    joined(&window[close + 1..]).then_some(())?;
-    heading(&window[window[..close].rfind('"')? + 1..close])
+    let near = floor(text, to.saturating_sub(WINDOW));
+    let close = near + text[near..to].rfind('"')?;
+    joined(&text[close + 1..to]).then_some(())?;
+    let far = floor(text, close.saturating_sub(LONGEST + 1));
+    let open = far + text[far..close].rfind('"')?;
+    heading(&text[open + 1..close])
 }
 
 fn heading(run: &str) -> Option<String> {

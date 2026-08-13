@@ -33,7 +33,7 @@ will take. This one is built around answering that, and around never showing you
 cannot stand behind: if it does not know, it says so instead of showing zero.
 
 The case that *can* lose data is a file you are still writing when the mount goes away.
-rclone only queues a file once it is closed, so nothing can see a copy in progress, and a
+rclone only queues a file once it is closed, so it cannot report a copy in progress, and a
 disconnect mid-write leaves the partial file to be uploaded later as though it were the whole
 thing. Disconnecting through this applet is therefore refused while anything is still using
 the mount, rather than cutting the writer off — unless you explicitly force it, which warns

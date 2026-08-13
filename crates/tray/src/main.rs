@@ -28,11 +28,11 @@ enum Command {
     List,
     /// Mount one configured mount.
     Mount { name: String },
-    /// Unmount one mount. Refused when uploads are still pending unless `--force`.
+    /// Unmount one mount. Refused while anything is still using it unless `--force`.
     Unmount {
         name: String,
-        /// Unmount even with unuploaded data in the write-back cache. This can lose
-        /// data that has not reached the remote.
+        /// Unmount even while the mount is in use. A file being written is severed
+        /// mid-write, and rclone later uploads the partial file as though complete.
         #[arg(long)]
         force: bool,
     },

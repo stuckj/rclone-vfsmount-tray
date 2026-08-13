@@ -2,7 +2,7 @@
 //!
 //! One type for the tray, D-Bus and GTK to consume whichever tier produced it. The tier
 //! travels with the data, because the same struct means different things depending on
-//! where it came from: see DESIGN.md's capability ladder.
+//! where it came from: see DESIGN.md, "The capability ladder".
 
 use crate::capabilities::Tier;
 use crate::models::{DiskCache, Pending, Transfer, VfsQueue};

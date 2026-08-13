@@ -1,7 +1,8 @@
 //! The applet's own configuration: which mounts it manages, and how it behaves.
 //!
 //! Distinct from rclone's config, which holds the remotes. This file references those by
-//! name; it never duplicates them and never contains credentials.
+//! name and needs no credential of its own. [`Mount::extra_args`] is the exception: it
+//! reaches rclone verbatim, so a credential flag put there is stored here.
 //!
 //! Until the GTK editor lands (#42) this file *is* the configuration UI, so it is meant
 //! to be hand-edited. `config.example.toml` is the annotated reference.

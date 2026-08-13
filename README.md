@@ -58,9 +58,10 @@ services down when your last session ends, which would take the mounts with them
 
 Not yet published. Once 0.1.0 ships there will be apt, dnf/yum, Homebrew and Nix packages.
 
-For now, build it from source. You will need a [Rust toolchain](https://rustup.rs) to build
-it, plus `rclone` and `fuse3` to mount anything. Mounts are run as systemd user units, so
-this needs a systemd-based distribution — which is most of them.
+For now, build it from source. You will need a [Rust toolchain](https://rustup.rs) and a C
+linker to build it — `build-essential` on Debian and Ubuntu, `gcc` most other places — plus
+`rclone` and `fuse3` to mount anything. Mounts are run as systemd user units, so this needs a
+systemd-based distribution, which is most of them.
 
 ```sh
 git clone https://github.com/stuckj/rclone-vfsmount-tray
@@ -68,8 +69,8 @@ cd rclone-vfsmount-tray
 cargo build --release
 ```
 
-The binaries land in `target/release/`. Nothing else needs installing — the build pulls in no
-system libraries.
+The binaries land in `target/release/`. There are no development packages to hunt down beyond
+the linker above — the build pulls in no system libraries at all.
 
 ## Configuring it
 

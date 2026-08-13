@@ -4,10 +4,12 @@
 //! as authoritative and sends the reader to a section that no longer says the thing. The
 //! citations wrap across rustdoc lines, so the text is rejoined before matching.
 //!
-//! Three kinds of citation are out of reach and would pass unchecked: one in a `/* */`
-//! block comment; one in a `.md` file, since only `crates/**/*.rs` is walked; and one that
-//! names a section without quoting it, which there is no way to tell from prose. None
-//! exists today — quote the section name and this guard covers it.
+//! These are out of reach and would pass unchecked, and none exists today: a citation in a
+//! `/* */` block comment; one in a `.md` file, since only `crates/**/*.rs` is walked; one
+//! naming a section without quoting it, which there is no telling from prose; one using
+//! typographic quotes; and one on the continuation line of a multi-line string literal,
+//! since the in-string state resets per line. Every miss is a false negative — write the
+//! citation as `DESIGN.md, "Section name"` and this guard covers it.
 
 use std::path::{Path, PathBuf};
 

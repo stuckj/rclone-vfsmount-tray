@@ -207,7 +207,7 @@ pub struct Mount {
     #[serde(default)]
     pub gid: Option<u32>,
     /// A file mode mask, octal, as a string so `0022` survives a round trip. A leading `0`
-    /// or `0o` is optional; it is re-spelled before it reaches rclone. See DESIGN.md.
+    /// or `0o` is optional; it is re-spelled before it reaches rclone (#92).
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -339,7 +339,7 @@ fn umask_bits(s: &str) -> Option<u128> {
 }
 
 /// `--umask` as leading-zero octal, the one spelling every supported rclone reads alike.
-/// Anything [`Config::validate`] would reject passes through untouched. See DESIGN.md.
+/// Anything [`Config::validate`] would reject passes through untouched.
 fn canonical_umask(s: &str) -> String {
     match umask_bits(s) {
         Some(bits) if bits <= MAX_UMASK => format!("0{bits:o}"),
@@ -348,7 +348,7 @@ fn canonical_umask(s: &str) -> String {
 }
 
 /// The effective masks an ambiguous `umask` means to rclone before 1.68.0 and to rclone
-/// now, when those differ. See DESIGN.md.
+/// now, when those differ. The per-version readings are measured in #92.
 pub fn umask_readings(s: &str) -> Option<(String, String)> {
     let now = umask_bits(s)? & 0o777;
     let unsigned = s.strip_prefix('+').unwrap_or(s);

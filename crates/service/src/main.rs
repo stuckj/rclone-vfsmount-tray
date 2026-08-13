@@ -27,8 +27,8 @@ pub struct Args {
     #[arg(long, value_name = "LEVEL")]
     log_level: Option<String>,
 
-    /// Stay in the foreground and log to stderr. Useful when running outside
-    /// systemd during development.
+    /// Accepted and ignored. It will mean "stay in the foreground and log to stderr" once
+    /// there is a background mode to opt out of; today that is all the service does.
     #[arg(long)]
     foreground: bool,
 

@@ -153,7 +153,8 @@ fn config_paths_are_parsed_from_the_real_output_shape() {
         p.config_file,
         Path::new("/home/user/.config/rclone/rclone.conf")
     );
-    // The cache dir is what makes the on-disk tier work with no rc endpoint.
+    // Where the on-disk tier will find its roots without asking rc for them, which is the
+    // rest of #22; today they come only from `vfs/stats`.
     assert_eq!(p.cache_dir, Path::new("/home/user/.cache/rclone"));
 }
 

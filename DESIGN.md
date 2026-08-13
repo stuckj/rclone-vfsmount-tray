@@ -46,9 +46,10 @@ its purpose.
 
 ### What is *not* the problem
 
-Unuploaded data is **not** lost when a mount goes away. rclone's write-back cache is on disk:
-dirty items survive an unmount, an rclone crash and a reboot, and upload resumes when the
-mount comes back.
+Unuploaded data from a file that has been **closed** is not lost when a mount goes away.
+rclone's write-back cache is on disk: dirty items survive an unmount, an rclone crash and a
+reboot, and upload resumes when the mount comes back. A file still *open* is the exception,
+and the one case that is genuinely destructive — see the lifetime rule below.
 
 So the cost of an unmount with a full queue is **delay and uncertainty**, not destruction:
 your data has not reached the remote, nothing tells you so, and nothing tells you when it
@@ -326,7 +327,8 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   shell-equivalent API wholesale would hand a sandboxed caller exactly what the sandbox exists
   to withhold. `core/command` and `config/dump` are never called and never reachable.
 - **Credentials are never read at all.** Mounting and reporting progress need remote *names*
-  and paths, not secrets, and nothing published over D-Bus carries either. Note there is no
+  and paths, not secrets, and nothing published over D-Bus carries a credential or a
+  remote's configuration. Note there is no
   safe subset to read even if one were wanted: `config/get` is not a per-field getter, and
   returns a whole remote's configuration with its credentials in it.
 - **Safety checks live service-side**, so a client cannot skip one by leaving a parameter out.

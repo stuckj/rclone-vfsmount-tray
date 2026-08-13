@@ -330,23 +330,19 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             .iter()
             .map(|m| (m.unit_name(), m.mount_point.as_path()))
             .collect();
-        // Named by the config and serving where that entry says: the healthy mount. It is
-        // both what this sweep passes over and the only thing that can vouch for a mount
-        // point against another unit's claim on it.
-        //
-        // Compared as written, because both spellings come from the same `mount_point`
-        // field and an entry nobody edited matches byte for byte — so the path every
-        // healthy mount takes canonicalises nothing. An edit that only respells the path
-        // falls through to the resolved comparison further down, which lets it go.
-        let in_place: std::collections::HashSet<&str> = loaded
+        // What each serving unit's argv says it mounted, unresolved. The inner `None` is a
+        // unit whose `ExecStart` could not be read: where it serves is then unknown, which
+        // [`Self::configured_unit_holds`] has to treat differently from knowing it is
+        // elsewhere.
+        let serving_argv: std::collections::HashMap<&str, Option<&Path>> = loaded
             .iter()
             .filter(|u| u.status.is_serving())
-            .filter(|u| {
-                u.serving
-                    .as_ref()
-                    .is_some_and(|s| ours.get(&u.name) == Some(&s.mount_point.as_path()))
+            .map(|u| {
+                (
+                    u.name.as_str(),
+                    u.serving.as_ref().map(|s| s.mount_point.as_path()),
+                )
             })
-            .map(|u| u.name.as_str())
             .collect();
         // Resolved only once a candidate has survived everything cheaper. Canonicalising
         // is a blocking call per configured mount, and a wedged one costs the full probe
@@ -355,7 +351,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
 
         let mut out = Vec::new();
         for u in &loaded {
-            if !u.status.is_serving() || in_place.contains(u.name.as_str()) {
+            if !u.status.is_serving() {
                 continue;
             }
             // Nothing to act on without knowing what it serves: stopping a unit whose
@@ -363,6 +359,15 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             let (Some(serving), Some(name)) = (u.serving.as_ref(), orphan_name(&u.name)) else {
                 continue;
             };
+            // Named by the config and serving exactly where that entry says. Compared as
+            // written, because both spellings come from the same `mount_point` field and
+            // an entry nobody edited matches byte for byte — so the path every healthy
+            // mount takes canonicalises nothing. Only a mismatch here pays for the
+            // resolved comparisons below, and equal-but-respelled is a mismatch that
+            // `configured_unit_holds` then lets go.
+            if ours.get(&u.name) == Some(&serving.mount_point.as_path()) {
+                continue;
+            }
             let point = Self::resolved(serving.mount_point.clone()).await;
             if !mountinfo::is_mounted_at(&live, &point) {
                 continue;
@@ -380,7 +385,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
                     configured.insert(c)
                 }
             };
-            if Self::configured_unit_holds(configured, &point, &in_place) {
+            if Self::configured_unit_holds(configured, &point, &serving_argv).await {
                 continue;
             }
             out.push(Target {
@@ -394,23 +399,38 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     }
 
     /// Whether a configured mount at one of these points has its own unit holding it.
-    /// Points come in already resolved: canonicalising them per candidate would put one
-    /// full probe timeout, and one parked blocking thread, behind every wedged mount in
-    /// the config.
+    /// Configured points come in already resolved: canonicalising them per candidate would
+    /// put one full probe timeout, and one parked blocking thread, behind every wedged
+    /// mount in the config. A unit's argv is resolved here and nowhere earlier, because
+    /// only a candidate that got this far can need it.
     ///
-    /// *Holding* it is the whole question, which is why this takes `in_place` rather than
-    /// asking whether the unit is up. A unit that is up but serving somewhere else vouches
-    /// for nothing, and reading it as proof would excuse the case this sweep exists to
-    /// find: two entries whose mount points were swapped would each cover for the other
-    /// (#90).
-    fn configured_unit_holds(
+    /// *Holding* it is the question, not merely running. A unit that is up but serving
+    /// somewhere else vouches for nothing, and reading it as proof would excuse the case
+    /// this sweep exists to find: two entries whose mount points were swapped would each
+    /// cover for the other (#90).
+    ///
+    /// A unit whose argv could not be read is the one thing taken on trust. Where it
+    /// serves is unknown, and the two ways of being wrong are not equal: refusing to
+    /// vouch leaves a live mount looking like an orphan, and unmounting that orphan cuts
+    /// it.
+    async fn configured_unit_holds(
         configured: &[(PathBuf, String)],
         point: &Path,
-        in_place: &std::collections::HashSet<&str>,
+        serving_argv: &std::collections::HashMap<&str, Option<&Path>>,
     ) -> bool {
-        configured
-            .iter()
-            .any(|(p, unit)| p == point && in_place.contains(unit.as_str()))
+        for (_, unit) in configured.iter().filter(|(p, _)| p == point) {
+            match serving_argv.get(unit.as_str()) {
+                // Not serving, so it holds nothing.
+                None => continue,
+                Some(None) => return true,
+                Some(Some(argv)) => {
+                    if Self::resolved(argv.to_path_buf()).await == point {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Where a unit of ours actually mounted, from the argv systemd still holds for it.
@@ -601,7 +621,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             // Mounted with no unit of ours *under this name*. Either somebody else
             // started it, or one of our own units is still holding the point under the
             // name this mount used to have.
-            (true, UnitStatus::Inactive) => match self.orphan_at(&point).await? {
+            (true, UnitStatus::Inactive) => match orphans.iter().find(|o| o.point == point) {
                 Some(o) => MountState::Failed {
                     reason: format!(
                         "{} is still served by {}, left over from a mount this config no \
@@ -2592,6 +2612,82 @@ mod tests {
             msg.contains(&held.display().to_string()),
             "the refusal has to name the path in the way: {msg}"
         );
+    }
+
+    /// A `mount_point` respelled to the *same* directory through a symlink. Nothing has
+    /// moved, so nothing may be reported as having moved — the raw comparison that keeps
+    /// the healthy path cheap says these differ, and only resolving them says otherwise.
+    #[tokio::test]
+    async fn respelling_a_mount_point_through_a_symlink_has_not_moved_it() {
+        let scratch = Scratch::new("respelled");
+        let real = std::fs::canonicalize(scratch.dir("real")).unwrap();
+        let link = scratch.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let events: Arc<Mutex<Vec<String>>> = Arc::default();
+        let units = FakeUnits {
+            events: events.clone(),
+            ..Default::default()
+        };
+        // Started against the symlink; the config now spells the same directory directly.
+        units.loaded.lock().unwrap().push(LoadedUnit {
+            name: "rvt-mount-backup.service".into(),
+            status: UnitStatus::Active,
+            serving: Some(Serving {
+                fs_spec: "backup:pictures".into(),
+                mount_point: link,
+            }),
+        });
+
+        let mut config = Config::default();
+        config.mounts.push(a_mount("backup", real.clone()));
+
+        let s = SystemdSupervisor::new(
+            Arc::new(config),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            scratch.join("run"),
+            PathBuf::from("/nonexistent/config.toml"),
+        )
+        .with_test_overrides(
+            fixture(
+                &scratch,
+                "respelled",
+                &mountinfo_with(&[&real.to_string_lossy()]),
+            ),
+            Duration::from_millis(300),
+        )
+        .with_events(events);
+
+        assert_eq!(
+            s.state("backup").await.unwrap(),
+            MountState::Mounted,
+            "the unit is serving the directory the config names, spelled differently"
+        );
+        s.mount("backup")
+            .await
+            .expect("a mount already up must not be refused as being in its own way");
+    }
+
+    /// A healthy unit whose `ExecStart` could not be read this sweep, with a rename's
+    /// leftover claiming the same point. Where the healthy one serves is unknown, and the
+    /// two ways of being wrong are not equal: call the leftover an orphan and the unmount
+    /// it invites cuts the live mount.
+    #[tokio::test]
+    async fn a_unit_whose_argv_cannot_be_read_still_vouches_for_its_point() {
+        let (_sc, s) = renamed("argv-unreadable");
+        s.units.loaded.lock().unwrap().push(LoadedUnit {
+            name: "rvt-mount-backups.service".into(),
+            status: UnitStatus::Active,
+            serving: None,
+        });
+
+        let found = s.reconcile().await.unwrap();
+        assert!(
+            !found.iter().any(|m| m.state == MountState::Orphaned),
+            "the configured unit may be the one holding it: {found:?}"
+        );
+        assert_eq!(s.state("backups").await.unwrap(), MountState::Mounted);
     }
 
     /// Two entries whose mount points were exchanged. Each unit is up, and each is serving

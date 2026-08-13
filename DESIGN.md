@@ -207,12 +207,12 @@ The same applies to composing flags. rclone has changed what a flag *means* insi
 supported range — `--umask` did at 1.68.0 (#69, pinned to that version in #92) — so send the
 spelling every supported version reads alike, rather than branching on a version discovered
 at start-up that need not be the binary which ends up running. Refuse a value that cannot
-work on *every* supported version, and nothing beyond that: a config `Config::validate`
-rejects stops the service, not the mount carrying it.
+work on *every* supported version, and as little beyond that as possible: a config
+`Config::validate` rejects stops the service, not the mount carrying it.
 
 | Tier | Source | Gives | Verdict |
 |---|---|---|---|
-| **T1** | `core/stats` `transferring[]` | per-file names, sizes and progress | Richest, but **does not meet the bar**: it shows transfers that have *started*, so a total taken from it reads zero while gigabytes sit queued — wrong in the unsafe direction. |
+| **T1** | `core/stats` `transferring[]` | per-file names, sizes and progress | Richest, but **does not meet the bar**: it shows transfers that have *started*, so a total taken from it reads zero while gigabytes sit queued (#9) — wrong in the unsafe direction. |
 | **T2** | `vfs/queue` (per-fs) | queued items with sizes, and an in-flight flag | **The minimum bar.** |
 | **T3** | `vfs/stats` (per-fs) | counts, and the cache paths | Counts only. Does not meet the bar alone, but hands T4 its roots. |
 | **T4** | Cache directory scan | dirty items and their on-disk sizes | Meets the bar, and is the only tier that survives an unreachable or crashed rclone. Takes its cache roots from T3 today; finding them without rc is the rest of #22. |
@@ -237,11 +237,11 @@ Two consequences that are easy to get backwards:
 
 - **A transfer must be attributed to a mount before it counts**, and that takes two
   conditions rather than one: it is not an explicit `copy`/`sync` job, *and* its source is
-  that mount's own cache path. `core/stats` is process-global and reports cache *downloads*
+  that mount's own cache path. `core/stats` is process-global and reports cache *downloads* (#9)
   alongside write-back uploads, so the first condition alone shows a file being downloaded as
   a pending upload and counts its bytes toward the total that decides whether unmounting is
   safe — wrong in the unsafe direction.
-- **An empty queue is not an idle mount.** rclone enqueues a file when it is *closed*, so
+- **An empty queue is not an idle mount.** rclone enqueues a file when it is *closed* (#73), so
   every rc endpoint reports nothing outstanding for the whole duration of a large copy — this
   is the normal state, not a narrow race. Only the on-disk dirty flag sees it. For this one
   question T4 is strictly better than T2: the single place the ladder's ordering does not
@@ -326,11 +326,15 @@ reason this interface is a boundary at all. Everything here is scoped to that:
 - The interface is a **curated set of methods, never a generic rc passthrough.** Proxying a
   shell-equivalent API wholesale would hand a sandboxed caller exactly what the sandbox exists
   to withhold. `core/command` and `config/dump` are never called and never reachable.
-- **Credentials are never read at all.** Mounting and reporting progress need remote *names*
-  and paths, not secrets, and nothing published over D-Bus carries a credential or a
-  remote's configuration. Note there is no
-  safe subset to read even if one were wanted: `config/get` is not a per-field getter, and
-  returns a whole remote's configuration with its credentials in it.
+- **rclone's own configuration is never read.** Mounting and reporting progress need remote
+  *names* and paths, not secrets. There is no safe subset to read even if one were wanted:
+  `config/get` is not a per-field getter, and returns a whole remote's configuration with its
+  credentials in it.
+- **This project's own config is not automatically safe to publish.** `extra_args` reaches
+  rclone as verbatim argv, so a user can put a credential flag in a mount, and mount
+  configuration crosses this interface in both directions once clients can edit it (#16,
+  #42). The surface has to treat that field as secret-bearing — redacted or gated — rather
+  than assume nothing here can be a secret.
 - **Safety checks live service-side**, so a client cannot skip one by leaving a parameter out.
   A forced unmount is destructive, and `force` is explicit and defaults to off — a guard
   against accident and bugs, not against malice.

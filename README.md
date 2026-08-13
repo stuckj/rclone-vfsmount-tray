@@ -45,14 +45,16 @@ A background **service** owns the mounts and does the work. The tray icon and th
 window are both just clients that talk to it.
 
 That split buys you the main guarantee: **quitting the tray never disconnects anything.**
-Neither does restarting the service, or the service crashing. Each mount runs on its own, and
-keeps running until you say otherwise.
+Neither does restarting the service, or the service crashing. Each mount runs on its own and
+keeps running until you say otherwise — or until you log out.
 
-The service is built to run with no tray at all, which is what you want on a machine
-you only ever reach over SSH. One caveat there: by default Linux shuts your user's background
-services down when your last session ends, which would take the mounts with them. Run
-`loginctl enable-linger` once to keep them up between logins — and if that is refused,
-`sudo loginctl enable-linger $USER`.
+That last one catches people out, on a desktop as much as over SSH. Linux shuts your user's
+background services down when your last session ends, and that takes the mounts with them.
+Run `loginctl enable-linger` once and they survive logouts and come back at boot; if that is
+refused, `sudo loginctl enable-linger $USER`.
+
+The service is built to run with no tray at all, which is what you want on a machine you only
+ever reach over SSH.
 
 ## Installing
 

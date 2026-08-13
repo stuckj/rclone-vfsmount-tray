@@ -4,12 +4,14 @@
 //! as authoritative and sends the reader to a section that no longer says the thing. The
 //! citations wrap across rustdoc lines, so the text is rejoined before matching.
 //!
-//! These are out of reach and would pass unchecked, and none exists today: a citation in a
-//! `/* */` block comment; one in a `.md` file, since only `crates/**/*.rs` is walked; one
-//! naming a section without quoting it, which there is no telling from prose; one using
-//! typographic quotes; and one on the continuation line of a multi-line string literal,
-//! since the in-string state resets per line. Every miss is a false negative — write the
-//! citation as `DESIGN.md, "Section name"` and this guard covers it.
+//! One spelling is read reliably — `DESIGN.md, "Section name"` — along with the near
+//! variants the control test pins. Write citations that way and they are checked.
+//!
+//! Other shapes are missed rather than mis-reported: a `/* */` block comment, a `.md` file
+//! (only `crates/**/*.rs` is walked), an unquoted section name, typographic quotes, a quote
+//! separated from the mention by a sentence boundary or by more than [`WINDOW`], and a
+//! continuation line of a multi-line string literal. That list is not a completeness
+//! proof — it is what has been tried. Every miss is a false negative.
 
 use std::path::{Path, PathBuf};
 

@@ -410,9 +410,10 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// cover for the other (#90).
     ///
     /// A unit whose argv could not be read is the one thing taken on trust. Where it
-    /// serves is unknown, and the two ways of being wrong are not equal: refusing to
-    /// vouch leaves a live mount looking like an orphan, and unmounting that orphan cuts
-    /// it.
+    /// serves is unknown, and the two ways of being wrong are not equal: refusing to vouch
+    /// leaves a live mount looking like an orphan, and unmounting that orphan cuts it. The
+    /// price is that a genuine orphan at the same point goes unreported for as long as the
+    /// read keeps failing — #90 reopens, quietly, for that one shape.
     async fn configured_unit_holds(
         configured: &[(PathBuf, String)],
         point: &Path,
@@ -464,8 +465,8 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         match self.orphan_at(point).await? {
             None => Ok(()),
             Some(o) => Err(SupervisorError::NotManaged(format!(
-                "{name}: {} is still held by {}, left over from a mount this config no \
-                 longer names. Unmount {:?} first.",
+                "{name}: {} is still held by {}, a mount of ours the config no longer \
+                 places there. Unmount {:?} first.",
                 point.display(),
                 o.unit,
                 o.name
@@ -578,22 +579,29 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     async fn resolve(&self, m: &Mount, orphans: &[Target]) -> Result<MountState, SupervisorError> {
         let point = Self::resolved_point(m).await;
         let live = mountinfo::is_mounted_at(&self.live_mounts(), &point);
+        let unit = self.units.status(&m.unit_name()).await?;
 
         // This entry's own unit, serving a path the entry no longer names — `mount_point`
-        // edited while it was up. Answered before anything else, because everything below
-        // asks about the configured path, and nothing can arrive there while that unit
-        // holds the name: `Mounting` is what this used to report, forever (#90).
-        if let Some(o) = orphans.iter().find(|o| o.unit == m.unit_name()) {
-            return Ok(MountState::Failed {
-                reason: format!(
-                    "{} is serving {}, not the configured {} — its mount point was changed \
-                     while it was mounted. Unmounting {:?} and mounting it again moves it.",
-                    o.unit,
-                    o.point.display(),
-                    point.display(),
-                    m.name
-                ),
-            });
+        // edited while it was up. Answered before the rest, because everything below asks
+        // about the configured path, and nothing can arrive there while that unit holds the
+        // name (#90).
+        //
+        // Except while it is stopping, which is the one way out of this state: a teardown
+        // the user asked for reports as one, here as everywhere else.
+        if unit != UnitStatus::Deactivating {
+            if let Some(o) = orphans.iter().find(|o| o.unit == m.unit_name()) {
+                return Ok(MountState::Failed {
+                    reason: format!(
+                        "{} is serving {}, not the configured {} — its mount point was \
+                         changed while it was mounted. Unmounting {:?} and mounting it again \
+                         moves it.",
+                        o.unit,
+                        o.point.display(),
+                        point.display(),
+                        m.name
+                    ),
+                });
+            }
         }
 
         // Still "mounted" to the kernel. Reporting it as Foreign would leave it neither
@@ -608,7 +616,6 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             });
         }
 
-        let unit = self.units.status(&m.unit_name()).await?;
         Ok(match (live, unit) {
             (true, UnitStatus::Active | UnitStatus::Activating) => MountState::Mounted,
             // A teardown the user asked for. Reporting it as anything else would tell them
@@ -618,14 +625,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             (true, UnitStatus::Failed) => MountState::Failed {
                 reason: self.failure_reason(&m.unit_name()).await,
             },
-            // Mounted with no unit of ours *under this name*. Either somebody else
-            // started it, or one of our own units is still holding the point under the
-            // name this mount used to have.
+            // Mounted with no unit of ours *under this name*. Either somebody else started
+            // it, or a unit of ours is still holding the point the config has since moved
+            // away from it — under an old name, or under a name it still has.
             (true, UnitStatus::Inactive) => match orphans.iter().find(|o| o.point == point) {
                 Some(o) => MountState::Failed {
                     reason: format!(
-                        "{} is still served by {}, left over from a mount this config no \
-                         longer names — usually a rename. Unmounting {:?} frees it.",
+                        "{} is still served by {}, a mount of ours the config no longer \
+                         places there. Unmounting {:?} frees it.",
                         point.display(),
                         o.unit,
                         o.name
@@ -856,10 +863,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             let _guard = lock.lock().await;
 
             // This entry's own unit, up and serving the path the entry had before it was
-            // edited. Nothing here can succeed: the unit name is taken, so starting is
-            // refused by systemd, and waiting for the configured path waits for something
-            // that cannot arrive while that unit runs. Said plainly rather than as the
-            // ready-timeout it would otherwise become (#90).
+            // edited. Nothing here can succeed: with that unit up, the branches below wait
+            // on the configured path, and nothing can arrive there until it stops. Said
+            // plainly rather than as the ready-timeout it would otherwise become (#90).
             if let Some(o) = self
                 .orphans()
                 .await?
@@ -2612,6 +2618,16 @@ mod tests {
             msg.contains(&held.display().to_string()),
             "the refusal has to name the path in the way: {msg}"
         );
+    }
+
+    /// Stopping a moved mount is the way out of the state, and while it stops it reports as
+    /// what it is. A unit is still "serving" to the sweep right through `Deactivating`, so
+    /// without care the advice to unmount it survives the whole teardown.
+    #[tokio::test]
+    async fn a_moved_mount_being_torn_down_reports_as_unmounting() {
+        let (_sc, s, _) = moved("moved-stopping");
+        s.units.loaded.lock().unwrap()[0].status = UnitStatus::Deactivating;
+        assert_eq!(s.state("backup").await.unwrap(), MountState::Unmounting);
     }
 
     /// A `mount_point` respelled to the *same* directory through a symlink. Nothing has

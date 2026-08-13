@@ -189,13 +189,26 @@ changes under running mounts. Rename a mount and its unit is still up and still 
 same path, while the name now asked about does not exist — so the mount reads as foreign, and
 every gate that keys on ownership then works against the user (#71).
 
-The prefix is therefore **swept** as well as constructed. A unit matching it that no config
-entry names, and that is still serving, is **orphaned**: ours, distinct from foreign, and
-stoppable exactly as any mount of ours is. Where an orphan mounts comes from its own unit —
-the only place that mapping survives a config edit — and a unit whose recorded arguments
-cannot be read is left alone rather than guessed at. What is *actually* mounted there is not
-required to match the `remote:path` the unit was given, because rclone records the Fs it
-resolved rather than the argument it was handed.
+The prefix is therefore **swept** as well as constructed. A unit matching it that is still
+serving, and that the config no longer places where it is, is **orphaned**: ours, distinct
+from foreign, and stoppable exactly as any mount of ours is. *Where* is as much of that test
+as *whether* — a changed `mount_point` leaves the unit named by its entry and serving a path
+that entry has abandoned (#90) — so the sweep compares the unit's own recorded arguments
+against the configured path, and does not stop at matching names.
+
+A name proves no more in the other direction. A configured mount's unit counts as holding a
+point only if it is serving *and* serving that point; otherwise two entries whose mount
+points were exchanged would each vouch for the other.
+
+Where an orphan mounts comes from its own unit — the only place that mapping survives a
+config edit — and a unit whose recorded arguments cannot be read is left alone rather than
+guessed at, in both directions: never swept, and still trusted to hold its own point, because
+mistaking a live mount for an orphan invites an unmount that cuts it. What is *actually*
+mounted there is not required to match the `remote:path` the unit was given, because rclone
+records the Fs it resolved rather than the argument it was handed.
+
+An orphan the config still names is reported under that name, not as a second row beside it:
+one name carries one state, because a name is what a client keys on.
 
 ## The capability ladder
 

@@ -2,7 +2,7 @@
 //!
 //! One type for the tray, D-Bus and GTK to consume whichever tier produced it. The tier
 //! travels with the data, because the same struct means different things depending on
-//! where it came from: see DESIGN.md's capability ladder.
+//! where it came from: see DESIGN.md, "The capability ladder".
 
 use crate::capabilities::Tier;
 use crate::models::{DiskCache, Pending, Transfer, VfsQueue};
@@ -292,7 +292,7 @@ impl TransferState {
     ///
     /// **Necessary, not sufficient.** rclone enqueues a file when it is closed, so a write
     /// still in progress is invisible to every rc endpoint and this returns `true` while
-    /// it runs — measured; see DESIGN.md and #73. Use it to decide what to *offer*: a
+    /// it runs — measured in #73. Use it to decide what to *offer*: a
     /// mount it calls idle can still be refused by
     /// [`crate::supervisor::MountSupervisor::unmount`], which is where the kernel gets
     /// asked. #22 would let this see an open write itself.
@@ -712,8 +712,7 @@ mod tests {
 
     #[test]
     fn counts_only_never_borrows_a_byte_total_from_the_cache_size() {
-        // `diskCache.bytesUsed` is cache size, not pending bytes — the one trap DESIGN
-        // names for this endpoint.
+        // `diskCache.bytesUsed` is cache size, not pending bytes (#9).
         let s = TransferState::from_stats("backup", &unhealthy_cache());
         assert_eq!(
             s.pending.known_bytes, 0,

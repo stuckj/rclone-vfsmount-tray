@@ -1,7 +1,8 @@
 # Repository conventions
 
-Notes for agent sessions working in this repo. `CONTRIBUTING.md` covers the same ground
-for humans; this adds the things that have actually gone wrong here.
+Notes for agent sessions working in this repo. `CONTRIBUTING.md` is the human-facing guide
+to building and submitting, and `DESIGN.md` holds the invariants restated below; this adds
+the things that have actually gone wrong here.
 
 ## Layout
 
@@ -21,6 +22,36 @@ The service and the clients communicate over D-Bus, not by linking.
 
 `crates/gtk` is excluded from `default-members`, so a bare `cargo build` works without GTK
 headers.
+
+## What goes in which document
+
+**`README.md`** — for a user, who is probably not an engineer. What the project does, how
+to install it, how to use it. It links to the others rather than repeating them.
+
+**`CONTRIBUTING.md`** — how to work on the project: checkout, the checks, the toolchain
+specifics that trip people up, how to submit. No design content.
+
+**`DESIGN.md`** — directional only: how the application *should* work. Components,
+boundaries, who owns what across them, and the decisions that constrain future work,
+including ones not built yet. It changes when that direction changes — a component added
+or removed, a boundary moved, a responsibility reassigned — and not otherwise. A thousand
+code changes can leave it untouched.
+
+**The code** — the authority on how the application *actually* works.
+
+Detail belongs one layer below wherever it is tempting to put it. A measurement goes in a
+test that fails when it stops being true, and in the dated PR or issue — not in
+`DESIGN.md`, which cannot fail and will outlive the measurement. A mechanism goes in the
+code — not in `DESIGN.md`, which will drift from it. `DESIGN.md` says a thing can fail and
+gives an example or two *as examples*; it does not catalogue the ways.
+
+The one exception: a measured fact that a directional decision *rests* on stays in
+`DESIGN.md`, because the decision is unreadable without it. State it in a clause, name the
+issue that took it, and do not let the table it came from follow it in. Stripping those
+facts out is as wrong as importing the catalogue.
+
+The corollary for both prose and comments: do not describe the same mechanism twice. See
+"Documentation restated in many places" below for what that has already cost here.
 
 ## Invariants
 
@@ -67,8 +98,10 @@ than the regex that enforces it. Check `rclone` source or real output before wri
 comment about it.
 
 **Documentation restated in many places.** The same rationale appeared in up to eight
-locations; one copy went stale and produced a real bug. `DESIGN.md` is the single home for
-reasoning. Code comments state the rule and point there.
+locations; one copy went stale and produced a real bug. State a rule once, in the layer
+that owns it — see "What goes in which document" above — and do not restate it elsewhere.
+A cross-reference is only worth adding if the thing it points at actually says more than
+the comment already does; a pointer to a section that has since moved is its own defect.
 
 **A search that found nothing, believed.** Three rules for checking a claim about this
 codebase, each learned from a wrong answer:
@@ -94,8 +127,8 @@ naming the constraint over narrating the discovery.
 
 **10-20% of lines is normal, as a guide rather than a limit.** Above that, re-read the
 comments against the rules above and check each one is still about the code: the usual
-cause of a high ratio is explaining consequences and justifying decisions inline, both of
-which belong in DESIGN.md.
+cause of a high ratio is narrating consequences at length. Keep the constraint, drop the
+essay around it.
 
 Two kinds of file legitimately sit higher. One documents an external format or behaviour
 nothing in the code implies — `mountinfo.rs` and the kernel's mountinfo layout. The other

@@ -33,8 +33,8 @@ static LIVE: Mutex<usize> = Mutex::new(0);
 /// The stamp is there because pids are reused, and truncating it to 32 bits — worth 11
 /// bytes of the socket budget above — makes a repeat improbable rather than impossible.
 /// Two processes collide only on the same pid *and* start times an exact multiple of
-/// 4.295s apart. [`create_exclusive`] is what catches that, rather than this. See
-/// DESIGN.md.
+/// 2^32 nanoseconds apart, which is where the odd-looking ~4.3s comes from.
+/// [`create_exclusive`] is what catches that, rather than this.
 fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {

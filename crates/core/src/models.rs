@@ -173,8 +173,10 @@ impl Transfer {
 
     /// Whether this transfer came out of `cache_path` (a mount's [`DiskCache::path`]).
     ///
-    /// Compares for equality after stripping rclone's `:backend{hash}:` tag. Looser matching
-    /// misattributes between sibling and nested mounts — see DESIGN.md.
+    /// Compares for equality after stripping rclone's `:backend{hash}:` tag, which is what
+    /// `srcFs` carries (#9). Substring matching would let `…/photos` claim
+    /// `…/photos-backup`; prefix matching fixes that but still lets a parent absorb a
+    /// nested mount's transfers.
     pub fn belongs_to_cache(&self, cache_path: &str) -> bool {
         if cache_path.is_empty() {
             return false;

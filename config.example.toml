@@ -6,8 +6,10 @@
 # This file is meant to be hand-edited — the graphical mount editor is not built yet.
 # Restart the service after editing; it does not watch this file yet.
 #
-# It references rclone remotes by name. It never contains credentials; those stay in
-# rclone's own config, which `rclone config` manages.
+# It references rclone remotes by name, so it needs no credentials of its own: those stay
+# in rclone's own config, which `rclone config` manages. The exception is `extra_args`
+# below, which is passed to rclone verbatim — a credential flag put there does end up in
+# this file. Check for that before sharing it.
 
 # Schema version. Leave it alone unless a release note says otherwise; a file claiming a
 # newer version than the installed build is refused rather than half-read.

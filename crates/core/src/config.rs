@@ -1,7 +1,8 @@
 //! The applet's own configuration: which mounts it manages, and how it behaves.
 //!
 //! Distinct from rclone's config, which holds the remotes. This file references those by
-//! name; it never duplicates them and never contains credentials.
+//! name and needs no credential of its own. [`Mount::extra_args`] is the exception: it
+//! reaches rclone verbatim, so a credential flag put there is stored here.
 //!
 //! Until the GTK editor lands (#42) this file *is* the configuration UI, so it is meant
 //! to be hand-edited. `config.example.toml` is the annotated reference.
@@ -166,7 +167,7 @@ impl CacheMode {
     /// enqueues a file when it is **closed**, so an open write sits dirty in the cache and
     /// absent from the queue for as long as it takes to write. Nothing over rc sees that —
     /// a non-empty cache does not imply it, since a clean entry lingers for
-    /// `--vfs-cache-max-age` and under `full` a plain read creates one. See DESIGN.md.
+    /// `--vfs-cache-max-age` and under `full` a plain read creates one.
     pub fn all_writes_queued(self) -> bool {
         matches!(self, CacheMode::Writes | CacheMode::Full)
     }
@@ -206,7 +207,7 @@ pub struct Mount {
     #[serde(default)]
     pub gid: Option<u32>,
     /// A file mode mask, octal, as a string so `0022` survives a round trip. A leading `0`
-    /// or `0o` is optional; it is re-spelled before it reaches rclone. See DESIGN.md.
+    /// or `0o` is optional; it is re-spelled before it reaches rclone (#92).
     #[serde(default)]
     pub umask: Option<String>,
 
@@ -322,8 +323,9 @@ impl Mount {
     }
 }
 
-/// Largest `umask` rclone will accept. See DESIGN.md, "`--umask` is two flags wearing one
-/// name", for why it is not the `0o777` that is all rclone can use.
+/// Largest `umask` rclone will accept — `i32::MAX`, since 1.68.0 parses the flag as a
+/// signed 32-bit octal. Only the low nine bits mean anything, but refusing a value rclone
+/// itself takes is not this project's call. The per-version boundary is measured in #92.
 const MAX_UMASK: u128 = 0o17777777777;
 
 /// The bits a [`Mount::umask`] spells. Too many digits saturates rather than failing, so
@@ -337,7 +339,7 @@ fn umask_bits(s: &str) -> Option<u128> {
 }
 
 /// `--umask` as leading-zero octal, the one spelling every supported rclone reads alike.
-/// Anything [`Config::validate`] would reject passes through untouched. See DESIGN.md.
+/// Anything [`Config::validate`] would reject passes through untouched.
 fn canonical_umask(s: &str) -> String {
     match umask_bits(s) {
         Some(bits) if bits <= MAX_UMASK => format!("0{bits:o}"),
@@ -346,7 +348,7 @@ fn canonical_umask(s: &str) -> String {
 }
 
 /// The effective masks an ambiguous `umask` means to rclone before 1.68.0 and to rclone
-/// now, when those differ. See DESIGN.md.
+/// now, when those differ. The per-version readings are measured in #92.
 pub fn umask_readings(s: &str) -> Option<(String, String)> {
     let now = umask_bits(s)? & 0o777;
     let unsigned = s.strip_prefix('+').unwrap_or(s);

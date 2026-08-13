@@ -30,13 +30,17 @@ const FS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an unmount redirected onto another name waits for that name's lock.
 ///
-/// Bounded, because the redirect graph can contain a cycle. An orphan's name can be a
-/// configured name now that a moved entry's own unit is one (#90), so two unmounts can
-/// each redirect onto the other's name and wait on each other — and nothing else in the
-/// sequence times out, so the two names would be unusable for the life of the process.
-/// Longer than a stop can legitimately take, so it expires on a cycle and not on a slow
-/// unmount.
-const REDIRECT_LOCK_WAIT: Duration = Duration::from_secs(90);
+/// A redirect needs its own unit not to be serving and the unit it redirects onto to be
+/// serving, so within one view of the world a redirect target is never itself a redirect
+/// source and the waits cannot cycle. What the bound is for is that the two halves are
+/// read at different moments: if each of two units stops between its own sweep and its own
+/// status read, both can redirect onto the other's name and wait on each other. An orphan
+/// name can be a configured name since #90, so nothing about the names rules it out.
+///
+/// Nothing else in the sequence times out, so an unbounded wait would leave both names
+/// unusable for the life of the process. Set far above any unmount this code will sit
+/// through on its own, so it expires on that race and never on a slow stop.
+const REDIRECT_LOCK_WAIT: Duration = Duration::from_secs(300);
 
 /// How hard to try when asking the kernel for a mount point back.
 ///
@@ -320,11 +324,12 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// leaves the name alone, so the unit keeps running against the path the entry used to
     /// have — which the entry no longer names, however little else changed (#90).
     ///
-    /// Being named by no config entry is not enough to make a unit the owner of a mount
-    /// point: its argv records only where it *meant* to mount, so a leftover would claim
-    /// whatever turns up at that path afterwards, and stopping it would take down a mount
-    /// that was never its own. It must also be [serving](UnitStatus::is_serving), and not
-    /// be shadowing a configured mount whose own unit is up.
+    /// Serving a path the config does not put it at is not enough on its own to make a
+    /// unit the owner of that path: its argv records only where it *meant* to mount, so a
+    /// leftover would claim whatever turns up there afterwards, and stopping it would take
+    /// down a mount that was never its own. It must also be
+    /// [serving](UnitStatus::is_serving), and not be shadowing a configured mount whose own
+    /// unit is [holding that very point](Self::configured_unit_holds).
     ///
     /// What is mounted there is deliberately **not** required to match the `remote:path`
     /// the unit was given. mountinfo carries the Fs rclone resolved, not the argument it
@@ -487,12 +492,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
 
     /// Which unit an unmount request has to act on.
     ///
-    /// Usually the one the configured mount names. It can also be an orphan: addressed
-    /// directly, under the name its unit was started with, or reached through a
-    /// configured mount whose point that orphan is the one still holding — what a rename
-    /// leaves behind. Both have to stop the unit: taken for foreign instead, the mount
-    /// cannot be unmounted without `force`, and `force` cannot escalate past a holder,
-    /// because [`Release::Detach`] is gated on the mount being ours.
+    /// Usually the one the configured mount names. It can also be an orphan, reached three
+    /// ways: addressed directly under the name its unit was started with; through a
+    /// configured mount whose point that orphan is the one still holding, which is what a
+    /// rename leaves behind; or as the configured mount's *own* unit, serving a path that
+    /// is no longer the configured one, which is what a moved `mount_point` leaves (#90).
+    /// All of them have to stop the unit: taken for foreign instead, the mount cannot be
+    /// unmounted without `force`, and `force` cannot escalate past a holder, because
+    /// [`Release::Detach`] is gated on the mount being ours.
     async fn unmount_target(&self, name: &str) -> Result<Target, SupervisorError> {
         let orphans = self.orphans().await?;
         let Ok(m) = self.mount_config(name) else {
@@ -877,18 +884,24 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // edited. Nothing here can succeed: with that unit up, the branches below wait
             // on the configured path, and nothing can arrive there until it stops. Said
             // plainly rather than as the ready-timeout it would otherwise become (#90).
-            if let Some(o) = self
-                .orphans()
-                .await?
-                .into_iter()
-                .find(|o| o.unit == m.unit_name())
-            {
-                return Err(SupervisorError::NotManaged(format!(
-                    "{name}: {} is still serving {}, the mount point this entry had before \
-                     it was changed. Unmount {name} first, then mount it again.",
-                    o.unit,
-                    o.point.display()
-                )));
+            //
+            // Unless it is already stopping, which is the wait the branches below are for
+            // and the same exemption `resolve` makes: refusing here would answer "unmount
+            // it first" to somebody whose unmount is in progress.
+            if self.units.status(&m.unit_name()).await? != UnitStatus::Deactivating {
+                if let Some(o) = self
+                    .orphans()
+                    .await?
+                    .into_iter()
+                    .find(|o| o.unit == m.unit_name())
+                {
+                    return Err(SupervisorError::NotManaged(format!(
+                        "{name}: {} is still serving {}, the mount point this entry had \
+                         before it was changed. Unmount {name} first, then mount it again.",
+                        o.unit,
+                        o.point.display()
+                    )));
+                }
             }
 
             let point = Self::resolved_point(m).await;
@@ -1050,10 +1063,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                         .await
                         .map_err(|_| SupervisorError::Busy {
                             detail: format!(
-                                "{}: {} is still being operated on under the name {:?}. If \
-                                 both were unmounted at once with their mount points \
-                                 exchanged, each is waiting for the other; retrying one at \
-                                 a time clears it.",
+                                "{}: gave up waiting for {}, which is being operated on \
+                                 under the name {:?}. Retrying this one on its own will \
+                                 say what is actually wrong with it.",
                                 name, target.unit, target.name
                             ),
                         })?,

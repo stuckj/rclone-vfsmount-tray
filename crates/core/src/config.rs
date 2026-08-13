@@ -362,11 +362,14 @@ pub fn umask_readings(s: &str) -> Option<(String, String)> {
 
 /// Whether rclone will accept this as a `--vfs-cache-max-size`.
 ///
-/// Only the unit is judged, never the number. rclone reads the number with Go's
-/// `ParseFloat`, which takes spellings Rust's does not — `1_0` and `0x1p4` are both sizes
-/// rclone accepts — and rejecting those here would refuse a config that works. The unit is
-/// where the mistake happens: `10GB` is the plausible spelling of `10G`, and the grammar
-/// has no room for it.
+/// Judges the unit, and asks of the number only whether it is one. rclone reads it with
+/// Go's `ParseFloat`, which takes spellings Rust's does not — `1_0`, `0x1p4` and `infG` are
+/// all sizes rclone accepts — so anything whose leading part is not a plain number is left
+/// alone: there is no unit in it this can be sure about. The unit is where the mistake
+/// happens: `10GB` is the plausible spelling of `10G`, and the grammar has no room for it.
+///
+/// The two things judged outright are a leading `-`, because rclone refuses a negative
+/// size and `off` is the unlimited one is reaching for, and surrounding whitespace.
 ///
 /// `B` is bytes and stands alone; `K` to `E` each take an optional `i`, and a `B` only
 /// after that `i`. So `10G`, `10Gi` and `10GiB` are one size, while `10GB`, `10i` and
@@ -380,16 +383,15 @@ fn size_suffix_ok(v: &str) -> bool {
     if v.eq_ignore_ascii_case("off") {
         return true;
     }
-    // rclone refuses every negative size, and `off` is the unlimited a `-1` is reaching
-    // for. A leading `+` it does accept.
-    if v != v.trim() || v.starts_with('-') {
+    // A leading `+` rclone does accept.
+    if v.is_empty() || v != v.trim() || v.starts_with('-') {
         return false;
     }
     let (number, unit) = v.split_at(v.trim_end_matches(char::is_alphabetic).len());
-    if number.is_empty() {
-        return false;
+    if unit.is_empty() || number.parse::<f64>().is_err() {
+        return true;
     }
-    if unit.eq_ignore_ascii_case("b") || unit.is_empty() {
+    if unit.eq_ignore_ascii_case("b") {
         return true;
     }
     // Peeled in this order so that a `b` reaching the scale letter without a lower-case
@@ -1238,12 +1240,15 @@ mod tests {
             "10G", "10g", "10GiB", "10Gi", "10GI", "10gib", "10Gib", "10gI", "10B", "10b", "10",
             "10.5G", "off", "OFF", "Off", "0", "0B", "1P", "1E", "1T", "10K", "10k", "10Ki", "10M",
             "10Mi", "10MiB", ".5G", "10.", "+10G", "1e3", "1e-3", "1e3G", "10Ei", "1_0", "0x1p4",
+            // Go's `ParseFloat` reads these, so rclone takes them as sizes. Here to hold
+            // the check off the number: it is the trailing `G` that has to be judged.
+            "infG", "InfG", "nanG", "NaNG", "infGiB",
         ] {
             assert!(size_suffix_ok(good), "rclone accepts {good:?}");
         }
         for bad in [
             "10GB", "10KB", "1MB", "10kB", "10GIB", "10KIB", "10gIB", "10Q", "", "-1", "-10G",
-            "10Bi", "10iB", "10i", " 10G", "10G ", "inf", "NaN", "G",
+            "10Bi", "10iB", "10i", " 10G", "10G ",
         ] {
             assert!(!size_suffix_ok(bad), "rclone refuses {bad:?}");
         }
@@ -1279,7 +1284,10 @@ mod tests {
             "-1h",
             "-1",
             "1us",
+            // Both spellings of micro: U+00B5 MICRO SIGN, then U+03BC GREEK SMALL LETTER
+            // MU. Go's parser takes either, and only one of them is the one people type.
             "1µs",
+            "1μs",
             "1h0m0s",
             "0s",
             "1e3",
@@ -1319,8 +1327,15 @@ mod tests {
                 "{through:?} is left for rclone to refuse"
             );
         }
-        // A hex integer is not a Go float; rclone wants the `p` exponent.
-        assert!(size_suffix_ok("0x10"), "left for rclone to refuse");
+        // A hex integer is not a Go float; rclone wants the `p` exponent. `inf`, `NaN` and
+        // a bare unit have no number for rclone's `ParseFloat` to read, and no number is
+        // also what this check declines to have an opinion about.
+        for through in ["0x10", "inf", "NaN", "G"] {
+            assert!(
+                size_suffix_ok(through),
+                "{through:?} is left for rclone to refuse"
+            );
+        }
     }
 
     #[test]

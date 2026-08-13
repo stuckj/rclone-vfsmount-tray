@@ -1,47 +1,38 @@
-//! Every quoted design-document citation in the code names a heading that still exists.
+//! Every `DESIGN.md, "Heading"` citation in a Rust comment names a heading that exists.
 //!
 //! A pointer into a document that has been reorganised is worse than no pointer: it reads
-//! as authoritative and sends the reader to a section that no longer says the thing. The
-//! citations wrap across rustdoc lines, so the text is rejoined before matching.
+//! as authoritative and sends the reader to a section that no longer says the thing.
 //!
-//! One spelling is read reliably — `DESIGN.md, "Section name"` — along with the near
-//! variants the control test pins. Write citations that way and they are checked.
-//!
-//! Other shapes are missed rather than mis-reported: a `/* */` block comment, a `.md` file
-//! (only `crates/**/*.rs` is walked), an unquoted section name, typographic quotes, a quote
-//! separated from the mention by a sentence boundary or by more than [`WINDOW`], and a
-//! continuation line of a multi-line string literal. That list is not a completeness
-//! proof — it is what has been tried. Every miss is a false negative.
+//! **One spelling is recognised, and that is the design.** Write `DESIGN.md, "Heading"` in
+//! a comment — wrapping across lines if it is long — and the citation is checked. Name a
+//! section any other way and this ignores it: unquoted, in a `/* */` block, trailing a line
+//! of code, or from a `.md` file. Those are not gaps to close. Recognising every way
+//! English can name a section costs a parser to maintain and buys what one line of
+//! convention already gives, and an unrecognised form is only ever a citation left
+//! unchecked — never a false report against a citation that is fine.
 
 use std::path::{Path, PathBuf};
 
-/// How far from a `DESIGN.md` mention a quoted heading may sit and still be a citation of
-/// it. Wide enough for every spelling in the tree and the obvious neighbours — `DESIGN.md,
-/// "…"`, `DESIGN.md under "…"`, `DESIGN.md's "…"`, `the "…" section of DESIGN.md` — and
-/// short enough that a quoted term in the next sentence is out of reach. Anything with a
-/// sentence boundary between the two is rejected regardless of distance.
-const WINDOW: usize = 48;
+/// The only form recognised. Read the module comment before widening it.
+const OPENER: &str = "DESIGN.md, \"";
 
-/// This guard, so an example written in one of its own comments is not taken for a claim
+/// This guard, whose own comments spell the form out and would otherwise be read as claims
 /// about the tree.
-const EXEMPT: [&str; 1] = ["crates/testutil/tests/design_citations_resolve.rs"];
+const EXEMPT: &str = "crates/testutil/tests/design_citations_resolve.rs";
 
 #[test]
 fn every_cited_design_heading_exists() {
     let root = workspace_root();
-    let headings = headings(&root.join("DESIGN.md"));
-    let mut broken = Vec::new();
+    let headings = headings_of(&read(&root.join("DESIGN.md")));
 
-    for (file, title) in citations(&root) {
-        if !resolves(&title, &headings) {
-            let rel = file
-                .strip_prefix(&root)
-                .unwrap_or(&file)
-                .display()
-                .to_string();
-            broken.push(format!("  {rel} cites \"{title}\""));
-        }
-    }
+    let broken: Vec<_> = citations(&root)
+        .into_iter()
+        .filter(|(_, title)| !resolves(title, &headings))
+        .map(|(file, title)| {
+            let rel = file.strip_prefix(&root).unwrap_or(&file).to_path_buf();
+            format!("  {} cites \"{title}\"", rel.display())
+        })
+        .collect();
 
     assert!(
         broken.is_empty(),
@@ -61,79 +52,35 @@ const MUST_REACH: [&str; 5] = [
     "crates/testutil/src/lib.rs",
 ];
 
-/// The control. An empty `broken` list above means nothing unless the extractor still
-/// finds citations that are really there, the matcher still rejects one that is not, and
-/// the walk still reaches the files that would carry an offender.
+/// The control. An empty result above proves nothing unless the extractor still reads a
+/// citation, the matcher still rejects a heading that is not there, a `#` inside a fence is
+/// still not a heading, and the walk still reaches every crate.
 #[test]
 fn the_guard_still_detects_what_it_is_looking_for() {
     let root = workspace_root();
-    let headings = headings(&root.join("DESIGN.md"));
+    let headings = headings_of(&read(&root.join("DESIGN.md")));
+
     assert!(
         headings.len() > 5,
         "parsed {} headings out of DESIGN.md, so the parser is broken",
         headings.len()
     );
 
-    let found = citations(&root);
-    assert!(
-        found
-            .iter()
-            .any(|(_, t)| t == "Delegated restart needs a pre-start hook to work at all"),
-        "the extractor no longer finds a citation that is present in the tree — update this \
-         literal if that section was deliberately renamed; it found: {:?}",
-        found.iter().map(|(_, t)| t).collect::<Vec<_>>()
-    );
-
-    // Every spelling against known input: the two in the tree, the two obvious neighbours,
-    // one wrapped across rustdoc lines, and one trailing a line of code.
+    // Plain and wrapped, which is the only variation the one supported form has.
     let sample = concat!(
         "/// Something. See DESIGN.md, \"first\".\n",
-        "/// More of it, per DESIGN.md under \"a wrapped\n",
+        "/// More of it, per DESIGN.md, \"a wrapped\n",
         "/// heading\", and done.\n",
-        "/// Then DESIGN.md's \"third\".\n",
-        "/// Then the \"fourth\" section of DESIGN.md.\n",
-        // Longer than WINDOW: real headings usually are, and only the closing quote is
-        // near the mention.
-        "/// And the \"a heading far longer than the window is wide\" section of DESIGN.md.\n",
-        "const N: usize = 1; // see DESIGN.md, \"fifth\"\n",
-        "const U: &str = \"unix://sock\"; // and DESIGN.md, \"sixth\"\n",
     );
     assert_eq!(
         cited_in(&comment_text(sample)),
-        [
-            "first",
-            "a wrapped heading",
-            "third",
-            "fourth",
-            "a heading far longer than the window is wide",
-            "fifth",
-            "sixth"
-        ]
-        .map(str::to_string),
-        "the extractor no longer reads every citation spelling it claims to"
+        ["first", "a wrapped heading"].map(str::to_string),
+        "the extractor no longer reads the form it claims to"
     );
 
-    // A quote the mention does not reach, and one a sentence boundary cuts off.
-    let noise = concat!(
-        "/// See DESIGN.md. The \"name\" field is separate.\n",
-        "/// A \"quoted term\" with no mention anywhere near it at all, padded out here.\n",
-    );
     assert!(
-        cited_in(&comment_text(noise)).is_empty(),
-        "the extractor reads ordinary quoted prose as a citation: {:?}",
-        cited_in(&comment_text(noise))
-    );
-
-    // An unbalanced quote earlier in the file must not hide a citation after it, which is
-    // what pairing quotes across the whole text instead of anchoring on the mention did.
-    let odd = concat!(
-        "/// The kernel says \"Device or resource busy.\n",
-        "/// See DESIGN.md, \"a heading that does not exist\".\n",
-    );
-    assert_eq!(
-        cited_in(&comment_text(odd)),
-        ["a heading that does not exist"].map(str::to_string),
-        "a stray quote upstream hides the citation below it"
+        !citations(&root).is_empty(),
+        "no citation found anywhere in the tree, so a clean result means nothing"
     );
 
     assert!(
@@ -141,7 +88,6 @@ fn the_guard_still_detects_what_it_is_looking_for() {
         "the matcher accepts a heading that does not exist, so it would accept anything"
     );
 
-    // A `#` line inside a fence is a comment in a sample, not a section to cite.
     assert_eq!(
         headings_of("## Real\n\n```toml\n# Not a heading\n```\n\n### Also real\n"),
         ["Real", "Also real"].map(str::to_string),
@@ -173,10 +119,6 @@ fn normalise(s: &str) -> String {
         .join(" ")
 }
 
-fn headings(design: &Path) -> Vec<String> {
-    headings_of(&std::fs::read_to_string(design).expect("DESIGN.md is missing"))
-}
-
 /// Headings outside fenced blocks. A `#` inside a fence is a shell or TOML comment, and
 /// counting one would let a citation resolve against a code sample instead of a section.
 fn headings_of(body: &str) -> Vec<String> {
@@ -198,120 +140,48 @@ fn headings_of(body: &str) -> Vec<String> {
 fn citations(root: &Path) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
     for file in rust_sources(&root.join("crates")) {
-        let rel = file.strip_prefix(root).unwrap_or(&file).to_path_buf();
-        if EXEMPT.iter().any(|e| rel == Path::new(e)) {
+        if file
+            .strip_prefix(root)
+            .is_ok_and(|r| r == Path::new(EXEMPT))
+        {
             continue;
         }
-        let Ok(body) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        for title in cited_in(&comment_text(&body)) {
+        for title in cited_in(&comment_text(&read(&file))) {
             out.push((file.clone(), title));
         }
     }
     out
 }
 
-/// The comment text of a source file, rejoined into one string so a citation that wraps
-/// across two rustdoc lines is still one run of text.
+/// The comment lines of a source file, rejoined into one string so a citation that wraps
+/// across two of them is a single run of text.
 fn comment_text(body: &str) -> String {
     body.lines()
-        .filter_map(|line| Some(&line[comment_start(line)? + 2..]))
+        .filter_map(|l| l.trim_start().strip_prefix("//"))
         .map(|l| l.trim_start_matches(['/', '!']).trim())
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-/// Where a line's comment starts. The first `//` is not always it — `"unix://…"` occurs in
-/// this tree — so string literals are skipped, honouring backslash escapes. A `'"'` char
-/// literal would fool this and hide a comment on that line: a citation missed, never one
-/// invented.
-fn comment_start(line: &str) -> Option<usize> {
-    let b = line.as_bytes();
-    let mut in_string = false;
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'\\' if in_string => i += 1,
-            b'"' => in_string = !in_string,
-            b'/' if !in_string && b.get(i + 1) == Some(&b'/') => return Some(i),
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-const MENTION: &str = "DESIGN.md";
-
-/// The longest a heading may be. A quote that runs past this is unbalanced prose, not a
-/// section name.
-const LONGEST: usize = 120;
-
-/// Every heading cited by a `DESIGN.md` mention, looking either side of it.
-///
-/// Anchored on the mention rather than on quotes, so a stray `"` elsewhere in the file
-/// cannot shift the pairing and hide a citation further down.
 fn cited_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(rel) = text[from..].find(MENTION) {
-        let at = from + rel;
-        let end = at + MENTION.len();
-        if let Some(title) = quoted_after(text, end).or_else(|| quoted_before(text, at)) {
-            out.push(title);
+    let mut rest = text;
+    while let Some(at) = rest.find(OPENER) {
+        rest = &rest[at + OPENER.len()..];
+        let Some(end) = rest.find('"') else { break };
+        let title = rest[..end].trim();
+        if !title.is_empty() {
+            out.push(title.to_string());
         }
-        from = end;
+        rest = &rest[end + 1..];
     }
     out
 }
 
-/// `DESIGN.md, "…"` — the quote follows the mention.
-fn quoted_after(text: &str, from: usize) -> Option<String> {
-    let window = &text[from..ceil(text, (from + WINDOW).min(text.len()))];
-    let open = window.find('"')?;
-    joined(&window[..open]).then_some(())?;
-    let rest = &text[from + open + 1..];
-    heading(&rest[..rest.find('"')?])
-}
-
-/// `the "…" section of DESIGN.md` — the quote precedes the mention.
-///
-/// Only the *closing* quote has to be within `WINDOW`; the opening one is sought back as
-/// far as `LONGEST`, since it is the heading's own length that separates them and most
-/// real headings are longer than the window.
-fn quoted_before(text: &str, to: usize) -> Option<String> {
-    let near = floor(text, to.saturating_sub(WINDOW));
-    let close = near + text[near..to].rfind('"')?;
-    joined(&text[close + 1..to]).then_some(())?;
-    let far = floor(text, close.saturating_sub(LONGEST + 1));
-    let open = far + text[far..close].rfind('"')?;
-    heading(&text[open + 1..close])
-}
-
-fn heading(run: &str) -> Option<String> {
-    let t = run.trim();
-    (!t.is_empty() && t.len() <= LONGEST).then(|| t.to_string())
-}
-
-/// Whether a gap between a quote and a `DESIGN.md` mention still joins them. A sentence
-/// ends the association: `See DESIGN.md. The "name" field …` cites nothing.
-fn joined(gap: &str) -> bool {
-    !gap.contains(". ") && !gap.trim_end().ends_with('.')
-}
-
-fn floor(s: &str, mut i: usize) -> usize {
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn ceil(s: &str, mut i: usize) -> usize {
-    while i < s.len() && !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
+/// Read, or fail naming the path. A file this cannot open is a hole in the guarantee
+/// rather than a file to pass over.
+fn read(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
 fn workspace_root() -> PathBuf {

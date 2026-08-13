@@ -1012,7 +1012,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 }
 
                 // The kernel decides, before rclone is signalled. Why this has to come
-                // first, and why any failure refuses, is in DESIGN.md under "the unmount
+                // first, and why any failure refuses, is in DESIGN.md, "The unmount
                 // order". #73.
                 match self.release_point(&point, Release::Refuse).await {
                     Ok(()) => {}

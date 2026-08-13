@@ -25,11 +25,17 @@ This is the missing front end:
   in the cloud
 
 That third point is the one that is missing everywhere else. When you save a file to an
-rclone mount, it lands in a local cache first and uploads afterwards. Nothing is lost if you
-disconnect before that finishes — the cache is on disk, and rclone picks up where it left off
-next time. But no existing tool tells you whether your work has actually reached the cloud,
-or how long it will take. This one is built around answering that, and around never showing
-you a number it cannot stand behind: if it does not know, it says so instead of showing zero.
+rclone mount, it lands in a local cache first and uploads afterwards. A queue you disconnect
+on is not lost — the cache is on disk, and rclone picks up where it left off next time. But
+no existing tool tells you whether your work has actually reached the cloud, or how long it
+will take. This one is built around answering that, and around never showing you a number it
+cannot stand behind: if it does not know, it says so instead of showing zero.
+
+The one case that *can* lose data is a file you are still writing when the mount goes away.
+rclone only queues a file once it is closed, so nothing can see a copy in progress, and a
+disconnect mid-write leaves the partial file to be uploaded later as though it were the whole
+thing. Disconnecting through this applet is therefore refused while anything is still using
+the mount, rather than cutting the writer off.
 
 ## How it is put together
 
@@ -38,15 +44,20 @@ window are both just clients that talk to it.
 
 That split buys you the main guarantee: **quitting the tray never disconnects anything.**
 Neither does restarting the service, or the service crashing. Each mount runs on its own, and
-keeps running until you say otherwise. The service also runs perfectly well with no tray at
-all, which is what you want on a machine you only ever reach over SSH.
+keeps running until you say otherwise.
+
+The service also runs perfectly well with no tray at all, which is what you want on a machine
+you only ever reach over SSH. One caveat there: by default Linux shuts your user's background
+services down when your last session ends, which would take the mounts with them. Run
+`loginctl enable-linger` once to keep them up between logins.
 
 ## Installing
 
 Not yet published. Once 0.1.0 ships there will be apt, dnf/yum, Homebrew and Nix packages.
 
-For now, build it from source. You will need a [Rust toolchain](https://rustup.rs), plus
-`rclone` and `fuse3` installed to actually mount anything.
+For now, build it from source. You will need a [Rust toolchain](https://rustup.rs) to build
+it, plus `rclone` and `fuse3` to mount anything. Mounts are run as systemd user units, so
+this needs a systemd-based distribution — which is most of them.
 
 ```sh
 git clone https://github.com/stuckj/rclone-vfsmount-tray
@@ -82,7 +93,8 @@ ones. **This file never contains passwords or keys** — those stay in rclone's 
 configuration, and this project never reads them.
 
 The graphical editor is not built yet, so this file is the way to set things up today. The
-service reads it at start-up and does not watch it, so restart the service after editing.
+service reads it once at start-up and does not watch it, so any edit takes effect the next
+time you start it.
 
 ## Running it
 
@@ -110,5 +122,3 @@ MIT — see [LICENSE](LICENSE).
 Mountain Duck® is a registered trademark of iterate GmbH. This project is not affiliated
 with, endorsed by, or derived from Mountain Duck; the name is used only to describe the kind
 of tool this is.
-</content>
-</invoke>

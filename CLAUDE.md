@@ -92,8 +92,10 @@ than the regex that enforces it. Check `rclone` source or real output before wri
 comment about it.
 
 **Documentation restated in many places.** The same rationale appeared in up to eight
-locations; one copy went stale and produced a real bug. `DESIGN.md` is the single home for
-reasoning. Code comments state the rule and point there.
+locations; one copy went stale and produced a real bug. State a rule once, in the layer
+that owns it — see "What goes in which document" above — and do not restate it elsewhere.
+A cross-reference is only worth adding if the thing it points at actually says more than
+the comment already does; a pointer to a section that has since moved is its own defect.
 
 **A search that found nothing, believed.** Three rules for checking a claim about this
 codebase, each learned from a wrong answer:
@@ -119,8 +121,8 @@ naming the constraint over narrating the discovery.
 
 **10-20% of lines is normal, as a guide rather than a limit.** Above that, re-read the
 comments against the rules above and check each one is still about the code: the usual
-cause of a high ratio is explaining consequences and justifying decisions inline, both of
-which belong in DESIGN.md.
+cause of a high ratio is narrating consequences at length. Keep the constraint, drop the
+essay around it.
 
 Two kinds of file legitimately sit higher. One documents an external format or behaviour
 nothing in the code implies — `mountinfo.rs` and the kernel's mountinfo layout. The other

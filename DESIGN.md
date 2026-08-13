@@ -5,8 +5,9 @@ A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mo
 This document is directional: what the pieces are, where the boundaries between them sit, who
 owns what across those boundaries, and the decisions that constrain what gets built next. It
 deliberately does not describe mechanism — the code is the authority on how any of this
-actually works — and it does not record measurements, which belong in tests that fail when
-they stop being true and in the issues that took them.
+actually works — and it does not catalogue measurements, which belong in tests that fail when
+they stop being true and in the issues that took them. Where a measured fact appears here it
+is because a decision rests on it, and it is stated once.
 
 ## What this is
 
@@ -231,10 +232,12 @@ is reported as unknown rather than as zero.
 
 Two consequences that are easy to get backwards:
 
-- **A transfer must be attributed to a mount before it counts.** `core/stats` is
-  process-global and reports cache *downloads* alongside write-back uploads. Keying on the
-  wrong signal shows a file being downloaded as a pending upload and counts its bytes toward
-  the total that decides whether unmounting is safe — wrong in the unsafe direction.
+- **A transfer must be attributed to a mount before it counts**, and that takes two
+  conditions rather than one: it is not an explicit `copy`/`sync` job, *and* its source is
+  that mount's own cache path. `core/stats` is process-global and reports cache *downloads*
+  alongside write-back uploads, so the first condition alone shows a file being downloaded as
+  a pending upload and counts its bytes toward the total that decides whether unmounting is
+  safe — wrong in the unsafe direction.
 - **An empty queue is not an idle mount.** rclone enqueues a file when it is *closed*, so
   every rc endpoint reports nothing outstanding for the whole duration of a large copy — this
   is the normal state, not a narrow race. Only the on-disk dirty flag sees it. For this one
@@ -355,5 +358,3 @@ rclone-vfsmount-trayd ──── poller ──► TransferState (carries its o
 - No embedded browser or webview.
 - Creating and editing rclone **remotes** is deliberately out of scope until 0.3.0. Listing
   and browsing existing remotes to choose a mount source is in from the start.
-</content>
-</invoke>

@@ -166,7 +166,7 @@ impl CacheMode {
     /// enqueues a file when it is **closed**, so an open write sits dirty in the cache and
     /// absent from the queue for as long as it takes to write. Nothing over rc sees that —
     /// a non-empty cache does not imply it, since a clean entry lingers for
-    /// `--vfs-cache-max-age` and under `full` a plain read creates one (#21).
+    /// `--vfs-cache-max-age` and under `full` a plain read creates one.
     pub fn all_writes_queued(self) -> bool {
         matches!(self, CacheMode::Writes | CacheMode::Full)
     }

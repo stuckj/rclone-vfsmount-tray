@@ -70,7 +70,8 @@ fn the_guard_still_detects_what_it_is_looking_for() {
         found
             .iter()
             .any(|(_, t)| t == "Delegated restart needs a pre-start hook to work at all"),
-        "the extractor no longer finds a citation that is present in the tree; it found: {:?}",
+        "the extractor no longer finds a citation that is present in the tree — update this \
+         literal if that section was deliberately renamed; it found: {:?}",
         found.iter().map(|(_, t)| t).collect::<Vec<_>>()
     );
 
@@ -106,6 +107,13 @@ fn the_guard_still_detects_what_it_is_looking_for() {
         "the matcher accepts a heading that does not exist, so it would accept anything"
     );
 
+    // A `#` line inside a fence is a comment in a sample, not a section to cite.
+    assert_eq!(
+        headings_of("## Real\n\n```toml\n# Not a heading\n```\n\n### Also real\n"),
+        ["Real", "Also real"].map(str::to_string),
+        "a commented line in a code sample counts as a heading, so citations resolve to it"
+    );
+
     let walked = rust_sources(&root.join("crates"));
     for rel in MUST_REACH {
         assert!(
@@ -132,11 +140,24 @@ fn normalise(s: &str) -> String {
 }
 
 fn headings(design: &Path) -> Vec<String> {
-    let body = std::fs::read_to_string(design).expect("DESIGN.md is missing");
-    body.lines()
-        .filter_map(|l| l.strip_prefix('#'))
-        .map(|l| l.trim_start_matches('#').trim().to_string())
-        .collect()
+    headings_of(&std::fs::read_to_string(design).expect("DESIGN.md is missing"))
+}
+
+/// Headings outside fenced blocks. A `#` inside a fence is a shell or TOML comment, and
+/// counting one would let a citation resolve against a code sample instead of a section.
+fn headings_of(body: &str) -> Vec<String> {
+    let mut fenced = false;
+    let mut out = Vec::new();
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+        } else if !fenced {
+            if let Some(rest) = line.strip_prefix('#') {
+                out.push(rest.trim_start_matches('#').trim().to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Every `(file, heading)` pair cited from a comment under `crates/`.

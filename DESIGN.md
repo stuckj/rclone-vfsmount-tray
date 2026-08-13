@@ -119,11 +119,11 @@ specification for tests rather than a description of them; asserting it against 
 is #38.
 
 **Whether a system update restarts this service is not established**, and the answer differs
-by install path: Home Manager's `sd-switch` does restart changed user units, `nixos-rebuild
-switch` is long documented as not reliably doing so
-([nixpkgs#29146](https://github.com/NixOS/nixpkgs/issues/29146)), and the `.deb`/`.rpm` case
-is unverified (#30, #34). None of the reasoning above depends on the answer. It is written
-down as an open question rather than deleted so the next person does not re-derive it.
+by install path: Home Manager's `sd-switch` does restart changed user units, while
+`nixos-rebuild switch` is long documented as not reliably doing so
+([nixpkgs#29146](https://github.com/NixOS/nixpkgs/issues/29146), #34). The `.deb`/`.rpm` case
+is unverified (#30). None of the reasoning above depends on the answer. It is written down as
+an open question rather than deleted so the next person does not re-derive it.
 
 ## How the service supervises mounts
 
@@ -204,10 +204,10 @@ build actually registers — never by comparing version numbers, which only gues
 
 The same applies to composing flags. rclone has changed what a flag *means* inside the
 supported range — `--umask` did at 1.68.0 (#69, pinned to that version in #92) — so send the
-spelling every supported version
-reads alike, rather than branching on a version discovered at start-up that need not be the
-binary which ends up running. Refuse a value no supported version accepts, and nothing beyond
-that: a config `Config::validate` rejects stops the service, not the mount carrying it.
+spelling every supported version reads alike, rather than branching on a version discovered
+at start-up that need not be the binary which ends up running. Refuse a value that cannot
+work on *every* supported version, and nothing beyond that: a config `Config::validate`
+rejects stops the service, not the mount carrying it.
 
 | Tier | Source | Gives | Verdict |
 |---|---|---|---|

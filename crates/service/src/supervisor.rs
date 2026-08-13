@@ -28,6 +28,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// enough to stop a wedged mount holding the executor, not to diagnose it.
 const FS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long an unmount redirected onto another name waits for that name's lock.
+///
+/// Bounded, because the redirect graph can contain a cycle. An orphan's name can be a
+/// configured name now that a moved entry's own unit is one (#90), so two unmounts can
+/// each redirect onto the other's name and wait on each other — and nothing else in the
+/// sequence times out, so the two names would be unusable for the life of the process.
+/// Longer than a stop can legitimately take, so it expires on a cycle and not on a slow
+/// unmount.
+const REDIRECT_LOCK_WAIT: Duration = Duration::from_secs(90);
+
 /// How hard to try when asking the kernel for a mount point back.
 ///
 /// Measured on rclone v1.75.0 and Linux 6.8, 15 MB written to a file still open: `-u` is
@@ -47,9 +57,10 @@ enum Release {
 /// The unit an operation acts on, and what is needed to act on it.
 ///
 /// A configured mount reduces to one of these, and so does an orphan — a unit of ours
-/// the config no longer names, rebuilt from the argv systemd still holds for it. Past
-/// this point the two are handled identically, which is the whole of #71: an orphan is
-/// stopped by stopping its unit, not by fusermounting the path it serves.
+/// the config no longer places where it is serving, rebuilt from the argv systemd still
+/// holds for it. Past this point the two are handled identically, which is the whole of
+/// #71: an orphan is stopped by stopping its unit, not by fusermounting the path it
+/// serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Target {
     /// The mount name, which is also the lock this operation holds.
@@ -299,7 +310,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         }
     }
 
-    /// Every unit of ours that is serving something the config no longer names.
+    /// Every unit of ours serving a path the config no longer puts it at.
     ///
     /// The sweep `UNIT_PREFIX` promises: without it a renamed mount leaves its old unit
     /// running and unaccounted for, and the mount point it holds reads as somebody
@@ -511,7 +522,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
                     mount = %target.name,
                     unit = %o.unit,
                     "stopping the unit still holding this mount point; the config no \
-                     longer names it"
+                     longer places it here"
                 );
                 Ok(o)
             }
@@ -1025,16 +1036,28 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
             // A redirect acts on a unit the caller's own lock does not guard, and after a
             // rename two names reach the same one — the configured entry and the orphan.
-            // Without this, both run the release-stop-clear sequence at once. Redirects
-            // only ever run configured name to orphan name, never the reverse, so holding
-            // the two in this order cannot cycle.
+            // Without this, both run the release-stop-clear sequence at once.
+            //
+            // Waited for, but not indefinitely — see [`REDIRECT_LOCK_WAIT`].
             let redirect_lock = if target.name != name {
                 Some(self.lock_for(&target.name).await)
             } else {
                 None
             };
             let _redirect_guard = match redirect_lock.as_ref() {
-                Some(l) => Some(l.lock().await),
+                Some(l) => Some(
+                    tokio::time::timeout(REDIRECT_LOCK_WAIT, l.lock())
+                        .await
+                        .map_err(|_| SupervisorError::Busy {
+                            detail: format!(
+                                "{}: {} is still being operated on under the name {:?}. If \
+                                 both were unmounted at once with their mount points \
+                                 exchanged, each is waiting for the other; retrying one at \
+                                 a time clears it.",
+                                name, target.unit, target.name
+                            ),
+                        })?,
+                ),
                 None => None,
             };
 
@@ -1229,9 +1252,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             for m in &self.config.mounts {
                 claimed.push(Self::resolved_point(m).await);
             }
-            // Ours, under a name the config dropped. Reported before the sweep below and
-            // counted as claimed, or the same mount point would appear twice: once as
-            // somebody else's, once as ours.
+            // Ours, at a path the config no longer puts them at. Reported before the sweep
+            // below and counted as claimed, or the same mount point would appear twice:
+            // once as somebody else's, once as ours.
             for o in orphans {
                 let named = self.config.mounts.iter().any(|m| m.unit_name() == o.unit);
                 claimed.push(o.point);

@@ -85,6 +85,12 @@ cache_mode = "writes"
 #
 # rclone will not evict data it has not yet uploaded, so a full cache stalls rather
 # than loses.
+#
+# Both are checked when this file is read, because rclone would otherwise reject them
+# at flag-parse time and the mount would simply never start. Sizes take `B`, or `K`,
+# `M`, `G`, `T`, `P` or `E` with an optional `i` or `iB` — "10G", "10Gi" and "10GiB"
+# are one size, and "10GB" is not one. Ages take a number and a unit from `ns` to `y`,
+# as in "24h"; "24H" is not a duration.
 cache_max_size = "10G"
 cache_max_age = "24h"
 

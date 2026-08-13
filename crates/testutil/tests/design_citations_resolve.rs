@@ -84,10 +84,19 @@ fn the_guard_still_detects_what_it_is_looking_for() {
         "/// Then DESIGN.md's \"third\".\n",
         "/// Then the \"fourth\" section of DESIGN.md.\n",
         "const N: usize = 1; // see DESIGN.md, \"fifth\"\n",
+        "const U: &str = \"unix://sock\"; // and DESIGN.md, \"sixth\"\n",
     );
     assert_eq!(
         cited_in(&comment_text(sample)),
-        ["first", "a wrapped heading", "third", "fourth", "fifth"].map(str::to_string),
+        [
+            "first",
+            "a wrapped heading",
+            "third",
+            "fourth",
+            "fifth",
+            "sixth"
+        ]
+        .map(str::to_string),
         "the extractor no longer reads every citation spelling it claims to"
     );
 
@@ -179,18 +188,33 @@ fn citations(root: &Path) -> Vec<(PathBuf, String)> {
 }
 
 /// The comment text of a source file, rejoined into one string so a citation that wraps
-/// across two rustdoc lines is still one run of text. Trailing comments count, but a `//`
-/// with an odd number of quotes before it is inside a string literal, not a comment —
-/// taking that would leave an unpaired quote and mis-pair everything after it.
+/// across two rustdoc lines is still one run of text.
 fn comment_text(body: &str) -> String {
     body.lines()
-        .filter_map(|line| {
-            let at = line.find("//")?;
-            (line[..at].matches('"').count() % 2 == 0).then(|| &line[at + 2..])
-        })
+        .filter_map(|line| Some(&line[comment_start(line)? + 2..]))
         .map(|l| l.trim_start_matches(['/', '!']).trim())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Where a line's comment starts. The first `//` is not always it — `"unix://…"` occurs in
+/// this tree — so string literals are skipped, honouring backslash escapes. A `'"'` char
+/// literal would fool this and hide a comment on that line: a citation missed, never one
+/// invented.
+fn comment_start(line: &str) -> Option<usize> {
+    let b = line.as_bytes();
+    let mut in_string = false;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\\' if in_string => i += 1,
+            b'"' => in_string = !in_string,
+            b'/' if !in_string && b.get(i + 1) == Some(&b'/') => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Every quoted run with a `DESIGN.md` mention close enough on either side to be citing it.

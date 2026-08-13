@@ -1,7 +1,8 @@
 # Repository conventions
 
-Notes for agent sessions working in this repo. `CONTRIBUTING.md` covers the same ground
-for humans; this adds the things that have actually gone wrong here.
+Notes for agent sessions working in this repo. `CONTRIBUTING.md` is the human-facing guide
+to building and submitting, and `DESIGN.md` holds the invariants restated below; this adds
+the things that have actually gone wrong here.
 
 ## Layout
 

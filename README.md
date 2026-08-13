@@ -32,7 +32,7 @@ no existing tool tells you whether your work has actually reached the cloud, or 
 will take. This one is built around answering that, and around never showing you a number it
 cannot stand behind: if it does not know, it says so instead of showing zero.
 
-The one case that *can* lose data is a file you are still writing when the mount goes away.
+The case that *can* lose data is a file you are still writing when the mount goes away.
 rclone only queues a file once it is closed, so nothing can see a copy in progress, and a
 disconnect mid-write leaves the partial file to be uploaded later as though it were the whole
 thing. Disconnecting through this applet is therefore refused while anything is still using
@@ -91,8 +91,10 @@ mount_point = "/home/you/mnt/photos"     # where it appears on your machine
 ```
 
 `rclone listremotes` shows the remotes you already have; `rclone config` is what creates new
-ones. **This file never contains passwords or keys** — those stay in rclone's own
-configuration, and this project never reads them.
+ones. **Nothing here needs a password or a key** — remotes are referred to by name, the
+secrets stay in rclone's own configuration, and this project never reads them. The one way a
+credential can end up in this file is if you put one there yourself, by passing a flag like
+`--s3-secret-access-key` through `extra_args`; check for that before sharing the file.
 
 The graphical editor is not built yet, so this file is the way to set things up today. The
 service reads it once at start-up and does not watch it, so any edit takes effect the next
@@ -107,8 +109,8 @@ time you start it.
 Today that finds rclone, reads your config, and logs the state of every mount it can see —
 including any rclone mount already running that this project did not start. Then it exits.
 It will **not** mount anything for you, so a fresh setup reports each of your mounts as
-unmounted and has no upload figures to show yet. Add `--log-level debug` for more, or
-`--config <path>` to point it at a different file.
+unmounted and has no upload figures to show yet. Use `--config <path>` to point it at a
+different file, and `--log-level debug` for more detail once there is something to report.
 
 Bringing mounts up on your behalf, and staying running to watch them, is what 0.1.0 is for.
 

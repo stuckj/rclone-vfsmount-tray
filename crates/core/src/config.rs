@@ -324,7 +324,7 @@ impl Mount {
 
 /// Largest `umask` rclone will accept — `i32::MAX`, since 1.68.0 parses the flag as a
 /// signed 32-bit octal. Only the low nine bits mean anything, but refusing a value rclone
-/// itself takes is not this project's call (#69).
+/// itself takes is not this project's call. The per-version boundary is measured in #92.
 const MAX_UMASK: u128 = 0o17777777777;
 
 /// The bits a [`Mount::umask`] spells. Too many digits saturates rather than failing, so

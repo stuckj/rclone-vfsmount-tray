@@ -120,9 +120,10 @@ is #38.
 
 **Whether a system update restarts this service is not established**, and the answer differs
 by install path: Home Manager's `sd-switch` does restart changed user units, `nixos-rebuild
-switch` is long documented as not reliably doing so, and the `.deb`/`.rpm` case is unverified
-(#30, #34). None of the reasoning above depends on the answer. It is written down as an open
-question rather than deleted so the next person does not re-derive it.
+switch` is long documented as not reliably doing so
+([nixpkgs#29146](https://github.com/NixOS/nixpkgs/issues/29146)), and the `.deb`/`.rpm` case
+is unverified (#30, #34). None of the reasoning above depends on the answer. It is written
+down as an open question rather than deleted so the next person does not re-derive it.
 
 ## How the service supervises mounts
 
@@ -202,7 +203,8 @@ across the supported range. **Feature-detect with `rc/list`**, which enumerates 
 build actually registers — never by comparing version numbers, which only guesses.
 
 The same applies to composing flags. rclone has changed what a flag *means* inside the
-supported range — `--umask` did at 1.68.0 (#69) — so send the spelling every supported version
+supported range — `--umask` did at 1.68.0 (#69, pinned to that version in #92) — so send the
+spelling every supported version
 reads alike, rather than branching on a version discovered at start-up that need not be the
 binary which ends up running. Refuse a value no supported version accepts, and nothing beyond
 that: a config `Config::validate` rejects stops the service, not the mount carrying it.
@@ -324,7 +326,9 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   shell-equivalent API wholesale would hand a sandboxed caller exactly what the sandbox exists
   to withhold. `core/command` and `config/dump` are never called and never reachable.
 - **Credentials are never read at all.** Mounting and reporting progress need remote *names*
-  and paths, not secrets, and nothing published over D-Bus carries either.
+  and paths, not secrets, and nothing published over D-Bus carries either. Note there is no
+  safe subset to read even if one were wanted: `config/get` is not a per-field getter, and
+  returns a whole remote's configuration with its credentials in it.
 - **Safety checks live service-side**, so a client cannot skip one by leaving a parameter out.
   A forced unmount is destructive, and `force` is explicit and defaults to off — a guard
   against accident and bugs, not against malice.

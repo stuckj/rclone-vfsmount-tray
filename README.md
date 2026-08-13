@@ -2,14 +2,15 @@
 
 A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mountain Duck.
 
-> **Status: early development — not usable yet.** There is no tray icon and no window. What
-> works today is the service underneath: it finds rclone, reads its configuration, starts,
-> stops and adopts mounts as systemd user units, and works out what each one still has to
-> upload. It then logs what it found and exits — it does not stay running, and nothing
-> connects to it yet. Follow the
+> **Status: early development — not usable yet.** There is no tray icon and no window, and
+> running it will not mount anything for you. What exists is the machinery underneath: it
+> finds rclone, reads its configuration, reports the state of every mount it can see, and
+> knows how to start, stop and adopt them as systemd user units and how to work out what
+> each one still has to upload. Nothing yet drives that on your behalf — the service reports
+> what it found and exits. Follow the
 > [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1) for progress.
 
-## What it does
+## What it will do
 
 rclone can mount cloud storage — Google Drive, S3, Dropbox, around 70 services — as a folder
 on your machine, downloading files as you open them and uploading changes in the background.
@@ -35,7 +36,8 @@ The one case that *can* lose data is a file you are still writing when the mount
 rclone only queues a file once it is closed, so nothing can see a copy in progress, and a
 disconnect mid-write leaves the partial file to be uploaded later as though it were the whole
 thing. Disconnecting through this applet is therefore refused while anything is still using
-the mount, rather than cutting the writer off.
+the mount, rather than cutting the writer off — unless you explicitly force it, which warns
+first and then does exactly that.
 
 ## How it is put together
 
@@ -99,13 +101,16 @@ time you start it.
 ## Running it
 
 ```sh
-./target/release/rclone-vfsmount-trayd --foreground
+./target/release/rclone-vfsmount-trayd
 ```
 
-Today that reconciles your mounts against the config, reports what each one has left to
-upload, and exits. Add `--log-level debug` for detail, or `--config <path>` to point it at a
-different file. Running it as a proper background service, with the tray attached, is what
-0.1.0 is for.
+Today that finds rclone, reads your config, and logs the state of every mount it can see —
+including any rclone mount already running that this project did not start. Then it exits.
+It will **not** mount anything for you, so a fresh setup reports each of your mounts as
+unmounted and has no upload figures to show yet. Add `--log-level debug` for more, or
+`--config <path>` to point it at a different file.
+
+Bringing mounts up on your behalf, and staying running to watch them, is what 0.1.0 is for.
 
 ## Documentation
 

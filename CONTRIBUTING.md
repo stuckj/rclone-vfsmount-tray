@@ -37,8 +37,11 @@ behaviour here has been measured against; the floor is 1.61) and `fuse3` on `PAT
 To run the service against your own config while developing:
 
 ```sh
-cargo run -p rclone-vfsmount-trayd -- --foreground --log-level debug
+cargo run -p rclone-vfsmount-trayd -- --log-level debug
 ```
+
+It reconciles, logs, and exits; it does not mount anything or stay up. `--foreground` is
+accepted but does nothing yet — there is no background mode for it to opt out of.
 
 ## Before opening a pull request
 

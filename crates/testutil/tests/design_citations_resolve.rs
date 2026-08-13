@@ -6,9 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// The two forms a citation takes here. Both are followed immediately by the quoted
-/// heading, which may be a fragment of it rather than the whole line.
-const OPENERS: [&str; 2] = ["DESIGN.md, \"", "DESIGN.md under \""];
+/// How far from a `DESIGN.md` mention a quoted heading may sit and still be a citation of
+/// it. Wide enough for every spelling in the tree and the obvious neighbours — `DESIGN.md,
+/// "…"`, `DESIGN.md under "…"`, `DESIGN.md's "…"`, `the "…" section of DESIGN.md` — and
+/// short enough that a quoted term in the next sentence is out of reach. Anything with a
+/// sentence boundary between the two is rejected regardless of distance.
+const WINDOW: usize = 48;
 
 /// This guard, so an example written in one of its own comments is not taken for a claim
 /// about the tree.
@@ -71,17 +74,31 @@ fn the_guard_still_detects_what_it_is_looking_for() {
         found.iter().map(|(_, t)| t).collect::<Vec<_>>()
     );
 
-    // Both forms against known input, the second wrapped across two rustdoc lines — the
-    // case that makes rejoining necessary.
+    // Every spelling against known input: the two in the tree, the two obvious neighbours,
+    // one wrapped across rustdoc lines, and one trailing a line of code.
     let sample = concat!(
-        "/// Something. See DESIGN.md, \"first title\".\n",
-        "/// More of it, per DESIGN.md under \"second\n",
-        "/// title\", and done.\n",
+        "/// Something. See DESIGN.md, \"first\".\n",
+        "/// More of it, per DESIGN.md under \"a wrapped\n",
+        "/// heading\", and done.\n",
+        "/// Then DESIGN.md's \"third\".\n",
+        "/// Then the \"fourth\" section of DESIGN.md.\n",
+        "const N: usize = 1; // see DESIGN.md, \"fifth\"\n",
     );
     assert_eq!(
         cited_in(&comment_text(sample)),
-        vec!["first title".to_string(), "second title".to_string()],
-        "the extractor no longer reads the citation forms it claims to"
+        ["first", "a wrapped heading", "third", "fourth", "fifth"].map(str::to_string),
+        "the extractor no longer reads every citation spelling it claims to"
+    );
+
+    // A quote the mention does not reach, and one a sentence boundary cuts off.
+    let noise = concat!(
+        "/// See DESIGN.md. The \"name\" field is separate.\n",
+        "/// A \"quoted term\" with no mention anywhere near it at all, padded out here.\n",
+    );
+    assert!(
+        cited_in(&comment_text(noise)).is_empty(),
+        "the extractor reads ordinary quoted prose as a citation: {:?}",
+        cited_in(&comment_text(noise))
     );
 
     assert!(
@@ -140,30 +157,75 @@ fn citations(root: &Path) -> Vec<(PathBuf, String)> {
     out
 }
 
-/// The comment lines of a source file, rejoined into one string so a citation that wraps
-/// across two rustdoc lines is still one run of text.
+/// The comment text of a source file, rejoined into one string so a citation that wraps
+/// across two rustdoc lines is still one run of text. Trailing comments count, but a `//`
+/// with an odd number of quotes before it is inside a string literal, not a comment —
+/// taking that would leave an unpaired quote and mis-pair everything after it.
 fn comment_text(body: &str) -> String {
     body.lines()
-        .map(str::trim_start)
-        .filter_map(|l| l.strip_prefix("//"))
+        .filter_map(|line| {
+            let at = line.find("//")?;
+            (line[..at].matches('"').count() % 2 == 0).then(|| &line[at + 2..])
+        })
         .map(|l| l.trim_start_matches(['/', '!']).trim())
         .collect::<Vec<_>>()
         .join(" ")
 }
 
+/// Every quoted run with a `DESIGN.md` mention close enough on either side to be citing it.
 fn cited_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for opener in OPENERS {
-        let mut rest = text;
-        while let Some(at) = rest.find(opener) {
-            rest = &rest[at + opener.len()..];
-            if let Some(end) = rest.find('"') {
-                out.push(rest[..end].trim().to_string());
-                rest = &rest[end + 1..];
-            }
+    let mut from = 0;
+    while let Some(rel_open) = text[from..].find('"') {
+        let open = from + rel_open;
+        let Some(rel_close) = text[open + 1..].find('"') else {
+            break;
+        };
+        let close = open + 1 + rel_close;
+        let title = text[open + 1..close].trim();
+
+        let before = &text[floor(text, open.saturating_sub(WINDOW))..open];
+        let after = &text[close + 1..ceil(text, (close + 1 + WINDOW).min(text.len()))];
+        if !title.is_empty() && (trails(before) || leads(after)) {
+            out.push(title.to_string());
         }
+        from = close + 1;
     }
     out
+}
+
+/// A mention ending this text, with nothing but connecting words after it.
+fn trails(before: &str) -> bool {
+    before
+        .rfind("DESIGN.md")
+        .is_some_and(|at| joined(&before[at + "DESIGN.md".len()..]))
+}
+
+/// A mention starting this text, with nothing but connecting words before it.
+fn leads(after: &str) -> bool {
+    after
+        .find("DESIGN.md")
+        .is_some_and(|at| joined(&after[..at]))
+}
+
+/// Whether a gap between a quote and a `DESIGN.md` mention still joins them. A sentence
+/// ends the association: `See DESIGN.md. The "name" field …` cites nothing.
+fn joined(gap: &str) -> bool {
+    !gap.contains(". ") && !gap.trim_end().ends_with('.')
+}
+
+fn floor(s: &str, mut i: usize) -> usize {
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn ceil(s: &str, mut i: usize) -> usize {
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 fn workspace_root() -> PathBuf {

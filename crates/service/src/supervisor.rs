@@ -600,9 +600,9 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         let unit = self.units.status(&m.unit_name()).await?;
 
         // This entry's own unit, serving a path the entry no longer names — `mount_point`
-        // edited while it was up. Answered before the rest, because everything below asks
-        // about the configured path, and nothing can arrive there while that unit holds the
-        // name (#90).
+        // edited while it was up. Answered before the rest, because everything below reads
+        // the configured path as this mount's, and it is not: whatever is or is not there,
+        // this mount is the one somewhere else (#90).
         //
         // Except while it is stopping, which is the one way out of this state: a teardown
         // the user asked for reports as one, here as everywhere else.
@@ -881,9 +881,10 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             let _guard = lock.lock().await;
 
             // This entry's own unit, up and serving the path the entry had before it was
-            // edited. Nothing here can succeed: with that unit up, the branches below wait
-            // on the configured path, and nothing can arrive there until it stops. Said
-            // plainly rather than as the ready-timeout it would otherwise become (#90).
+            // edited. Nothing good can come of the branches below: they read the state of
+            // the configured path as this mount's, so an empty one is waited out to the
+            // ready-timeout, and a *foreign* mount sitting there with our unit `Active`
+            // reports success over somebody else's filesystem. Said plainly instead (#90).
             //
             // Unless it is already stopping, which is the wait the branches below are for
             // and the same exemption `resolve` makes: refusing here would answer "unmount
@@ -910,9 +911,11 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 // alone it blocks every future attempt, since rclone cannot mount over
                 // it — so clear it rather than reporting success onto a dead mount.
                 if self.is_stale(&point).await {
-                    // Unless a unit of ours under a dropped name is still behind it: an
-                    // rclone whose FUSE connection has been aborted answers `ENOTCONN`
-                    // while systemd still reports its unit `active`. The release does not
+                    // Unless a unit of ours the config no longer places here is still
+                    // behind it: an rclone whose FUSE connection has been aborted answers
+                    // `ENOTCONN` while systemd still reports its unit `active`. Since #90
+                    // that unit can be one the config still names, under its own name, so
+                    // this is not only the dropped-name case. The release does not
                     // ask who owns the point, so it is asked here. A unit that has
                     // *exited* is not caught — it is no longer serving, by definition —
                     // and clearing the point it left is the whole purpose of this branch.
@@ -2663,6 +2666,22 @@ mod tests {
         let (_sc, s, _) = moved("moved-stopping");
         s.units.loaded.lock().unwrap()[0].status = UnitStatus::Deactivating;
         assert_eq!(s.state("backup").await.unwrap(), MountState::Unmounting);
+    }
+
+    /// Remounting a moved mount is unmount-then-mount, so the mount half arrives while the
+    /// unit is still stopping. Refusing it there would answer "unmount it first" to the
+    /// person whose unmount is running.
+    #[tokio::test]
+    async fn mounting_a_moved_mount_waits_out_its_teardown_rather_than_refusing() {
+        let (_sc, s, _) = moved("moved-remount");
+        s.units.loaded.lock().unwrap()[0].status = UnitStatus::Deactivating;
+        // The wait gives up once the unit is gone from systemd, which the fake reports as
+        // soon as the status stops being `Deactivating`; nothing here has to actually stop.
+        let waited = tokio::time::timeout(Duration::from_millis(200), s.mount("backup")).await;
+        assert!(
+            !matches!(waited, Ok(Err(SupervisorError::NotManaged(_)))),
+            "a teardown in progress is what the branches below wait for, got {waited:?}"
+        );
     }
 
     /// A `mount_point` respelled to the *same* directory through a symlink. Nothing has

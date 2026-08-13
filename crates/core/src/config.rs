@@ -360,6 +360,101 @@ pub fn umask_readings(s: &str) -> Option<(String, String)> {
     (before != now).then(|| (format!("0{before:o}"), format!("0{now:o}")))
 }
 
+/// Whether rclone will accept this as a `--vfs-cache-max-size`.
+///
+/// Only the unit is judged, never the number. rclone reads the number with Go's
+/// `ParseFloat`, which takes spellings Rust's does not — `1_0` and `0x1p4` are both sizes
+/// rclone accepts — and rejecting those here would refuse a config that works. The unit is
+/// where the mistake happens: `10GB` is the plausible spelling of `10G`, and the grammar
+/// has no room for it.
+///
+/// `B` is bytes and stands alone; `K` to `E` each take an optional `i`, and a `B` only
+/// after that `i`. So `10G`, `10Gi` and `10GiB` are one size, while `10GB`, `10i` and
+/// `10Bi` are errors, and a bare number is KiB. Case does not matter. Measured against
+/// rclone 1.61.1, 1.62.2 and 1.75.0 (#93); the three agree exactly, which is why nothing
+/// here branches on a version.
+fn size_suffix_ok(v: &str) -> bool {
+    if v.eq_ignore_ascii_case("off") {
+        return true;
+    }
+    // rclone refuses every negative size, and `off` is the unlimited a `-1` is reaching
+    // for. A leading `+` it does accept.
+    if v != v.trim() || v.starts_with('-') {
+        return false;
+    }
+    let (number, unit) = v.split_at(v.trim_end_matches(char::is_alphabetic).len());
+    if number.is_empty() {
+        return false;
+    }
+    let unit = unit.to_ascii_lowercase();
+    if unit.is_empty() || unit == "b" {
+        return true;
+    }
+    let scale = unit
+        .strip_suffix("ib")
+        .or_else(|| unit.strip_suffix('i'))
+        .unwrap_or(&unit);
+    matches!(scale, "k" | "m" | "g" | "t" | "p" | "e")
+}
+
+/// Units [`duration_ok`] accepts anywhere, because Go's `time.ParseDuration` does.
+const GO_DURATION_UNITS: &[&str] = &["ns", "us", "µs", "μs", "ms", "s", "m", "h"];
+
+/// Units [`duration_ok`] accepts only on their own, because only rclone's own parser knows
+/// them and it reads a single `<number><unit>`.
+const RCLONE_DURATION_UNITS: &[&str] = &["d", "w", "M", "y"];
+
+/// Whether rclone will accept this as a `--vfs-cache-max-age`.
+///
+/// rclone tries Go's `time.ParseDuration` first and falls back to its own parser, and only
+/// the fallback knows `d`, `w`, `M` and `y` — but the fallback reads one `<number><unit>`
+/// and nothing more. That is the shape of it: `1h30m` is fine because both units are Go's,
+/// while `1d12h` is refused because `d` never reaches a parser that can also read `h`.
+/// Case is load-bearing: `M` is a month, `m` a minute, and `1H` is not a duration at all.
+/// A bare number is seconds, and `off` — lower case only — is no limit.
+///
+/// Measured against rclone 1.61.1, 1.62.2 and 1.75.0 (#93), which agree exactly.
+fn duration_ok(v: &str) -> bool {
+    if v == "off" {
+        return true;
+    }
+    let Some(units) = duration_units(v) else {
+        return false;
+    };
+    match units.as_slice() {
+        [] => false,
+        [only] => {
+            only.is_empty()
+                || GO_DURATION_UNITS.contains(only)
+                || RCLONE_DURATION_UNITS.contains(only)
+        }
+        several => several.iter().all(|u| GO_DURATION_UNITS.contains(u)),
+    }
+}
+
+/// The unit of each `<number><unit>` the value is made of, in order, with an empty string
+/// for a number carrying none. `None` when it is not that shape at all — a unit with no
+/// number in front of it, which is also what a word like `OFF` looks like from here.
+fn duration_units(v: &str) -> Option<Vec<&str>> {
+    let mut rest = v.strip_prefix(['+', '-']).unwrap_or(v);
+    let mut units = Vec::new();
+    while !rest.is_empty() {
+        let digits = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        if digits == 0 {
+            return None;
+        }
+        rest = &rest[digits..];
+        let unit = rest
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(rest.len());
+        units.push(&rest[..unit]);
+        rest = &rest[unit..];
+    }
+    Some(units)
+}
+
 /// Prefix for every unit this service starts. Also how [`crate::supervisor`] tells its
 /// own units apart from any other rclone mount on the system.
 pub const UNIT_PREFIX: &str = "rvt-mount-";
@@ -638,6 +733,32 @@ impl Config {
                         )))
                     }
                     Some(_) => {}
+                }
+            }
+            // Both reach rclone as verbatim argv and fail at flag-parse time, which stops
+            // the unit before it has logged anything a user would connect to the config
+            // they just edited.
+            if let Some(v) = &m.cache_max_size {
+                if !size_suffix_ok(v) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mount {n:?}: cache_max_size {v:?} is not a size rclone accepts. Use \
+                         a number with `B` for bytes, or `K`, `M`, `G`, `T`, `P` or `E`, each \
+                         taking an optional `i` or `iB` — `10G`, `10Gi` and `10GiB` are the \
+                         same size, and `10GB` is not one. A bare number is KiB, and `off` \
+                         means no limit."
+                    )));
+                }
+            }
+            if let Some(v) = &m.cache_max_age {
+                if !duration_ok(v) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mount {n:?}: cache_max_age {v:?} is not a duration rclone accepts. \
+                         Use a number and a unit — `ns`, `us`, `ms`, `s`, `m`, `h`, `d`, `w`, \
+                         `M` for a month or `y` — as in `24h`. Only `ns` through `h` may be \
+                         combined, so `1h30m` works and `1d12h` does not, and case matters: \
+                         `M` is a month, `m` a minute. A bare number is seconds, and `off` \
+                         means no limit."
+                    )));
                 }
             }
         }
@@ -1110,6 +1231,72 @@ mod tests {
                 "umask {spelling:?} rejected as {msg:?}, which does not say {want:?}"
             );
         }
+    }
+
+    /// Every spelling in this table and the next was run against rclone 1.61.1, 1.62.2 and
+    /// 1.75.0 — the floor of the supported range, a point inside it, and the newest — with
+    /// `rclone mount --vfs-cache-max-size=<value>`, and a value counts as refused when
+    /// rclone's own error names the flag. All three agree on every row (#93).
+    ///
+    /// The odd-looking ones are load-bearing. `1_0` and `0x1p4` are numbers Go's
+    /// `ParseFloat` takes and Rust's does not, so they are here to hold the check to
+    /// judging the unit alone; `1e3` has no unit at all, and `10E` does.
+    #[test]
+    fn a_size_is_accepted_exactly_when_rclone_accepts_it() {
+        for good in [
+            "10G", "10g", "10GiB", "10Gi", "10gib", "10Gib", "10gI", "10B", "10b", "10", "10.5G",
+            "off", "OFF", "Off", "0", "0B", "1P", "1E", "1T", "10K", "10k", "10Ki", "10M", "10Mi",
+            "10MiB", ".5G", "10.", "+10G", "1e3", "1e-3", "1e3G", "10Ei", "1_0", "0x1p4",
+        ] {
+            assert!(size_suffix_ok(good), "rclone accepts {good:?}");
+        }
+        for bad in [
+            "10GB", "10KB", "1MB", "10kB", "10Q", "", "-1", "-10G", "10Bi", "10iB", "10i", " 10G",
+            "10G ", "inf", "NaN", "G",
+        ] {
+            assert!(!size_suffix_ok(bad), "rclone refuses {bad:?}");
+        }
+    }
+
+    /// The same measurement for `--vfs-cache-max-age`. `1d12h` and `1h30m` are the pair
+    /// that shows why: both read naturally, and only the one whose units Go's parser knows
+    /// works.
+    #[test]
+    fn an_age_is_accepted_exactly_when_rclone_accepts_it() {
+        for good in [
+            "24h", "1d", "1w", "1M", "1y", "1h30m", "90s", "1000ms", "1ms", "off", "0", "1",
+            "1.5h", "1.5", "1m", "100us", "1ns", "-1h", "-1", "1us", "1µs", "1h0m0s", "0s",
+        ] {
+            assert!(duration_ok(good), "rclone accepts {good:?}");
+        }
+        for bad in [
+            "24H", "24 h", "24hours", "1s30", "1S", "1h30", "1d12h", "1w2d", "1y6M", "OFF", "1e3s",
+            "",
+        ] {
+            assert!(!duration_ok(bad), "rclone refuses {bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_cache_limit_rclone_would_refuse() {
+        // The value the example config's `10G` invites, and the age spelling that looks
+        // like the size one. Both reach rclone verbatim, so validate is the only thing
+        // between them and a unit that never starts.
+        let mut size = with(vec![mount("a", "/mnt/one")]);
+        size.mounts[0].cache_max_size = Some("10GB".into());
+        let msg = size.validate().unwrap_err().to_string();
+        assert!(
+            msg.contains("cache_max_size") && msg.contains("10GB"),
+            "the refusal must name the field and the value, got {msg:?}"
+        );
+
+        let mut age = with(vec![mount("a", "/mnt/one")]);
+        age.mounts[0].cache_max_age = Some("24H".into());
+        let msg = age.validate().unwrap_err().to_string();
+        assert!(
+            msg.contains("cache_max_age") && msg.contains("24H"),
+            "the refusal must name the field and the value, got {msg:?}"
+        );
     }
 
     #[test]

@@ -96,8 +96,8 @@ and tying whether a filesystem is reachable to whether it has a bug is far too w
 radius for what it is. It is also restarted by hand, and by whatever is managing it.
 
 Nor is an unmount free to take back. rclone exits on `SIGTERM` without flushing its write-back
-queue, so an unmount at a moment the user did not choose can sever a write in flight. The
-cache is on disk and resumes, but the file that was mid-write does not un-truncate.
+queue (#73), so an unmount at a moment the user did not choose can sever a write in flight.
+The cache is on disk and resumes, but the file that was mid-write does not un-truncate.
 
 | Event | Mounts |
 |---|---|

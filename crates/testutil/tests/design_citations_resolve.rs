@@ -3,6 +3,10 @@
 //! A pointer into a document that has been reorganised is worse than no pointer: it reads
 //! as authoritative and sends the reader to a section that no longer says the thing. The
 //! citations wrap across rustdoc lines, so the text is rejoined before matching.
+//!
+//! Two kinds of citation are out of reach and would pass unchecked: one written in a
+//! `/* */` block comment, and one in a `.md` file, since only `crates/**/*.rs` is walked.
+//! Neither exists today.
 
 use std::path::{Path, PathBuf};
 
@@ -111,6 +115,18 @@ fn the_guard_still_detects_what_it_is_looking_for() {
         cited_in(&comment_text(noise))
     );
 
+    // An unbalanced quote earlier in the file must not hide a citation after it, which is
+    // what pairing quotes across the whole text instead of anchoring on the mention did.
+    let odd = concat!(
+        "/// The kernel says \"Device or resource busy.\n",
+        "/// See DESIGN.md, \"a heading that does not exist\".\n",
+    );
+    assert_eq!(
+        cited_in(&comment_text(odd)),
+        ["a heading that does not exist"].map(str::to_string),
+        "a stray quote upstream hides the citation below it"
+    );
+
     assert!(
         !resolves("a heading nobody has ever written", &headings),
         "the matcher accepts a heading that does not exist, so it would accept anything"
@@ -217,40 +233,50 @@ fn comment_start(line: &str) -> Option<usize> {
     None
 }
 
-/// Every quoted run with a `DESIGN.md` mention close enough on either side to be citing it.
+const MENTION: &str = "DESIGN.md";
+
+/// The longest a heading may be. A quote that runs past this is unbalanced prose, not a
+/// section name.
+const LONGEST: usize = 120;
+
+/// Every heading cited by a `DESIGN.md` mention, looking either side of it.
+///
+/// Anchored on the mention rather than on quotes, so a stray `"` elsewhere in the file
+/// cannot shift the pairing and hide a citation further down.
 fn cited_in(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut from = 0;
-    while let Some(rel_open) = text[from..].find('"') {
-        let open = from + rel_open;
-        let Some(rel_close) = text[open + 1..].find('"') else {
-            break;
-        };
-        let close = open + 1 + rel_close;
-        let title = text[open + 1..close].trim();
-
-        let before = &text[floor(text, open.saturating_sub(WINDOW))..open];
-        let after = &text[close + 1..ceil(text, (close + 1 + WINDOW).min(text.len()))];
-        if !title.is_empty() && (trails(before) || leads(after)) {
-            out.push(title.to_string());
+    while let Some(rel) = text[from..].find(MENTION) {
+        let at = from + rel;
+        let end = at + MENTION.len();
+        if let Some(title) = quoted_after(text, end).or_else(|| quoted_before(text, at)) {
+            out.push(title);
         }
-        from = close + 1;
+        from = end;
     }
     out
 }
 
-/// A mention ending this text, with nothing but connecting words after it.
-fn trails(before: &str) -> bool {
-    before
-        .rfind("DESIGN.md")
-        .is_some_and(|at| joined(&before[at + "DESIGN.md".len()..]))
+/// `DESIGN.md, "…"` — the quote follows the mention.
+fn quoted_after(text: &str, from: usize) -> Option<String> {
+    let window = &text[from..ceil(text, (from + WINDOW).min(text.len()))];
+    let open = window.find('"')?;
+    joined(&window[..open]).then_some(())?;
+    let rest = &text[from + open + 1..];
+    heading(&rest[..rest.find('"')?])
 }
 
-/// A mention starting this text, with nothing but connecting words before it.
-fn leads(after: &str) -> bool {
-    after
-        .find("DESIGN.md")
-        .is_some_and(|at| joined(&after[..at]))
+/// `the "…" section of DESIGN.md` — the quote precedes the mention.
+fn quoted_before(text: &str, to: usize) -> Option<String> {
+    let window = &text[floor(text, to.saturating_sub(WINDOW))..to];
+    let close = window.rfind('"')?;
+    joined(&window[close + 1..]).then_some(())?;
+    heading(&window[window[..close].rfind('"')? + 1..close])
+}
+
+fn heading(run: &str) -> Option<String> {
+    let t = run.trim();
+    (!t.is_empty() && t.len() <= LONGEST).then(|| t.to_string())
 }
 
 /// Whether a gap between a quote and a `DESIGN.md` mention still joins them. A sentence

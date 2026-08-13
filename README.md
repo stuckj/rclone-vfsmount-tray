@@ -48,10 +48,11 @@ That split buys you the main guarantee: **quitting the tray never disconnects an
 Neither does restarting the service, or the service crashing. Each mount runs on its own, and
 keeps running until you say otherwise.
 
-The service also runs perfectly well with no tray at all, which is what you want on a machine
+The service is built to run with no tray at all, which is what you want on a machine
 you only ever reach over SSH. One caveat there: by default Linux shuts your user's background
 services down when your last session ends, which would take the mounts with them. Run
-`loginctl enable-linger` once to keep them up between logins.
+`loginctl enable-linger` once to keep them up between logins — and if that is refused,
+`sudo loginctl enable-linger $USER`.
 
 ## Installing
 

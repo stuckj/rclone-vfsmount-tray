@@ -45,6 +45,11 @@ test that fails when it stops being true, and in the dated PR or issue — not i
 code — not in `DESIGN.md`, which will drift from it. `DESIGN.md` says a thing can fail and
 gives an example or two *as examples*; it does not catalogue the ways.
 
+The one exception: a measured fact that a directional decision *rests* on stays in
+`DESIGN.md`, because the decision is unreadable without it. State it in a clause, name the
+issue that took it, and do not let the table it came from follow it in. Stripping those
+facts out is as wrong as importing the catalogue.
+
 The corollary for both prose and comments: do not describe the same mechanism twice. See
 "Documentation restated in many places" below for what that has already cost here.
 

@@ -49,19 +49,14 @@ accepted but does nothing yet — there is no background mode for it to opt out 
 cargo fmt --all
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace
 ```
 
-All three run in CI and all three are blocking. `--locked` matters: the lockfile is
-committed, and without it you can pass locally against dependencies CI will not use. Read
-clippy's output rather than trusting its exit status.
-
-If you touched a public item's docs:
-
-```sh
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p rvt-core
-```
-
-Broken intra-doc links are an error, and the crate cross-references itself heavily.
+All four run in CI and all four are blocking. `--locked` matters: the lockfile is committed,
+and without it you can pass locally against dependencies CI will not use. `--workspace` on
+the last one matters for the same reason — a broken intra-doc link in the service crate is
+invisible to a `-p rvt-core` run and fails CI. Read clippy's output rather than trusting its
+exit status.
 
 ## Testing
 
@@ -142,7 +137,7 @@ Four places, and it matters which one you reach for:
 | | |
 |---|---|
 | `README.md` | For users, most of whom are not engineers. What it does, how to install it, how to use it. |
-| `CONTRIBUTING.md` | This file. How to build, test and submit. |
+| `CONTRIBUTING.md` | This file. How to build, test and submit. No design content. |
 | `DESIGN.md` | Directional only — components, boundaries, who owns what, and decisions that constrain future work. It changes when the *shape* of the design changes, not when its details do. |
 | the code | The authority on how anything actually works. |
 
@@ -155,6 +150,8 @@ lives in the code.
 Measurements are the common mistake. A fact about rclone's behaviour belongs in a test that
 fails when it stops being true, and in the pull request or issue that recorded it — both
 dated. `DESIGN.md` cannot fail, so a measurement written there quietly outlives its truth.
+The exception is a measured fact a design decision rests on, which stays in `DESIGN.md` as a
+clause naming the issue that took it — without it the decision cannot be read.
 
 ## Pull requests
 

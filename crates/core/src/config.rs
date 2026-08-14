@@ -360,13 +360,12 @@ pub fn umask_readings(s: &str) -> Option<(String, String)> {
     (before != now).then(|| (format!("0{before:o}"), format!("0{now:o}")))
 }
 
-/// Whether rclone will accept this as a `--vfs-cache-max-size`.
-///
-/// Only the unit is judged; of the number, only whether it is one. rclone reads it with
-/// Go's `ParseFloat`, so `1_0`, `0x1p4` and `infG` are all sizes it takes.
+/// rclone reads a size's number with Go's `ParseFloat`, so `1_0`, `0x1p4` and `infG` are
+/// all sizes it takes. Only the unit is judged here; of the number, only whether it is
+/// one. A spelling this lets through is left for rclone to refuse.
 ///
 /// Measured against rclone 1.61.1, 1.62.2 and 1.75.0 (#93), which agree on every spelling
-/// in [`tests::a_size_is_accepted_exactly_when_rclone_accepts_it`].
+/// in [`tests::a_size_matches_rclone_on_every_spelling_measured`].
 fn size_suffix_ok(v: &str) -> bool {
     if v.eq_ignore_ascii_case("off") {
         return true;
@@ -401,15 +400,13 @@ const DURATION_UNITS: &[&str] = &[
     "ns", "us", "µs", "μs", "ms", "s", "m", "h", "d", "w", "M", "y",
 ];
 
-/// Whether rclone will accept this as a `--vfs-cache-max-age`.
-///
-/// Judged as [`size_suffix_ok`] judges a size, and for the same reason. rclone's grammar
-/// here is wider still: a bare number is seconds however it is spelled, and an absolute
-/// timestamp is also a duration. What is caught is a number wearing a unit rclone has no
-/// name for — `24H`, `1D`, `24hours`.
+/// rclone's duration grammar is wider still than a size's: a bare number is seconds
+/// however it is spelled, and an absolute timestamp is also a duration. Judged as
+/// [`size_suffix_ok`] judges a size, so what is caught is a number wearing a unit rclone
+/// has no name for — `24H`, `1D`, `24hours`.
 ///
 /// Measured against rclone 1.61.1, 1.62.2 and 1.75.0 (#93), which agree on every spelling
-/// in [`tests::an_age_is_accepted_exactly_when_rclone_accepts_it`].
+/// in [`tests::an_age_matches_rclone_on_every_spelling_measured`].
 fn duration_ok(v: &str) -> bool {
     if v == "off" || v.is_empty() {
         return v == "off";
@@ -1207,7 +1204,7 @@ mod tests {
     /// Missing one rclone refuses costs rclone's error instead of ours, and
     /// `what_the_cache_limit_checks_deliberately_do_not_catch` holds those.
     #[test]
-    fn a_size_is_accepted_exactly_when_rclone_accepts_it() {
+    fn a_size_matches_rclone_on_every_spelling_measured() {
         for good in [
             "10G", "10g", "10GiB", "10Gi", "10GI", "10gib", "10Gib", "10gI", "10B", "10b", "10",
             "10.5G", "off", "OFF", "Off", "0", "0B", "1P", "1E", "1T", "10K", "10k", "10Ki", "10M",
@@ -1227,7 +1224,7 @@ mod tests {
 
     /// The same measurement for `--vfs-cache-max-age`.
     #[test]
-    fn an_age_is_accepted_exactly_when_rclone_accepts_it() {
+    fn an_age_matches_rclone_on_every_spelling_measured() {
         for good in [
             "24h",
             "1d",

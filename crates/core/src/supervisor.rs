@@ -215,12 +215,10 @@ pub trait MountSupervisor: Send + Sync {
     /// A configured mount that is down is reported [`MountState::Unmounted`], not
     /// omitted.
     ///
-    /// **One name, one row.** A unit left behind by a changed `mount_point` is still named
-    /// by its own entry, so it is reported once under that name as
-    /// [`MountState::Failed`], and the path it is holding gets no row of its own (#90).
-    /// A client offering "stop the leftover unit" therefore cannot key that on
-    /// [`MountState::Orphaned`] alone — a `Failed` row can need the same gesture, and its
-    /// reason names the unit and the path.
+    /// A unit left behind by a changed `mount_point` is still named by its entry, so it is
+    /// reported once under that name as [`MountState::Failed`] and the path it holds gets
+    /// no row of its own (#90). "Stop the leftover unit" therefore cannot key on
+    /// [`MountState::Orphaned`] alone.
     fn reconcile(&self) -> BoxFuture<'_, Result<Vec<DiscoveredMount>, SupervisorError>>;
 }
 

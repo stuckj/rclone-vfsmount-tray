@@ -30,16 +30,10 @@ const FS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long an unmount redirected onto another name waits for that name's lock.
 ///
-/// A redirect needs its own unit not to be serving and the unit it redirects onto to be
-/// serving, so within one view of the world a redirect target is never itself a redirect
-/// source and the waits cannot cycle. What the bound is for is that the two halves are
-/// read at different moments: if each of two units stops between its own sweep and its own
-/// status read, both can redirect onto the other's name and wait on each other. An orphan
-/// name can be a configured name since #90, so nothing about the names rules it out.
-///
-/// Nothing else in the sequence times out, so an unbounded wait would leave both names
-/// unusable for the life of the process. Set far above any unmount this code will sit
-/// through on its own, so it expires on that race and never on a slow stop.
+/// Two redirects can point at each other if each unit stops between its own sweep and its
+/// own status read — an orphan's name can be a configured name since #90. Nothing else in
+/// the sequence times out, so an unbounded wait would strand both names for the life of
+/// the process. Far above any stop this code sits through, so only that race reaches it.
 const REDIRECT_LOCK_WAIT: Duration = Duration::from_secs(300);
 
 /// How hard to try when asking the kernel for a mount point back.
@@ -320,16 +314,14 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// running and unaccounted for, and the mount point it holds reads as somebody
     /// else's.
     ///
-    /// A unit still *named* by the config can be one of these too. Editing `mount_point`
-    /// leaves the name alone, so the unit keeps running against the path the entry used to
-    /// have — which the entry no longer names, however little else changed (#90).
+    /// Includes a unit the config still *names*: editing `mount_point` leaves the name
+    /// alone and the unit serving the path the entry has abandoned (#90).
     ///
-    /// Serving a path the config does not put it at is not enough on its own to make a
-    /// unit the owner of that path: its argv records only where it *meant* to mount, so a
-    /// leftover would claim whatever turns up there afterwards, and stopping it would take
-    /// down a mount that was never its own. It must also be
-    /// [serving](UnitStatus::is_serving), and not be shadowing a configured mount whose own
-    /// unit is [holding that very point](Self::configured_unit_holds).
+    /// Serving a path the config does not put it at is not enough on its own. The argv
+    /// records only where a unit *meant* to mount, so a leftover would claim whatever turns
+    /// up there afterwards and stopping it would take down a mount that was never its own.
+    /// It must also be [serving](UnitStatus::is_serving), and not be shadowing a configured
+    /// mount whose own unit is [holding that point](Self::configured_unit_holds).
     ///
     /// What is mounted there is deliberately **not** required to match the `remote:path`
     /// the unit was given. mountinfo carries the Fs rclone resolved, not the argument it
@@ -346,10 +338,9 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             .iter()
             .map(|m| (m.unit_name(), m.mount_point.as_path()))
             .collect();
-        // What each serving unit's argv says it mounted, unresolved. The inner `None` is a
-        // unit whose `ExecStart` could not be read: where it serves is then unknown, which
-        // [`Self::configured_unit_holds`] has to treat differently from knowing it is
-        // elsewhere.
+        // What each serving unit's argv says it mounted, unresolved. `None` is an
+        // `ExecStart` that could not be read, which `configured_unit_holds` treats
+        // differently from knowing the unit serves elsewhere.
         let serving_argv: std::collections::HashMap<&str, Option<&Path>> = loaded
             .iter()
             .filter(|u| u.status.is_serving())
@@ -375,12 +366,10 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             let (Some(serving), Some(name)) = (u.serving.as_ref(), orphan_name(&u.name)) else {
                 continue;
             };
-            // Named by the config and serving exactly where that entry says. Compared as
-            // written, because both spellings come from the same `mount_point` field and
-            // an entry nobody edited matches byte for byte — so the path every healthy
-            // mount takes canonicalises nothing. Only a mismatch here pays for the
-            // resolved comparisons below, and equal-but-respelled is a mismatch that
-            // `configured_unit_holds` then lets go.
+            // Named by the config and serving exactly where it says. Compared as written:
+            // both spellings come from the same `mount_point` field, so an unedited entry
+            // matches byte for byte and the healthy path canonicalises nothing. A
+            // respelling falls through to `configured_unit_holds`, which lets it go.
             if ours.get(&u.name) == Some(&serving.mount_point.as_path()) {
                 continue;
             }
@@ -415,21 +404,13 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     }
 
     /// Whether a configured mount at one of these points has its own unit holding it.
-    /// Configured points come in already resolved: canonicalising them per candidate would
-    /// put one full probe timeout, and one parked blocking thread, behind every wedged
-    /// mount in the config. A unit's argv is resolved here and nowhere earlier, because
-    /// only a candidate that got this far can need it.
+    /// Configured points come in already resolved: canonicalising per candidate would put a
+    /// full probe timeout, and a parked thread, behind every wedged mount in the config.
     ///
-    /// *Holding* it is the question, not merely running. A unit that is up but serving
-    /// somewhere else vouches for nothing, and reading it as proof would excuse the case
-    /// this sweep exists to find: two entries whose mount points were swapped would each
-    /// cover for the other (#90).
-    ///
-    /// A unit whose argv could not be read is the one thing taken on trust. Where it
-    /// serves is unknown, and the two ways of being wrong are not equal: refusing to vouch
-    /// leaves a live mount looking like an orphan, and unmounting that orphan cuts it. The
-    /// price is that a genuine orphan at the same point goes unreported for as long as the
-    /// read keeps failing — #90 reopens, quietly, for that one shape.
+    /// *Holding* it, not merely running: two entries whose mount points were swapped would
+    /// otherwise each vouch for the other (#90). An unreadable argv is trusted anyway,
+    /// since mistaking a live mount for an orphan invites an unmount that cuts it — at the
+    /// price of a real orphan there going unreported while the read keeps failing.
     async fn configured_unit_holds(
         configured: &[(PathBuf, String)],
         point: &Path,
@@ -493,13 +474,11 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// Which unit an unmount request has to act on.
     ///
     /// Usually the one the configured mount names. It can also be an orphan, reached three
-    /// ways: addressed directly under the name its unit was started with; through a
-    /// configured mount whose point that orphan is the one still holding, which is what a
-    /// rename leaves behind; or as the configured mount's *own* unit, serving a path that
-    /// is no longer the configured one, which is what a moved `mount_point` leaves (#90).
-    /// All of them have to stop the unit: taken for foreign instead, the mount cannot be
-    /// unmounted without `force`, and `force` cannot escalate past a holder, because
-    /// [`Release::Detach`] is gated on the mount being ours.
+    /// ways: addressed directly under its unit's own name; through a configured mount
+    /// whose point that orphan holds, which a rename leaves; or as the configured mount's
+    /// *own* unit serving somewhere else, which a moved `mount_point` leaves (#90). All
+    /// stop the unit: taken for foreign instead, the mount needs `force`, and `force`
+    /// cannot escalate past a holder because [`Release::Detach`] is gated on ownership.
     async fn unmount_target(&self, name: &str) -> Result<Target, SupervisorError> {
         let orphans = self.orphans().await?;
         let Ok(m) = self.mount_config(name) else {
@@ -515,9 +494,9 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         // somebody else, and acting on this one would release their mount and then stop
         // this one instead.
         if self.units.status(&target.unit).await?.is_serving() {
-            // The same unit, but a `mount_point` edit has left the configured path and the
-            // served one different. The release has to act on the one it actually holds,
-            // or it clears nothing and reports success over a mount still up (#90).
+            // A `mount_point` edit puts the configured path and the served one out of
+            // step. The release must act on the one actually held, or it clears nothing
+            // and reports success over a mount still up (#90).
             return Ok(orphans
                 .into_iter()
                 .find(|o| o.unit == target.unit)
@@ -600,12 +579,9 @@ impl<M: UnitManager> SystemdSupervisor<M> {
         let unit = self.units.status(&m.unit_name()).await?;
 
         // This entry's own unit, serving a path the entry no longer names — `mount_point`
-        // edited while it was up. Answered before the rest, because everything below reads
-        // the configured path as this mount's, and it is not: whatever is or is not there,
-        // this mount is the one somewhere else (#90).
-        //
-        // Except while it is stopping, which is the one way out of this state: a teardown
-        // the user asked for reports as one, here as everywhere else.
+        // edited while it was up. Answered first, because everything below reads the
+        // configured path as this mount's, and it is not (#90). Not while it is stopping,
+        // which is the way out of this state and reports as the teardown it is.
         if unit != UnitStatus::Deactivating {
             if let Some(o) = orphans.iter().find(|o| o.unit == m.unit_name()) {
                 return Ok(MountState::Failed {
@@ -880,15 +856,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             let lock = self.lock_for(name).await;
             let _guard = lock.lock().await;
 
-            // This entry's own unit, up and serving the path the entry had before it was
-            // edited. Nothing good can come of the branches below: they read the state of
-            // the configured path as this mount's, so an empty one is waited out to the
-            // ready-timeout, and a *foreign* mount sitting there with our unit `Active`
-            // reports success over somebody else's filesystem. Said plainly instead (#90).
-            //
-            // Unless it is already stopping, which is the wait the branches below are for
-            // and the same exemption `resolve` makes: refusing here would answer "unmount
-            // it first" to somebody whose unmount is in progress.
+            // The state `resolve` reports as `Failed` (#90). The branches below would wait
+            // the configured path out to the ready-timeout, or report success over a
+            // foreign mount on it. Not while the unit is stopping — that is their wait.
             if self.units.status(&m.unit_name()).await? != UnitStatus::Deactivating {
                 if let Some(o) = self
                     .orphans()
@@ -913,10 +883,9 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 if self.is_stale(&point).await {
                     // Unless a unit of ours the config no longer places here is still
                     // behind it: an rclone whose FUSE connection has been aborted answers
-                    // `ENOTCONN` while systemd still reports its unit `active`. Never this
-                    // mount's own unit, which is excused for its own configured point —
-                    // since #90 it can be one belonging to a *different* entry whose
-                    // `mount_point` moved off this path. The release does not
+                    // `ENOTCONN` while systemd still reports its unit `active`. Since #90
+                    // that can be a *different* entry's unit, moved off this path. The
+                    // release does not
                     // ask who owns the point, so it is asked here. A unit that has
                     // *exited* is not caught — it is no longer serving, by definition —
                     // and clearing the point it left is the whole purpose of this branch.
@@ -1053,9 +1022,8 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 
             // A redirect acts on a unit the caller's own lock does not guard, and after a
             // rename two names reach the same one — the configured entry and the orphan.
-            // Without this, both run the release-stop-clear sequence at once.
-            //
-            // Waited for, but not indefinitely — see [`REDIRECT_LOCK_WAIT`].
+            // Without this, both run the release-stop-clear sequence at once. Bounded:
+            // see [`REDIRECT_LOCK_WAIT`].
             let redirect_lock = if target.name != name {
                 Some(self.lock_for(&target.name).await)
             } else {
@@ -1268,15 +1236,14 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             for m in &self.config.mounts {
                 claimed.push(Self::resolved_point(m).await);
             }
-            // Ours, at a path the config no longer puts them at. Reported before the sweep
-            // below and counted as claimed, or the same mount point would appear twice:
-            // once as somebody else's, once as ours.
+            // Ours, at a path the config no longer puts them at. Counted as claimed before
+            // the sweep below, or the point would appear twice — theirs, then ours.
             for o in orphans {
                 let named = self.config.mounts.iter().any(|m| m.unit_name() == o.unit);
                 claimed.push(o.point);
-                // A unit whose entry only moved is still named by the config, and `resolve`
-                // has already reported it under that name. Listing it again here would put
-                // two rows and two states under one name, which is what a client keys on.
+                // A moved entry's unit is still named by the config and `resolve` has
+                // reported it under that name. A second row would put two states on one
+                // name, which is what a client keys on.
                 if !named {
                     out.push(DiscoveredMount::new(o.name, MountState::Orphaned));
                 }
@@ -2551,9 +2518,8 @@ mod tests {
         (scratch, sup)
     }
 
-    /// #90: the same mount, with `mount_point` edited instead of `name`. The unit keeps
-    /// its name, so the config still names it, and it keeps serving the path it started
-    /// on. Returns the scratch, the supervisor, and the path the unit is still holding.
+    /// #90: `mount_point` edited instead of `name`, so the config still names the unit and
+    /// the unit still serves the path it started on. Yields that path.
     fn moved(tag: &str) -> (Scratch, SystemdSupervisor<FakeUnits>, PathBuf) {
         let scratch = Scratch::new(tag);
         let held = mount_point(&scratch);
@@ -2596,8 +2562,8 @@ mod tests {
         (scratch, sup, held)
     }
 
-    /// Half the damage in #90: the entry's own unit was `Active` and its configured path
-    /// empty, which read as coming up. Nothing was coming.
+    /// Half of #90: the entry's own unit `Active` and its configured path empty read as
+    /// coming up, and nothing was coming.
     #[tokio::test]
     async fn a_moved_mount_point_does_not_report_itself_mounting_forever() {
         let (_sc, s, held) = moved("moved-state");
@@ -2659,9 +2625,8 @@ mod tests {
         );
     }
 
-    /// Stopping a moved mount is the way out of the state, and while it stops it reports as
-    /// what it is. A unit is still "serving" to the sweep right through `Deactivating`, so
-    /// without care the advice to unmount it survives the whole teardown.
+    /// A unit is still "serving" to the sweep right through `Deactivating`, so without care
+    /// the advice to unmount it survives the whole teardown.
     #[tokio::test]
     async fn a_moved_mount_being_torn_down_reports_as_unmounting() {
         let (_sc, s, _) = moved("moved-stopping");
@@ -2669,16 +2634,14 @@ mod tests {
         assert_eq!(s.state("backup").await.unwrap(), MountState::Unmounting);
     }
 
-    /// Remounting a moved mount is unmount-then-mount, so the mount half arrives while the
-    /// unit is still stopping. Refusing it there would answer "unmount it first" to the
-    /// person whose unmount is running.
+    /// Remounting is unmount-then-mount, so the mount half arrives while the unit is still
+    /// stopping. Refusing there answers "unmount it first" to somebody already doing it.
     #[tokio::test]
     async fn mounting_a_moved_mount_waits_out_its_teardown_rather_than_refusing() {
         let (_sc, s, _) = moved("moved-remount");
         s.units.loaded.lock().unwrap()[0].status = UnitStatus::Deactivating;
-        // Nothing here ever finishes the stop, so the wait runs out and says so. That
-        // error is the assertion: reaching it at all means the #90 refusal was skipped and
-        // what this mount is waiting on is the teardown.
+        // Nothing here finishes the stop, so the wait runs out. Reaching that error at all
+        // means the #90 refusal was skipped and the teardown is what is being waited on.
         match s.mount("backup").await {
             Err(SupervisorError::Supervision { context, .. }) => assert!(
                 context.contains("shutting down"),
@@ -2688,9 +2651,9 @@ mod tests {
         }
     }
 
-    /// A `mount_point` respelled to the *same* directory through a symlink. Nothing has
-    /// moved, so nothing may be reported as having moved — the raw comparison that keeps
-    /// the healthy path cheap says these differ, and only resolving them says otherwise.
+    /// A `mount_point` respelled to the *same* directory through a symlink. The raw
+    /// comparison that keeps the healthy path cheap says these differ; only resolving
+    /// them says otherwise, and nothing has moved.
     #[tokio::test]
     async fn respelling_a_mount_point_through_a_symlink_has_not_moved_it() {
         let scratch = Scratch::new("respelled");
@@ -2743,10 +2706,9 @@ mod tests {
             .expect("a mount already up must not be refused as being in its own way");
     }
 
-    /// A healthy unit whose `ExecStart` could not be read this sweep, with a rename's
-    /// leftover claiming the same point. Where the healthy one serves is unknown, and the
-    /// two ways of being wrong are not equal: call the leftover an orphan and the unmount
-    /// it invites cuts the live mount.
+    /// A healthy unit whose `ExecStart` could not be read, with a rename's leftover
+    /// claiming the same point. Calling the leftover an orphan invites an unmount that
+    /// cuts the live mount.
     #[tokio::test]
     async fn a_unit_whose_argv_cannot_be_read_still_vouches_for_its_point() {
         let (_sc, s) = renamed("argv-unreadable");
@@ -2764,9 +2726,9 @@ mod tests {
         assert_eq!(s.state("backups").await.unwrap(), MountState::Mounted);
     }
 
-    /// Two entries whose mount points were exchanged. Each unit is up, and each is serving
-    /// the path the *other* entry now names, so asking only whether a configured unit is
-    /// running has both of them vouching for a point neither holds.
+    /// Two entries whose mount points were exchanged, each unit serving the path the
+    /// *other* entry now names. Asking only whether a configured unit is running has both
+    /// vouching for a point neither holds.
     #[tokio::test]
     async fn mounts_that_swapped_their_points_do_not_vouch_for_each_other() {
         let scratch = Scratch::new("swapped");

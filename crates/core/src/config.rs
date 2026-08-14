@@ -362,23 +362,11 @@ pub fn umask_readings(s: &str) -> Option<(String, String)> {
 
 /// Whether rclone will accept this as a `--vfs-cache-max-size`.
 ///
-/// Judges the unit, and asks of the number only whether it is one. rclone reads it with
-/// Go's `ParseFloat`, which takes spellings Rust's does not — `1_0`, `0x1p4` and `infG` are
-/// all sizes rclone accepts — so anything whose leading part is not a plain number is left
-/// alone: there is no unit in it this can be sure about. The unit is where the mistake
-/// happens: `10GB` is the plausible spelling of `10G`, and the grammar has no room for it.
+/// Only the unit is judged; of the number, only whether it is one. rclone reads it with
+/// Go's `ParseFloat`, so `1_0`, `0x1p4` and `infG` are all sizes it takes.
 ///
-/// The two things judged outright are a leading `-`, because rclone refuses a negative
-/// size and `off` is the unlimited one is reaching for, and surrounding whitespace.
-///
-/// `B` is bytes and stands alone; `K` to `E` each take an optional `i`, and a `B` only
-/// after that `i`. So `10G`, `10Gi` and `10GiB` are one size, while `10GB`, `10i` and
-/// `10Bi` are errors, and a bare number is KiB.
-///
-/// Case matters in exactly one place: the `i` must be lower case once a `b` follows it.
-/// `10GI` and `10gib` are sizes; `10GIB` is not. Measured against rclone 1.61.1, 1.62.2
-/// and 1.75.0 (#93); the three agree exactly, which is why nothing here branches on a
-/// version.
+/// Measured against rclone 1.61.1, 1.62.2 and 1.75.0 (#93), which agree on every spelling
+/// in [`tests::a_size_is_accepted_exactly_when_rclone_accepts_it`].
 fn size_suffix_ok(v: &str) -> bool {
     if v.eq_ignore_ascii_case("off") {
         return true;
@@ -394,8 +382,8 @@ fn size_suffix_ok(v: &str) -> bool {
     if unit.eq_ignore_ascii_case("b") {
         return true;
     }
-    // Peeled in this order so that a `b` reaching the scale letter without a lower-case
-    // `i` in between — `GB` — is left whole and fails the match below.
+    // A `b` is only a unit behind a lower-case `i`, so `GB` has to survive this whole and
+    // fail the match below.
     let scale = match unit.strip_suffix(['b', 'B']) {
         Some(rest) if rest.ends_with('i') => rest,
         _ => unit,
@@ -407,29 +395,21 @@ fn size_suffix_ok(v: &str) -> bool {
     )
 }
 
-/// Units rclone reads after a duration's number. `ns` through `h` are Go's, from
-/// `time.ParseDuration`; `d`, `w`, `M` and `y` are rclone's own. Case is load-bearing —
-/// `M` is a month and `m` a minute.
+/// Units rclone reads after a duration's number. `ns` through `h` are Go's; `d`, `w`, `M`
+/// and `y` are rclone's own. `M` is a month and `m` a minute.
 const DURATION_UNITS: &[&str] = &[
     "ns", "us", "µs", "μs", "ms", "s", "m", "h", "d", "w", "M", "y",
 ];
 
 /// Whether rclone will accept this as a `--vfs-cache-max-age`.
 ///
-/// Judges the unit and never the number, for the reason [`size_suffix_ok`] gives: rclone
-/// reads the number with Go's `ParseFloat` and takes a bare one as seconds, so `1e3`,
-/// `1_0`, `0x1p4` and even `inf` are all durations, and refusing them here would stop the
-/// service over a config that works. Nor is `<number><unit>` the only shape it accepts —
-/// an absolute timestamp is a duration to rclone too. So anything whose leading part is
-/// not a plain number is left alone: there is no unit in it for this to be sure about.
+/// Judged as [`size_suffix_ok`] judges a size, and for the same reason. rclone's grammar
+/// here is wider still: a bare number is seconds however it is spelled, and an absolute
+/// timestamp is also a duration. What is caught is a number wearing a unit rclone has no
+/// name for — `24H`, `1D`, `24hours`.
 ///
-/// What is left is the mistake worth catching, which is a real number wearing a unit
-/// rclone does not have: `24H`, `1D`, `24hours`. The cost of drawing the line there is
-/// that `1d12h` and `1h30` get rclone's error rather than ours — rclone combines units
-/// only within Go's set, and only its own parser knows `d` — which is the harmless
-/// direction to be wrong in.
-///
-/// Measured against rclone 1.61.1, 1.62.2 and 1.75.0 (#93), which agree exactly.
+/// Measured against rclone 1.61.1, 1.62.2 and 1.75.0 (#93), which agree on every spelling
+/// in [`tests::an_age_is_accepted_exactly_when_rclone_accepts_it`].
 fn duration_ok(v: &str) -> bool {
     if v == "off" || v.is_empty() {
         return v == "off";
@@ -721,9 +701,8 @@ impl Config {
                     Some(_) => {}
                 }
             }
-            // Both reach rclone as verbatim argv and fail at flag-parse time, which stops
-            // the unit before it has logged anything a user would connect to the config
-            // they just edited.
+            // Both reach rclone as verbatim argv, where a bad one fails at flag-parse time
+            // and the unit never starts.
             if let Some(v) = &m.cache_max_size {
                 if !size_suffix_ok(v) {
                     return Err(ConfigError::Invalid(format!(
@@ -1220,30 +1199,20 @@ mod tests {
     }
 
     /// Every spelling in this table and the next was run against rclone 1.61.1, 1.62.2 and
-    /// 1.75.0 — the floor of the supported range, a point inside it, and the newest — with
-    /// `rclone mount --vfs-cache-max-size=<value>`, and a value counts as refused when
-    /// rclone's own error names the flag. All three agree on every row (#93).
+    /// 1.75.0 — the floor of the supported range, a point inside it, and the newest — as
+    /// `rclone mount --vfs-cache-max-size=<value>`, counting a value refused when rclone's
+    /// own error names the flag. All three agree on every row (#93).
     ///
-    /// The two lists are not the same claim. **Accepting what rclone accepts is the one
-    /// that must hold exactly**: a value refused here stops the service, so a wrong entry
-    /// in the first list breaks a config that works. The second list is only the mistakes
-    /// this is meant to catch; letting something rclone refuses through costs rclone's
-    /// error instead of ours, and `deliberately_unchecked` below holds those on purpose.
-    ///
-    /// The odd-looking ones are load-bearing. `1_0` and `0x1p4` are numbers Go's
-    /// `ParseFloat` takes and Rust's does not, so they hold the check to judging the unit
-    /// alone; `1e3` has no unit at all, and `10E` does. `10GI` and `10GIB` are the pair
-    /// that pins where case matters.
+    /// Only the accept list has to hold exactly: a value refused here stops the service.
+    /// Missing one rclone refuses costs rclone's error instead of ours, and
+    /// `what_the_cache_limit_checks_deliberately_do_not_catch` holds those.
     #[test]
     fn a_size_is_accepted_exactly_when_rclone_accepts_it() {
         for good in [
             "10G", "10g", "10GiB", "10Gi", "10GI", "10gib", "10Gib", "10gI", "10B", "10b", "10",
             "10.5G", "off", "OFF", "Off", "0", "0B", "1P", "1E", "1T", "10K", "10k", "10Ki", "10M",
             "10Mi", "10MiB", ".5G", "10.", "+10G", "1e3", "1e-3", "1e3G", "10Ei", "1_0", "0x1p4",
-            // Go's `ParseFloat` reads these, so rclone takes them as sizes. They pass the
-            // way an unparseable number does — the unit run swallows `inf` whole, leaving
-            // nothing this can call a number, so it declines to judge the unit at all.
-            // `1e3G` above is the row where the unit really is checked.
+            // Go's `ParseFloat` reads these, so rclone takes them as sizes.
             "infG", "InfG", "nanG", "NaNG", "infGiB",
         ] {
             assert!(size_suffix_ok(good), "rclone accepts {good:?}");
@@ -1256,13 +1225,7 @@ mod tests {
         }
     }
 
-    /// The same measurement for `--vfs-cache-max-age`, and the same asymmetry between the
-    /// two lists.
-    ///
-    /// rclone's duration grammar is far wider than `<number><unit>`: a bare number is
-    /// seconds however it is spelled, and an absolute timestamp is a duration too. All of
-    /// those are in the first list, because refusing one would stop the service over a
-    /// config rclone is perfectly happy with.
+    /// The same measurement for `--vfs-cache-max-age`.
     #[test]
     fn an_age_is_accepted_exactly_when_rclone_accepts_it() {
         for good in [
@@ -1286,8 +1249,7 @@ mod tests {
             "-1h",
             "-1",
             "1us",
-            // Both spellings of micro: U+00B5 MICRO SIGN, then U+03BC GREEK SMALL LETTER
-            // MU. Go's parser takes either, and only one of them is the one people type.
+            // U+00B5 MICRO SIGN, then U+03BC GREEK SMALL LETTER MU. Go takes either.
             "1µs",
             "1μs",
             "1h0m0s",
@@ -1312,15 +1274,10 @@ mod tests {
         }
     }
 
-    /// Spellings rclone refuses that these checks let through, listed so the gap is a
-    /// decision on the record rather than something a later reader has to rediscover.
-    ///
-    /// Every one needs the number judged to catch, and judging the number is what would
-    /// break `1e3`, `0x1p4` and a timestamp. Since the cost of missing one is rclone's
-    /// error at mount time instead of ours at config time, the number is left alone.
+    /// Spellings rclone refuses that these checks let through. Catching any of them needs
+    /// the number judged, which is what would break `1e3`, `0x1p4` and a timestamp.
     #[test]
     fn what_the_cache_limit_checks_deliberately_do_not_catch() {
-        // Combining units across the two parsers, and a number with no unit after it.
         for through in [
             "1d12h", "1w2d", "1y6M", "1h30", "1s30", "1e3s", "24 h", "OFF",
         ] {
@@ -1329,9 +1286,6 @@ mod tests {
                 "{through:?} is left for rclone to refuse"
             );
         }
-        // A hex integer is not a Go float; rclone wants the `p` exponent. `inf`, `NaN` and
-        // a bare unit have no number for rclone's `ParseFloat` to read, and no number is
-        // also what this check declines to have an opinion about.
         for through in ["0x10", "inf", "NaN", "G"] {
             assert!(
                 size_suffix_ok(through),

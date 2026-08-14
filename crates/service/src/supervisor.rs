@@ -913,9 +913,10 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 if self.is_stale(&point).await {
                     // Unless a unit of ours the config no longer places here is still
                     // behind it: an rclone whose FUSE connection has been aborted answers
-                    // `ENOTCONN` while systemd still reports its unit `active`. Since #90
-                    // that unit can be one the config still names, under its own name, so
-                    // this is not only the dropped-name case. The release does not
+                    // `ENOTCONN` while systemd still reports its unit `active`. Never this
+                    // mount's own unit, which is excused for its own configured point —
+                    // since #90 it can be one belonging to a *different* entry whose
+                    // `mount_point` moved off this path. The release does not
                     // ask who owns the point, so it is asked here. A unit that has
                     // *exited* is not caught — it is no longer serving, by definition —
                     // and clearing the point it left is the whole purpose of this branch.
@@ -2675,13 +2676,16 @@ mod tests {
     async fn mounting_a_moved_mount_waits_out_its_teardown_rather_than_refusing() {
         let (_sc, s, _) = moved("moved-remount");
         s.units.loaded.lock().unwrap()[0].status = UnitStatus::Deactivating;
-        // The wait gives up once the unit is gone from systemd, which the fake reports as
-        // soon as the status stops being `Deactivating`; nothing here has to actually stop.
-        let waited = tokio::time::timeout(Duration::from_millis(200), s.mount("backup")).await;
-        assert!(
-            !matches!(waited, Ok(Err(SupervisorError::NotManaged(_)))),
-            "a teardown in progress is what the branches below wait for, got {waited:?}"
-        );
+        // Nothing here ever finishes the stop, so the wait runs out and says so. That
+        // error is the assertion: reaching it at all means the #90 refusal was skipped and
+        // what this mount is waiting on is the teardown.
+        match s.mount("backup").await {
+            Err(SupervisorError::Supervision { context, .. }) => assert!(
+                context.contains("shutting down"),
+                "expected the teardown wait, got {context}"
+            ),
+            other => panic!("a teardown in progress is waited out, not refused: {other:?}"),
+        }
     }
 
     /// A `mount_point` respelled to the *same* directory through a symlink. Nothing has

@@ -1240,8 +1240,10 @@ mod tests {
             "10G", "10g", "10GiB", "10Gi", "10GI", "10gib", "10Gib", "10gI", "10B", "10b", "10",
             "10.5G", "off", "OFF", "Off", "0", "0B", "1P", "1E", "1T", "10K", "10k", "10Ki", "10M",
             "10Mi", "10MiB", ".5G", "10.", "+10G", "1e3", "1e-3", "1e3G", "10Ei", "1_0", "0x1p4",
-            // Go's `ParseFloat` reads these, so rclone takes them as sizes. Here to hold
-            // the check off the number: it is the trailing `G` that has to be judged.
+            // Go's `ParseFloat` reads these, so rclone takes them as sizes. They pass the
+            // way an unparseable number does — the unit run swallows `inf` whole, leaving
+            // nothing this can call a number, so it declines to judge the unit at all.
+            // `1e3G` above is the row where the unit really is checked.
             "infG", "InfG", "nanG", "NaNG", "infGiB",
         ] {
             assert!(size_suffix_ok(good), "rclone accepts {good:?}");

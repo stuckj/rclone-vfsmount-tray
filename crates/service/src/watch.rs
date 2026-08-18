@@ -23,6 +23,34 @@ use tokio::sync::{Mutex, Notify};
 /// mount appearing, or one of ours dying in a way systemd could not restart.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Wakes the watcher, and names the mounts whose poller can no longer be trusted.
+///
+/// A sweep cannot tell that a mount cycled: an unmount and a remount between two of them
+/// look exactly like no change, and the poller would carry a capability probe and a rate
+/// estimate across two different rclone processes. Only the caller that performed the
+/// action knows, so it says so here.
+#[derive(Default)]
+pub struct Nudge {
+    woken: Notify,
+    cycled: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl Nudge {
+    /// An action landed on this mount: sweep now, and re-probe it from scratch.
+    pub fn acted_on(&self, name: &str) {
+        self.cycled.lock().expect("lock").insert(name.to_string());
+        self.woken.notify_one();
+    }
+
+    async fn woken(&self) {
+        self.woken.notified().await
+    }
+
+    fn take_cycled(&self) -> std::collections::BTreeSet<String> {
+        std::mem::take(&mut self.cycled.lock().expect("lock"))
+    }
+}
+
 pub struct Watcher {
     sup: Arc<dyn MountSupervisor>,
     registry: Arc<Mutex<Registry>>,
@@ -35,6 +63,7 @@ pub struct Watcher {
     /// When each mount is next worth asking.
     due: HashMap<String, Instant>,
     sweep_due: Instant,
+    nudge: Arc<Nudge>,
 }
 
 impl Watcher {
@@ -43,6 +72,7 @@ impl Watcher {
         registry: Arc<Mutex<Registry>>,
         config: Arc<Config>,
         runtime_dir: PathBuf,
+        nudge: Arc<Nudge>,
     ) -> Self {
         Self {
             sup,
@@ -52,6 +82,7 @@ impl Watcher {
             pollers: HashMap::new(),
             due: HashMap::new(),
             sweep_due: Instant::now(),
+            nudge,
         }
     }
 
@@ -59,6 +90,11 @@ impl Watcher {
     pub async fn tick(&mut self) -> (Vec<Change>, Duration) {
         let now = Instant::now();
         let mut changes = Vec::new();
+
+        for name in self.nudge.take_cycled() {
+            self.pollers.remove(&name);
+            self.due.remove(&name);
+        }
 
         if self.sweep_due <= now {
             changes.extend(self.sweep().await);
@@ -81,9 +117,9 @@ impl Watcher {
     pub async fn run(
         mut self,
         emitter: zbus::object_server::SignalEmitter<'_>,
-        resweep: Arc<Notify>,
         report: fn(&Change),
     ) {
+        let nudge = self.nudge.clone();
         loop {
             let (changes, wait) = self.tick().await;
             for change in changes {
@@ -96,7 +132,7 @@ impl Watcher {
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 // An action of ours has landed; publish its result now.
-                _ = resweep.notified() => self.sweep_due = Instant::now(),
+                _ = nudge.woken() => self.sweep_due = Instant::now(),
             }
         }
     }
@@ -252,10 +288,21 @@ mod tests {
         config: Arc<Config>,
         runtime_dir: PathBuf,
     ) -> (Watcher, Arc<Mutex<Registry>>) {
+        let (w, registry, _) = watcher_with_nudge(sup, config, runtime_dir);
+        (w, registry)
+    }
+
+    fn watcher_with_nudge(
+        sup: Arc<dyn MountSupervisor>,
+        config: Arc<Config>,
+        runtime_dir: PathBuf,
+    ) -> (Watcher, Arc<Mutex<Registry>>, Arc<Nudge>) {
         let registry = Arc::new(Mutex::new(Registry::default()));
+        let nudge = Arc::new(Nudge::default());
         (
-            Watcher::new(sup, registry.clone(), config, runtime_dir),
+            Watcher::new(sup, registry.clone(), config, runtime_dir, nudge.clone()),
             registry,
+            nudge,
         )
     }
 
@@ -397,6 +444,37 @@ mod tests {
             "nothing was polled, so nothing is proved"
         );
         assert!(wait <= SWEEP_INTERVAL, "{wait:?}");
+    }
+
+    #[tokio::test]
+    async fn a_mount_that_cycled_between_sweeps_is_probed_again() {
+        // An unmount and a remount in the gap look like no change at all from the
+        // registry's side — both sweeps see `mounted` — so the poller would carry a
+        // capability probe and a rate estimate across two different rclone processes.
+        // Only the caller that did it knows, which is what `Nudge::acted_on` carries.
+        let scratch = Scratch::new("watch-cycled");
+        let sup = ScriptedSupervisor::new(vec![Ok(vec![DiscoveredMount::new(
+            "photos",
+            MountState::Mounted,
+        )])]);
+        let (mut w, _registry, nudge) =
+            watcher_with_nudge(sup, config_with(&["photos"]), scratch.path().to_path_buf());
+
+        w.tick().await;
+        assert_eq!(w.pollers.len(), 1, "the mount is serving, so it is polled");
+
+        // Not due again for ten minutes. Without the nudge nothing would touch it, and the
+        // poller connected to the old rclone would still be there when it was.
+        let far_off = Instant::now() + Duration::from_secs(600);
+        w.due.insert("photos".into(), far_off);
+
+        nudge.acted_on("photos");
+        w.tick().await;
+
+        assert!(
+            w.due["photos"] < far_off,
+            "the mount was not re-probed, so the poller spans two rclone processes"
+        );
     }
 
     #[tokio::test]

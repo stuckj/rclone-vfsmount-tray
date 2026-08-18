@@ -5,7 +5,8 @@
 //! [`crate::watch`]) is what keeps it current.
 
 use rvt_core::ipc::{MountView, TransferView};
-use rvt_core::Tier;
+use rvt_core::transfer::TransferState;
+use rvt_core::{MountState, Tier};
 use std::collections::BTreeMap;
 
 /// Something that has happened since a client was last told.
@@ -42,15 +43,16 @@ impl Registry {
     /// is a removal. A reading for a mount that is no longer serving is dropped with it:
     /// the last figures before an unmount describe a mount that is no longer there, and
     /// serving them on would be the confident-but-wrong answer the tier rules exist to
-    /// prevent.
+    /// prevent. Dropping one is published, not merely done — a client keeps a model from
+    /// these changes, so a reading it is never told to forget is one it goes on showing.
     pub fn observe_mounts(&mut self, found: Vec<MountView>) -> Vec<Change> {
         let mut changes = Vec::new();
         let mut seen = BTreeMap::new();
 
         for view in found {
             let changed = self.mounts.get(&view.name) != Some(&view);
-            if !pollable(&view) {
-                self.transfers.remove(&view.name);
+            if !pollable(&view) && self.transfers.remove(&view.name).is_some() {
+                changes.push(Change::Transfer(nothing_to_say(&view)));
             }
             if changed {
                 changes.push(Change::Mount(view.clone()));
@@ -118,6 +120,35 @@ impl Registry {
             .filter(|v| pollable(v))
             .map(|v| v.name.clone())
             .collect()
+    }
+}
+
+/// An empty reading, for a mount there is nothing to read from.
+///
+/// Not a zero. [`TransferState::unmonitored`] leaves `outstanding_known` false and carries
+/// the reason, so a client cannot render this as "nothing left to upload, safe to unmount".
+pub fn nothing_to_say(mount: &MountView) -> TransferView {
+    TransferView::from(&TransferState::unmonitored(
+        &mount.name,
+        why_not_polled(mount),
+    ))
+}
+
+/// Why a mount has no reading, in words a client can show.
+///
+/// Every one of these is an ordinary state rather than a failure, which is why it is a
+/// reason attached to an empty answer and not an error.
+///
+/// Read back through [`rvt_core::ipc::state_from_name`] rather than matched as strings, so
+/// the vocabulary lives in one place and a renamed state cannot quietly fall through.
+fn why_not_polled(mount: &MountView) -> String {
+    match rvt_core::ipc::state_from_name(&mount.state, mount.reason.as_deref()) {
+        Some(MountState::Foreign) => {
+            "started outside this service, so its rc socket is unknown".into()
+        }
+        Some(MountState::Orphaned) => "no configuration describes this mount any more".into(),
+        Some(MountState::Mounted) => "not polled yet".into(),
+        _ => "the mount is not serving".into(),
     }
 }
 
@@ -222,6 +253,32 @@ mod tests {
         );
         assert_eq!(r.note_tier(Tier::T2), None, "nor does repeating the best");
         assert_eq!(r.tier(), Some(Tier::T2));
+    }
+
+    #[test]
+    fn dropping_a_reading_is_published_rather_than_done_quietly() {
+        // A client builds its model from these changes, so a reading it is never told to
+        // forget is one it goes on showing: "3 files, 1.2 GB still to upload" against a
+        // mount that is down.
+        let mut r = Registry::default();
+        r.observe_mounts(vec![view("photos", "mounted")]);
+        r.observe_transfer(transfer("photos", 3));
+
+        let changes = r.observe_mounts(vec![view("photos", "unmounted")]);
+        let emptied = changes
+            .iter()
+            .find_map(|c| match c {
+                Change::Transfer(v) => Some(v),
+                _ => None,
+            })
+            .expect("the dropped reading has to be announced");
+
+        assert_eq!(emptied.pending_files, 0);
+        assert!(
+            !emptied.outstanding_known,
+            "an empty reading that claims to be exact reads as safe to unmount"
+        );
+        assert!(emptied.degraded_reason.is_some());
     }
 
     #[test]

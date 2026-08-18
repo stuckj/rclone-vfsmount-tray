@@ -4,12 +4,12 @@
 //! `/proc` and systemd. `Mount` and `Unmount` are the exceptions — they act, and return
 //! when the mount is actually up or down.
 
-use crate::registry::{Change, Registry};
+use crate::registry::{self, Change, Registry};
+use crate::watch::Nudge;
 use rvt_core::ipc::{self, IpcError, MountView, TransferView};
-use rvt_core::supervisor::{MountState, MountSupervisor};
-use rvt_core::transfer::TransferState;
+use rvt_core::supervisor::MountSupervisor;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
 use zbus::object_server::SignalEmitter;
 
@@ -18,8 +18,8 @@ pub struct MountManager {
     sup: Arc<dyn MountSupervisor>,
     registry: Arc<Mutex<Registry>>,
     /// Poked after an action so the watcher publishes its result now rather than at the
-    /// next sweep.
-    resweep: Arc<Notify>,
+    /// next sweep, and re-probes the mount that was acted on.
+    nudge: Arc<Nudge>,
     rclone_version: String,
 }
 
@@ -27,13 +27,13 @@ impl MountManager {
     pub fn new(
         sup: Arc<dyn MountSupervisor>,
         registry: Arc<Mutex<Registry>>,
-        resweep: Arc<Notify>,
+        nudge: Arc<Nudge>,
         rclone_version: impl Into<String>,
     ) -> Self {
         Self {
             sup,
             registry,
-            resweep,
+            nudge,
             rclone_version: rclone_version.into(),
         }
     }
@@ -48,7 +48,7 @@ impl MountManager {
     async fn mount(&self, name: &str) -> Result<(), IpcError> {
         let result = self.sup.mount(name).await;
         // Whether it worked or not: a failed attempt leaves a state worth publishing.
-        self.resweep.notify_one();
+        self.nudge.acted_on(name);
         result.map_err(|e| {
             tracing::warn!(mount = name, error = %e, "mount refused");
             e.into()
@@ -72,7 +72,7 @@ impl MountManager {
             );
         }
         let result = self.sup.unmount(name, force).await;
-        self.resweep.notify_one();
+        self.nudge.acted_on(name);
         result.map_err(|e| {
             tracing::warn!(mount = name, error = %e, "unmount refused");
             e.into()
@@ -87,10 +87,9 @@ impl MountManager {
         let mount = registry
             .mount(name)
             .ok_or_else(|| IpcError::UnknownMount(format!("no mount named {name:?}")))?;
-        Ok(TransferView::from(&TransferState::unmonitored(
-            name,
-            why_not_polled(mount),
-        )))
+        // The same empty answer the registry publishes when it drops a reading, so a
+        // client that asks and a client that listens cannot be told different things.
+        Ok(registry::nothing_to_say(mount))
     }
 
     /// A mount's state changed, or a row appeared.
@@ -131,25 +130,6 @@ impl MountManager {
             .await
             .tier()
             .map_or_else(|| "unknown".to_string(), |t| ipc::tier_name(t).to_string())
-    }
-}
-
-/// Why a mount has no reading, in words a client can show.
-///
-/// Every one of these is an ordinary state rather than a failure, which is why this is a
-/// reason attached to an empty answer and not an error.
-///
-/// Read back through [`ipc::state_from_name`] rather than matched as strings, so the
-/// vocabulary lives in one place and a renamed state cannot quietly fall through to the
-/// last arm.
-fn why_not_polled(mount: &MountView) -> String {
-    match ipc::state_from_name(&mount.state, mount.reason.as_deref()) {
-        Some(MountState::Foreign) => {
-            "started outside this service, so its rc socket is unknown".into()
-        }
-        Some(MountState::Orphaned) => "no configuration describes this mount any more".into(),
-        Some(MountState::Mounted) => "not polled yet".into(),
-        _ => "the mount is not serving".into(),
     }
 }
 
@@ -207,6 +187,7 @@ mod tests {
     use super::*;
     use rvt_core::ipc::RcloneVfsmountTrayProxy;
     use rvt_core::supervisor::{BoxFuture, MountState, SupervisorError};
+    use rvt_core::transfer::TransferState;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use zbus::object_server::Interface;
@@ -282,7 +263,7 @@ mod tests {
         let manager = MountManager::new(
             sup,
             registry.clone(),
-            Arc::new(Notify::new()),
+            Arc::new(Nudge::default()),
             "v1.75.0".to_string(),
         );
 
@@ -315,24 +296,38 @@ mod tests {
     /// so the second must be told rather than left waiting for a turn.
     ///
     /// Needs a real bus: a peer-to-peer connection keeps no name registry and hands out
-    /// every name asked for. Skipped where there is none, as the systemd tests are — and
-    /// skipped too where something already owns the name, since then the first `serve`
-    /// here is the one that is refused.
+    /// every name asked for. The absence of one is the *only* thing that skips this — a
+    /// `serve` that cannot take its name has to fail here, not read as a missing bus, and
+    /// this is the one test that covers the service's own start-up path.
     #[tokio::test]
     async fn a_second_service_is_refused_rather_than_left_waiting() {
+        if zbus::Connection::session().await.is_err() {
+            eprintln!("skipped: no session bus");
+            return;
+        }
+
         let manager = || {
             MountManager::new(
                 Arc::new(FakeSupervisor::default()),
                 Arc::new(Mutex::new(Registry::default())),
-                Arc::new(Notify::new()),
+                Arc::new(Nudge::default()),
                 "v1.75.0".to_string(),
             )
         };
 
-        let Ok(_first) = serve(manager()).await else {
-            eprintln!("skipped: no session bus, or the name is already owned");
-            return;
+        // Something already owning the name — a real service on a developer's machine — is
+        // the same refusal under test, so it is asserted on rather than skipped past.
+        let _first = match serve(manager()).await {
+            Ok(conn) => conn,
+            Err(already) => {
+                assert!(
+                    already.to_string().contains(ipc::BUS_NAME),
+                    "serve failed for a reason that is not the name being taken: {already}"
+                );
+                return;
+            }
         };
+
         let refused = serve(manager())
             .await
             .expect_err("two services must not both own the mounts");

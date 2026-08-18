@@ -128,24 +128,24 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let registry = Arc::new(tokio::sync::Mutex::new(registry::Registry::default()));
-    let resweep = Arc::new(tokio::sync::Notify::new());
+    let nudge = Arc::new(watch::Nudge::default());
 
     // The name goes up before the first sweep, so a client that starts alongside this one
     // connects and waits for signals rather than concluding the service is absent.
     let conn = dbus::serve(dbus::MountManager::new(
         sup.clone(),
         registry.clone(),
-        resweep.clone(),
+        nudge.clone(),
         rclone.version().to_string(),
     ))
     .await?;
     tracing::info!(name = rvt_core::ipc::BUS_NAME, "serving");
 
     let emitter = zbus::object_server::SignalEmitter::new(&conn, rvt_core::ipc::OBJECT_PATH)?;
-    let watcher = watch::Watcher::new(sup, registry, config, runtime_dir);
+    let watcher = watch::Watcher::new(sup, registry, config, runtime_dir, nudge);
 
     tokio::select! {
-        _ = watcher.run(emitter, resweep, report) => {}
+        _ = watcher.run(emitter, report) => {}
         result = stop_requested() => result?,
     }
 

@@ -63,7 +63,12 @@ pub enum IpcError {
     BadMountPoint(String),
     /// rclone could not be started, or exited during start-up.
     RcloneFailed(String),
-    /// Unmount refused: the write-back cache still holds unuploaded data (#19).
+    /// The unmount was not done: the write-back cache still holds unuploaded data.
+    ///
+    /// **Nothing raises this yet.** The check is #19, and until it lands an unmount is not
+    /// weighed against what is still queued. When it does, a client is to present it as a
+    /// choice — wait, unmount anyway, cancel — and not as a wall: the data is on disk and
+    /// resumes on remount, so the cost is delay, not loss.
     PendingUploads(String),
     /// The mount point could not be released — something is still using it.
     Busy(String),

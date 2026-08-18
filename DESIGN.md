@@ -362,10 +362,8 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   the choice between redacting and gating falls due when editing lands. **Gating the field
   is not enough on its own**, because rclone echoes its own argv when asked to log at debug
   level, and a failed mount's reason is rclone's output — so the line it echoes on does not
-  cross at all. Removing the *value* instead was tried and abandoned: rclone spells one
-  argument three ways, and a rule that has to recognise the spelling fails silently on the
-  one it does not. Which is the narrower claim either way: the reason is rclone's, and
-  rclone can be told to log a great deal that this does not know to remove.
+  cross at all. Which is the narrower claim: the reason is rclone's, and rclone can be told
+  to log a great deal that this does not know to remove.
 - **Safety checks live service-side**, so a client cannot skip one by leaving a parameter out.
   A forced unmount is destructive, and `force` is explicit and defaults to off — a guard
   against accident and bugs, not against malice.

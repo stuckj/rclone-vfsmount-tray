@@ -4,8 +4,9 @@ A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mo
 
 > **Status: early development — not usable yet.** There is no tray icon and no window, so
 > nothing yet asks for anything on your behalf. The service itself now works: it finds
-> rclone, reads your configuration, stays running, keeps track of every mount it can see and
-> what each one still has to upload, and mounts or unmounts on request. Two things are still
+> rclone, reads your configuration, stays running, keeps track of every mount it can see —
+> and of what each one it started still has to upload — and mounts or unmounts on request.
+> Two things are still
 > missing before that is any use to you — a front end to ask it, and bringing your mounts up
 > by itself when it starts. Follow the
 > [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1) for progress.

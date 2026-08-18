@@ -319,21 +319,22 @@ impl MountPoller {
         // for it stops the watcher, which stops every sweep and every signal — and leaves
         // the last reading standing as though it were current. Giving up says "cannot
         // tell", which is the honest answer and one the caller already handles.
-        let scanned = tokio::time::timeout(
-            SCAN_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                rvt_core::scan::scan(std::path::Path::new(&meta), std::path::Path::new(&data))
-            }),
-        )
-        .await;
+        let mut task = tokio::task::spawn_blocking(move || {
+            rvt_core::scan::scan(std::path::Path::new(&meta), std::path::Path::new(&data))
+        });
 
-        let scanned = match scanned {
+        let scanned = match tokio::time::timeout(SCAN_TIMEOUT, &mut task).await {
             Ok(joined) => joined,
             Err(_) => {
+                // Aborted, not just dropped. Dropping a handle detaches the task, and a
+                // scan still queued behind a saturated pool would then run later anyway —
+                // one more per poll, each eventually taking a thread to walk a tree whose
+                // answer nothing is waiting for. Abort cannot stop one already running.
+                task.abort();
                 return TransferState::unmonitored(
                     &self.name,
                     format!("{e}; and the cache on disk could not be read within {SCAN_TIMEOUT:?}"),
-                )
+                );
             }
         };
 

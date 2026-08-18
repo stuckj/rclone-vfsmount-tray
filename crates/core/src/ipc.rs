@@ -357,7 +357,7 @@ pub trait RcloneVfsmountTray {
     #[zbus(property)]
     fn service_version(&self) -> Result<String, IpcError>;
 
-    /// The rclone this service found, as rclone reports it.
+    /// The rclone this service found: the bare version, without rclone's leading `v`.
     #[zbus(property)]
     fn rclone_version(&self) -> Result<String, IpcError>;
 

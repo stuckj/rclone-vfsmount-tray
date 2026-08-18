@@ -684,10 +684,16 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     async fn failure_reason(&self, unit: &str) -> String {
         let out = self.units.recent_output(unit).await;
         if out.is_empty() {
-            format!("rclone logged nothing; check `journalctl --user -u {unit}`")
-        } else {
-            out
+            return format!("rclone logged nothing; check `journalctl --user -u {unit}`");
         }
+        let extra_args = self
+            .config
+            .mounts
+            .iter()
+            .find(|m| m.unit_name() == unit)
+            .map(|m| m.extra_args.as_slice())
+            .unwrap_or_default();
+        redact_extra_args(&out, extra_args)
     }
 
     /// Create the runtime directory private to this user.
@@ -1267,6 +1273,50 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 /// This service's runtime directory joined with the shared socket file name. The client
 /// resolves the same name against `XDG_RUNTIME_DIR`; `RcClient::socket_file_name` is the
 /// single definition both use, and explains why the name is escaped rather than folded.
+/// What replaces an `extra_args` entry found in rclone's output.
+const REDACTED: &str = "<redacted>";
+
+/// Characters rclone wraps a logged parameter in, stripped before comparing.
+const WRAPPERS: [char; 4] = ['"', '[', ']', ','];
+
+/// Take a mount's own `extra_args` back out of rclone's log.
+///
+/// This text becomes a mount's failure reason, which crosses D-Bus. `extra_args` reaches
+/// rclone as verbatim argv, so a credential flag put there is one rclone can echo: at
+/// debug level it opens with `starting with parameters [...]`, every value quoted.
+/// Measured against rclone 1.75.0, which does not log that line at its default level —
+/// so this bites only for a mount that asked for `-vv`.
+///
+/// Matched whole-token, never as a substring, so an entry that is also an ordinary word —
+/// `1`, `true` — cannot shred the rest of the message.
+///
+/// Not a guarantee that nothing sensitive crosses. The text is rclone's, and rclone can
+/// be told to log a great deal; this closes the argv echo, which is the one path that
+/// leaks a field this project stores. See DESIGN.md, "D-Bus, and only for sandboxed
+/// callers".
+fn redact_extra_args(text: &str, extra_args: &[String]) -> String {
+    if extra_args.is_empty() {
+        return text.to_string();
+    }
+    text.split_inclusive(char::is_whitespace)
+        .map(|piece| {
+            let token = piece.trim_end();
+            let space = &piece[token.len()..];
+            let core = token.trim_matches(WRAPPERS);
+            if core.is_empty() || !extra_args.iter().any(|a| a == core) {
+                return piece.to_string();
+            }
+            let lead = token.len() - token.trim_start_matches(WRAPPERS).len();
+            let trail = token.len() - token.trim_end_matches(WRAPPERS).len();
+            format!(
+                "{}{REDACTED}{}{space}",
+                &token[..lead],
+                &token[token.len() - trail..]
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
     runtime_dir.join(rvt_core::RcClient::socket_file_name(name))
 }
@@ -1382,6 +1432,9 @@ mod tests {
         /// what pins a mount is the holder's own descriptor, so killing rclone leaves it
         /// exactly as busy. Measured — see [`Release`].
         busy: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+        /// What the journal would hand back for a failed unit. `None` gives the ordinary
+        /// one-line failure the lifecycle tests expect.
+        output: Mutex<Option<String>>,
     }
 
     impl UnitManager for FakeUnits {
@@ -1441,7 +1494,13 @@ mod tests {
             })
         }
         fn recent_output<'a>(&'a self, _unit: &'a str) -> BoxFuture<'a, String> {
-            Box::pin(async { "rclone: couldn't connect: permission denied".to_string() })
+            Box::pin(async {
+                self.output
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "rclone: couldn't connect: permission denied".to_string())
+            })
         }
     }
 
@@ -3299,5 +3358,97 @@ mod tests {
         ] {
             assert_eq!(orphan_name(not_ours), None, "{not_ours}");
         }
+    }
+
+    /// A supervisor whose one mount carries `extra_args`, and whose journal says whatever
+    /// the test wants it to.
+    fn with_extra_args(
+        tag: &str,
+        extra_args: &[&str],
+        journal: &str,
+    ) -> SystemdSupervisor<FakeUnits> {
+        let scratch = Scratch::new(tag);
+        let mut mount = a_mount("backup", mount_point(&scratch));
+        mount.extra_args = extra_args.iter().map(|s| s.to_string()).collect();
+        let mut config = Config::default();
+        config.mounts.push(mount);
+
+        let units = FakeUnits::default();
+        *units.output.lock().unwrap() = Some(journal.to_string());
+        SystemdSupervisor::new(
+            Arc::new(config),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            scratch.join("run"),
+            PathBuf::from("/nonexistent/config.toml"),
+        )
+    }
+
+    /// rclone 1.75.0's opening line at `-vv`, which is where a secret in `extra_args`
+    /// comes back out. Captured from a real run; it is absent at the default level.
+    const ARGV_ECHO: &str = concat!(
+        "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
+        "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" \"-vv\" ",
+        "\"--drive-token\" \"SECRET-TOKEN-abc123\"]\n",
+        "CRITICAL: Failed to create file system for \"backup:pictures\": ",
+        "didn't find section in config file"
+    );
+
+    #[tokio::test]
+    async fn a_failure_reason_does_not_carry_a_secret_from_extra_args_onto_the_bus() {
+        // The reason reaches every session-bus peer as `MountView.Reason`, and
+        // `extra_args` is the one field of this project's config that can hold a
+        // credential. See DESIGN.md, "D-Bus, and only for sandboxed callers".
+        let sup = with_extra_args(
+            "reason-redacts",
+            &["-vv", "--drive-token", "SECRET-TOKEN-abc123"],
+            ARGV_ECHO,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "a credential from extra_args reached the wire: {reason}"
+        );
+        assert!(
+            reason.contains("didn't find section in config file"),
+            "the reason still has to say what went wrong: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redacting_takes_whole_arguments_and_leaves_the_message_readable() {
+        // Substring matching would rewrite every "1" and "mount" in the text, which is
+        // most of it.
+        let sup = with_extra_args(
+            "reason-whole-tokens",
+            &["--transfers", "1", "--drive-token", "SECRET-TOKEN-abc123"],
+            ARGV_ECHO,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(reason.contains("Version"), "{reason}");
+        assert!(
+            reason.contains("didn't find section in config file"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("v1.75.0"),
+            "the version is not a secret: {reason}"
+        );
+    }
+
+    #[test]
+    fn redaction_leaves_a_mount_with_no_extra_args_untouched() {
+        let text = "CRITICAL: Failed to create file system";
+        assert_eq!(redact_extra_args(text, &[]), text);
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_said_nothing_still_says_where_to_look() {
+        let sup = with_extra_args("reason-empty", &["--drive-token", "s3cret"], "");
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(reason.contains("journalctl"), "{reason}");
+        assert!(!reason.contains("s3cret"), "{reason}");
     }
 }

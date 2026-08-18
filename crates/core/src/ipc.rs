@@ -11,6 +11,13 @@
 //! version. [`INTERFACE_VERSION`] therefore announces additive revisions, and the `1` in
 //! [`INTERFACE_NAME`] changes only when something is removed or reinterpreted.
 //!
+//! **Subscribe, then list, then apply what arrived in between.** Signals are deltas and
+//! the service sends one only when something changes, so a client that lists first and
+//! subscribes afterwards can miss the change that happened in the gap and never hear of it
+//! again. Subscribing first and applying the snapshot *before* the buffered signals gets
+//! the ordering right in both directions: a signal older than the snapshot re-applies what
+//! the snapshot already has, and a newer one lands on top of it.
+//!
 //! What is *not* here is as deliberate: no method takes an rc command, a path outside a
 //! configured mount, or anything from rclone's own configuration. See DESIGN.md,
 //! "D-Bus, and only for sandboxed callers".
@@ -527,12 +534,33 @@ mod tests {
     fn each_supervisor_failure_gets_its_own_error_name() {
         use zbus::DBusError as _;
 
+        // Every variant `From<SupervisorError>` maps. The compiler catches a *new* one, but
+        // not one mapped to the wrong name, and two failures sharing a name is a client
+        // that cannot tell them apart.
         let cases = [
             (
                 SupervisorError::UnknownMount("photos".into()),
                 "UnknownMount",
             ),
-            (SupervisorError::NotManaged("photos".into()), "NotManaged"),
+            (
+                SupervisorError::BadMountPoint {
+                    path: "/mnt/photos".into(),
+                    reason: "not a directory".into(),
+                    source: None,
+                },
+                "BadMountPoint",
+            ),
+            (
+                SupervisorError::RcloneFailed {
+                    reason: "exited 1".into(),
+                    source: None,
+                },
+                "RcloneFailed",
+            ),
+            (
+                SupervisorError::PendingUploads(Pending::new(3, 1024, 0)),
+                "PendingUploads",
+            ),
             (
                 SupervisorError::Busy {
                     detail: "still in use".into(),
@@ -540,12 +568,16 @@ mod tests {
                 "Busy",
             ),
             (
-                SupervisorError::PendingUploads(Pending::new(3, 1024, 0)),
-                "PendingUploads",
+                SupervisorError::Supervision {
+                    context: "starting unit".into(),
+                    source: None,
+                },
+                "Supervision",
             ),
+            (SupervisorError::NotManaged("photos".into()), "NotManaged"),
         ];
 
-        let mut seen = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
         for (err, expected) in cases {
             let text = err.to_string();
             let ipc = IpcError::from(err);
@@ -559,13 +591,8 @@ mod tests {
                 Some(text.as_str()),
                 "the sentence a client shows must be the supervisor's own"
             );
-            seen.push(name);
+            assert!(seen.insert(name.clone()), "{name} is used twice");
         }
-        seen.dedup();
-        assert_eq!(
-            seen.len(),
-            4,
-            "distinct failures must not share an error name"
-        );
+        assert_eq!(seen.len(), 7);
     }
 }

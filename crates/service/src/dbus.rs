@@ -6,7 +6,7 @@
 
 use crate::registry::{Change, Registry};
 use rvt_core::ipc::{self, IpcError, MountView, TransferView};
-use rvt_core::supervisor::MountSupervisor;
+use rvt_core::supervisor::{MountState, MountSupervisor};
 use rvt_core::transfer::TransferState;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
@@ -138,11 +138,17 @@ impl MountManager {
 ///
 /// Every one of these is an ordinary state rather than a failure, which is why this is a
 /// reason attached to an empty answer and not an error.
+///
+/// Read back through [`ipc::state_from_name`] rather than matched as strings, so the
+/// vocabulary lives in one place and a renamed state cannot quietly fall through to the
+/// last arm.
 fn why_not_polled(mount: &MountView) -> String {
-    match mount.state.as_str() {
-        "foreign" => "started outside this service, so its rc socket is unknown".into(),
-        "orphaned" => "no configuration describes this mount any more".into(),
-        "mounted" => "not polled yet".into(),
+    match ipc::state_from_name(&mount.state, mount.reason.as_deref()) {
+        Some(MountState::Foreign) => {
+            "started outside this service, so its rc socket is unknown".into()
+        }
+        Some(MountState::Orphaned) => "no configuration describes this mount any more".into(),
+        Some(MountState::Mounted) => "not polled yet".into(),
         _ => "the mount is not serving".into(),
     }
 }
@@ -153,6 +159,19 @@ pub async fn announce(emitter: &SignalEmitter<'_>, change: Change) -> zbus::Resu
         Change::Mount(view) => MountManager::mount_state_changed(emitter, view).await,
         Change::Removed(name) => MountManager::mount_removed(emitter, &name).await,
         Change::Transfer(view) => MountManager::transfer_state_changed(emitter, view).await,
+        // A property, so it travels as `PropertiesChanged` and has to be emitted through
+        // the object server, which holds the instance the new value is read from.
+        Change::CapabilityTier => {
+            let iface = emitter
+                .connection()
+                .object_server()
+                .interface::<_, MountManager>(emitter.path())
+                .await?;
+            let published = iface.get().await;
+            published
+                .capability_tier_changed(iface.signal_emitter())
+                .await
+        }
     }
 }
 
@@ -463,5 +482,47 @@ mod tests {
             .expect("no signal arrived: the emitter and the proxy do not agree")
             .expect("the signal stream ended");
         assert_eq!(signal.args().unwrap().mount.state, "mounted");
+    }
+
+    #[tokio::test]
+    async fn a_resolved_tier_reaches_a_client_that_already_read_the_property() {
+        use futures_util::StreamExt as _;
+
+        // A D-Bus proxy caches a property and refreshes it only from `PropertiesChanged`,
+        // so a client that connects before any mount is up — which the service invites by
+        // taking its name before the first sweep — would hold "unknown" for the life of
+        // the connection unless the change is published.
+        let (server, client, registry) =
+            connected(Arc::new(FakeSupervisor::default()), Vec::new()).await;
+
+        let p = proxy(&client).await;
+        assert_eq!(p.capability_tier().await.unwrap(), "unknown");
+
+        // zbus hands the current value out first and only then waits for changes, so the
+        // opening event is the "unknown" the client already has. What is being tested is
+        // that a second one ever arrives.
+        let mut changed = p.receive_capability_tier_changed().await;
+        let opening = tokio::time::timeout(Duration::from_secs(10), changed.next())
+            .await
+            .expect("the stream did not yield its current value")
+            .expect("the stream ended");
+        assert_eq!(opening.get().await.unwrap(), "unknown");
+
+        let change = registry.lock().await.note_tier(rvt_core::Tier::T1);
+        let emitter = SignalEmitter::new(&server, ipc::OBJECT_PATH).unwrap();
+        announce(&emitter, change.expect("the first tier is a change"))
+            .await
+            .unwrap();
+
+        let update = tokio::time::timeout(Duration::from_secs(10), changed.next())
+            .await
+            .expect("the property change was never published")
+            .expect("the stream ended");
+        assert_eq!(update.get().await.unwrap(), "T1");
+        assert_eq!(
+            p.capability_tier().await.unwrap(),
+            "T1",
+            "the cached value has to move with it, since that is what a client reads"
+        );
     }
 }

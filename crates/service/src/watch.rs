@@ -62,7 +62,10 @@ impl Watcher {
 
         if self.sweep_due <= now {
             changes.extend(self.sweep().await);
-            self.sweep_due = now + SWEEP_INTERVAL;
+            // Measured from the end of the sweep, not its start. A systemd slow enough to
+            // take longer than the interval would otherwise leave the deadline already
+            // past and sweep without pause.
+            self.sweep_due = Instant::now() + SWEEP_INTERVAL;
         }
         changes.extend(self.poll_due(now).await);
 
@@ -143,12 +146,15 @@ impl Watcher {
 
             let poller = self.pollers.get_mut(&name).expect("just inserted");
             let state = poller.poll().await;
-            let tier = poller.tier();
+            // Only from a probe that answered. An unreachable rclone reports T4 as well,
+            // and publishing that as this build's capability is a claim taken from a
+            // refusal.
+            let tier = poller.rc_answered().then(|| poller.tier());
             let wait = MountPoller::interval(&state, &self.config.global.poll);
             self.due.insert(name.clone(), Instant::now() + wait);
 
             let mut registry = self.registry.lock().await;
-            registry.note_tier(tier);
+            changes.extend(tier.and_then(|t| registry.note_tier(t)));
             if let Some(change) = registry.observe_transfer(TransferView::from(&state)) {
                 changes.push(change);
             }
@@ -227,6 +233,16 @@ mod tests {
             .collect::<String>();
         let config: Config =
             toml::from_str(&format!("version = 1\n{mounts}")).expect("fixture config");
+        config.validate().expect("fixture config is not valid");
+        Arc::new(config)
+    }
+
+    /// The same, with a cadence slower than [`SWEEP_INTERVAL`] — which a user with a
+    /// rarely-touched mount would set, and which is the only case where the two deadlines
+    /// disagree about which comes first.
+    fn config_polling_slowly(names: &[&str]) -> Arc<Config> {
+        let mut config = Config::clone(&config_with(names));
+        config.global.poll.idle_secs = 600;
         config.validate().expect("fixture config is not valid");
         Arc::new(config)
     }
@@ -361,11 +377,44 @@ mod tests {
 
     #[tokio::test]
     async fn the_wait_never_outruns_the_next_sweep() {
+        // A mount whose own cadence is 600s, so its poll deadline is far past the sweep's
+        // and the sweep is what the wait has to be taken from. With nothing to poll this
+        // holds trivially and proves nothing.
         let scratch = Scratch::new("watch-wait");
-        let sup = ScriptedSupervisor::new(vec![Ok(Vec::new())]);
-        let (mut w, _registry) = watcher(sup, config_with(&[]), scratch.path().to_path_buf());
+        let sup = ScriptedSupervisor::new(vec![Ok(vec![DiscoveredMount::new(
+            "photos",
+            MountState::Mounted,
+        )])]);
+        let (mut w, _registry) = watcher(
+            sup,
+            config_polling_slowly(&["photos"]),
+            scratch.path().to_path_buf(),
+        );
 
         let (_, wait) = w.tick().await;
+        assert!(
+            !w.due.is_empty(),
+            "nothing was polled, so nothing is proved"
+        );
         assert!(wait <= SWEEP_INTERVAL, "{wait:?}");
+    }
+
+    #[tokio::test]
+    async fn a_tier_is_not_claimed_from_a_probe_that_was_refused() {
+        // The socket does not exist, so the capability set is empty and `tier()` falls
+        // back to T4 — the disk scan, which needs nothing. Publishing that as what this
+        // rclone supports would be a capability read off a refusal.
+        let scratch = Scratch::new("watch-refused-probe");
+        let sup = ScriptedSupervisor::new(vec![Ok(vec![DiscoveredMount::new(
+            "photos",
+            MountState::Mounted,
+        )])]);
+        let (mut w, registry) =
+            watcher(sup, config_with(&["photos"]), scratch.path().to_path_buf());
+
+        let (changes, _) = w.tick().await;
+
+        assert_eq!(registry.lock().await.tier(), None);
+        assert!(!changes.iter().any(|c| matches!(c, Change::CapabilityTier)));
     }
 }

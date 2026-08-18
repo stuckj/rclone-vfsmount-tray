@@ -76,6 +76,16 @@ impl MountPoller {
         self.caps.tier()
     }
 
+    /// Whether rclone answered the capability probe at all.
+    ///
+    /// [`Self::tier`] is `T4` both for an rclone that offers nothing over rc and for one
+    /// that could not be reached, since the disk scan is what is left in either case. Only
+    /// the first of those is a statement about what this rclone *supports*, so anything
+    /// reporting a capability rather than a reading has to tell them apart.
+    pub fn rc_answered(&self) -> bool {
+        !self.caps.is_empty()
+    }
+
     /// How long to wait before polling again.
     ///
     /// Driven by whether anything is known to be outstanding, not by whether the mount is

@@ -17,6 +17,11 @@ pub enum Change {
     Removed(String),
     /// A mount's outstanding work changed.
     Transfer(TransferView),
+    /// The best tier any mount has resolved changed, which happens the first time one
+    /// answers over rc. A property rather than a signal, but it has to be published all
+    /// the same: a client that reads it once and caches it — which is what a D-Bus proxy
+    /// does by default — otherwise keeps `"unknown"` for the life of the connection.
+    CapabilityTier,
 }
 
 /// The mounts, and the last reading taken for each.
@@ -83,11 +88,17 @@ impl Registry {
         self.mounts.get(name)
     }
 
-    /// Record what a mount's rc connection turned out to support.
+    /// Record what a mount's rc connection turned out to support, reporting whether that
+    /// changed the answer.
     ///
     /// Kept at the richest seen: `Tier` orders by detail, so `min` is the best of them.
-    pub fn note_tier(&mut self, tier: Tier) {
-        self.tier = Some(self.tier.map_or(tier, |best| best.min(tier)));
+    pub fn note_tier(&mut self, tier: Tier) -> Option<Change> {
+        let best = Some(self.tier.map_or(tier, |seen| seen.min(tier)));
+        if best == self.tier {
+            return None;
+        }
+        self.tier = best;
+        Some(Change::CapabilityTier)
     }
 
     /// The richest tier any mount has resolved, or `None` before one has.
@@ -202,9 +213,14 @@ mod tests {
             "no tier may be named before one is resolved"
         );
 
-        r.note_tier(Tier::T3);
-        r.note_tier(Tier::T2);
-        r.note_tier(Tier::T4);
+        assert_eq!(r.note_tier(Tier::T3), Some(Change::CapabilityTier));
+        assert_eq!(r.note_tier(Tier::T2), Some(Change::CapabilityTier));
+        assert_eq!(
+            r.note_tier(Tier::T4),
+            None,
+            "a poorer tier does not change the answer, so nothing is published"
+        );
+        assert_eq!(r.note_tier(Tier::T2), None, "nor does repeating the best");
         assert_eq!(r.tier(), Some(Tier::T2));
     }
 

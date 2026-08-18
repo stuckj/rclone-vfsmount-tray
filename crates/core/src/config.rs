@@ -25,6 +25,11 @@ static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// dropping fields it does not understand is how configuration gets eaten.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// Longest wait accepted between polls. A day is already far past the point where the
+/// answer means anything; the bound exists so the value cannot overflow the deadline the
+/// service computes from it.
+pub const MAX_POLL_SECS: u64 = 86_400;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -585,15 +590,18 @@ impl Config {
             }
         }
 
-        // Zero is not "as fast as possible": this is the wait *between* polls, so a mount
-        // with anything outstanding would be re-polled with no wait at all.
+        // This is the wait *between* polls. Zero is not "as fast as possible" — a mount
+        // with anything outstanding would be re-polled with no wait at all — and the
+        // ceiling is not taste: the service adds this to an `Instant`, which panics on
+        // overflow, so an unbounded value takes the whole service down at the first poll.
         for (field, secs) in [
             ("active_secs", self.global.poll.active_secs),
             ("idle_secs", self.global.poll.idle_secs),
         ] {
-            if secs == 0 {
+            if secs == 0 || secs > MAX_POLL_SECS {
                 return Err(ConfigError::Invalid(format!(
-                    "global.poll.{field} must be at least 1 second"
+                    "global.poll.{field} must be between 1 second and {MAX_POLL_SECS} \
+                     (a day), got {secs}"
                 )));
             }
         }
@@ -1301,20 +1309,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_a_poll_interval_that_would_spin() {
+    fn validate_rejects_a_poll_interval_at_either_end_of_the_range() {
+        // Zero spins; the top end overflows the deadline the service builds from it, and
+        // `Instant` panics rather than saturating. Both fields, both ends — the same
+        // omission at the far end of a range is this repo's most repeated defect.
         for field in ["active_secs", "idle_secs"] {
-            let mut c = with(vec![mount("a", "/mnt/one")]);
-            match field {
-                "active_secs" => c.global.poll.active_secs = 0,
-                _ => c.global.poll.idle_secs = 0,
+            for bad in [0, MAX_POLL_SECS + 1, u64::MAX] {
+                let mut c = with(vec![mount("a", "/mnt/one")]);
+                match field {
+                    "active_secs" => c.global.poll.active_secs = bad,
+                    _ => c.global.poll.idle_secs = bad,
+                }
+                let msg = c.validate().unwrap_err().to_string();
+                assert!(
+                    msg.contains(field) && msg.contains(&bad.to_string()),
+                    "the refusal must name the field and the value: {msg:?}"
+                );
             }
-            let msg = c.validate().unwrap_err().to_string();
-            assert!(
-                msg.contains(field),
-                "the refusal must name the field: {msg:?}"
-            );
         }
+
+        let mut ok = with(vec![mount("a", "/mnt/one")]);
+        ok.global.poll.idle_secs = MAX_POLL_SECS;
+        assert!(ok.validate().is_ok(), "the bound itself is accepted");
         assert!(with(vec![mount("a", "/mnt/one")]).validate().is_ok());
+    }
+
+    #[test]
+    fn the_largest_accepted_poll_interval_cannot_overflow_a_deadline() {
+        // What the bound is for: the service does `Instant::now() + interval`.
+        let longest = std::time::Duration::from_secs(MAX_POLL_SECS);
+        assert!(std::time::Instant::now().checked_add(longest).is_some());
     }
 
     #[test]

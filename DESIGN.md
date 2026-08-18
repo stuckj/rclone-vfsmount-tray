@@ -359,21 +359,26 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   #42). The surface has to treat that field as secret-bearing — redacted or gated — rather
   than assume nothing here can be a secret. It is gated for now, by not publishing mount
   configuration at all: a client is told a mount's name, state, point and `remote:path`, and
-  the choice between redacting and gating falls due when editing lands.
+  the choice between redacting and gating falls due when editing lands. **Gating the field
+  is not enough on its own**, because rclone echoes its own argv when asked to log at debug
+  level, and a failed mount's reason is rclone's output — so a mount's `extra_args` are
+  taken back out of that text before it crosses. Which is the narrower claim: the reason is
+  rclone's, and rclone can be told to log a great deal that this does not know to remove.
 - **Safety checks live service-side**, so a client cannot skip one by leaving a parameter out.
   A forced unmount is destructive, and `force` is explicit and defaults to off — a guard
   against accident and bugs, not against malice.
 - Closing the malice case needs an authorization decision the bus cannot make for us. **It is
-  settled as: accept the risk, no polkit** (#40). polkit authorises a *privilege transition*,
-  and there is none here — the service acts as the calling user and does nothing that user
-  could not do directly, so the action it would guard is "may you act on your own files".
-  Nor would it separate the caller this section is about: polkit identifies a subject by uid
-  and pid, and a sandboxed app runs under the same uid as the tray, so the prompt would land
-  on every forced unmount including the ordinary ones. It also costs a system-wide policy
-  file, which a per-user install cannot place, so the applet would behave differently by
-  install path. What remains is an explicit `force` defaulting to off, and a logged line
-  naming the caller's connection. If this is revisited, the mechanism that would actually
-  tell a sandboxed caller apart is peer-credential inspection, as the desktop portals do it —
+  settled as: accept the risk, no polkit** (#40). Not because there is nothing to authorise —
+  a sandboxed app that cannot reach the mount point can still ask this service to unmount it,
+  which is a confused deputy and exactly polkit's shape. It is that polkit cannot tell that
+  caller from the tray: it identifies a subject by uid and pid, both of which a sandboxed app
+  shares with every other process of this user, so the prompt would land on every forced
+  unmount including the ordinary ones and be trained away within a week. It also costs a
+  system-wide policy file, which a per-user install cannot place, so the applet would behave
+  differently by install path. What remains is an explicit `force` defaulting to off, and a
+  logged line naming the caller's connection. If this is revisited, the mechanism that would
+  actually tell a sandboxed caller apart is peer-credential inspection, as the desktop
+  portals do it —
   not polkit.
 
 One further surface to keep in mind: the on-disk cache scanner walks a path taken from an rc

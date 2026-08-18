@@ -164,6 +164,7 @@ fn report(change: &Change) {
             tracing::info!(mount = %view.name, state = %view.state, "mount state")
         }
         Change::Removed(name) => tracing::info!(mount = %name, "no longer listed"),
+        Change::CapabilityTier => tracing::info!("capability tier resolved"),
         Change::Transfer(view) => tracing::debug!(
             mount = %view.mount,
             fidelity = ?view.fidelity,

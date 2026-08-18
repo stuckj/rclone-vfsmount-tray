@@ -3500,6 +3500,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_value_echoed_off_the_command_line_is_replaced_too() {
+        // The line drop covers the argv echo. This is the other half of the function: a
+        // value rclone quotes somewhere else entirely. Without a fixture that puts one
+        // there, that half could stop working and nothing would say so.
+        let journal = concat!(
+            "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
+            "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\"]\n",
+            "ERROR+4: Failed to read token \"SECRET-TOKEN-abc123\": malformed"
+        );
+        let sup = with_extra_args(
+            "reason-echoed-elsewhere",
+            &["-vv", "--drive-token", "SECRET-TOKEN-abc123"],
+            journal,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "a value quoted outside the argv echo crossed: {reason}"
+        );
+        assert!(reason.contains("malformed"), "{reason}");
+    }
+
+    #[tokio::test]
     async fn redacting_leaves_rclones_own_words_alone() {
         // `1` is an ordinary word as well as an argument, and rclone's own "exit status 1"
         // must not come out as "exit status <redacted>" — which reads to a user as though

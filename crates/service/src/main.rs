@@ -140,9 +140,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Swept before the name goes up, and the changes dropped because nobody can be
     // listening yet. A client that connected first would find an empty list and no way to
-    // tell it from "no mounts configured" — and would be told a mount it can see in the
-    // config is a name this service has never heard of. A client that cannot connect at
-    // all has to cope with that anyway (#52), so it is the honest half-second to spend.
+    // tell it from "no mounts configured". A client that cannot connect at all has to cope
+    // with that anyway (#52), so the wait is the honest place to spend it — and it is a
+    // wait: a mount point that has wedged makes this tens of seconds (#103).
     let (found, _) = watcher.tick().await;
     for change in &found {
         report(change);

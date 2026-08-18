@@ -177,15 +177,18 @@ fn pollable(view: &MountView) -> bool {
 mod tests {
     use super::*;
 
+    /// Built through the real conversion, so `live` and `managed` are whatever the state
+    /// actually implies. Writing them by hand made every fixture claim a foreign mount was
+    /// not live, which is the one thing it is.
     fn view(name: &str, state: &str) -> MountView {
+        let found = rvt_core::DiscoveredMount::new(
+            name,
+            rvt_core::ipc::state_from_name(state, None).expect("a state this build knows"),
+        );
         MountView {
-            name: name.into(),
-            state: state.into(),
-            live: state == "mounted",
-            managed: true,
-            reason: None,
             mount_point: Some(format!("/mnt/{name}")),
             remote: Some(format!("drive:{name}")),
+            ..MountView::from(&found)
         }
     }
 

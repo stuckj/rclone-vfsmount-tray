@@ -530,6 +530,37 @@ mod tests {
     }
 
     #[test]
+    fn live_and_managed_come_from_the_state_rather_than_from_the_sender() {
+        // Written out rather than derived from `is_live`/`is_managed`, because a test that
+        // asks the same predicate the code asks cannot tell a broken mapping from a
+        // correct one. These are what a client renders for a state name it cannot parse.
+        for (state, live, managed) in [
+            (MountState::Unmounted, false, true),
+            (MountState::Mounting, false, true),
+            (MountState::Mounted, true, true),
+            (MountState::Unmounting, false, true),
+            (
+                MountState::Failed {
+                    reason: "rclone exited".into(),
+                },
+                false,
+                true,
+            ),
+            // Somebody else's mount: serving, and not ours to act on.
+            (MountState::Foreign, true, false),
+            // Ours, serving, and stoppable — the distinction from `Foreign`.
+            (MountState::Orphaned, true, true),
+        ] {
+            let view = MountView::from(&DiscoveredMount::new("m", state.clone()));
+            assert_eq!(
+                (view.live, view.managed),
+                (live, managed),
+                "{state:?} crossed with the wrong live/managed"
+            );
+        }
+    }
+
+    #[test]
     fn an_unknown_state_still_says_whether_anything_is_mounted() {
         // What `Live` and `Managed` are for: a client one release behind must not have to
         // guess whether a state it cannot name means a filesystem is serving.

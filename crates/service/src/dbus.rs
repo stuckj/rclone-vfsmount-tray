@@ -317,15 +317,16 @@ mod tests {
         }
     }
 
+    /// Built through the real conversion, so `live` and `managed` follow the state.
     fn a_mount(name: &str, state: &str) -> MountView {
+        let found = rvt_core::DiscoveredMount::new(
+            name,
+            rvt_core::ipc::state_from_name(state, None).expect("a state this build knows"),
+        );
         MountView {
-            name: name.into(),
-            state: state.into(),
-            live: state == "mounted",
-            managed: true,
-            reason: None,
             mount_point: Some(format!("/mnt/{name}")),
             remote: Some(format!("drive:{name}")),
+            ..MountView::from(&found)
         }
     }
 
@@ -584,16 +585,30 @@ mod tests {
     #[tokio::test]
     async fn a_call_that_did_nothing_does_not_buy_a_sweep() {
         // A sweep lists units, reads /proc and shells out to journalctl. Any peer on the
-        // session bus can call `Mount`, so a name the service itself refuses must not be
-        // a way to spend its CPU — and the init system's — in a loop.
+        // session bus can call `Mount`, so a refusal must not be a way to spend its CPU —
+        // and the init system's — in a loop.
+        //
+        // The name has to be one the registry holds, or `must_know` refuses it first and
+        // the supervisor is never reached. A foreign row is the real shape of that: it is
+        // listed, so a client has the name, and `Mount` on it refuses because no config
+        // entry says how to start it.
         let sup = Arc::new(FakeSupervisor {
-            refuse_mount: Some(SupervisorError::UnknownMount("nope".into())),
+            refuse_mount: Some(SupervisorError::UnknownMount("/mnt/theirs".into())),
             ..Default::default()
         });
         let nudge = Arc::new(Nudge::default());
-        let (_server, client, _reg) = connected_with(sup, Vec::new(), nudge.clone()).await;
+        let (_server, client, _reg) = connected_with(
+            sup.clone(),
+            vec![a_mount("/mnt/theirs", "foreign")],
+            nudge.clone(),
+        )
+        .await;
 
-        assert!(proxy(&client).await.mount("nope").await.is_err());
+        assert!(proxy(&client).await.mount("/mnt/theirs").await.is_err());
+        assert!(
+            !sup.calls.lock().unwrap().is_empty(),
+            "the supervisor was never asked, so nothing here exercised the refusal"
+        );
         assert!(
             nudge.nothing_pending(),
             "a refusal that touched nothing asked for a sweep anyway"

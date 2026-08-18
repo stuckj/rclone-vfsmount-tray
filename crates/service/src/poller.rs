@@ -83,7 +83,9 @@ impl MountPoller {
     /// the first of those is a statement about what this rclone *supports*, so anything
     /// reporting a capability rather than a reading has to tell them apart.
     pub fn rc_answered(&self) -> bool {
-        !self.caps.is_empty()
+        // Not "the command set is non-empty": an rclone that answers `rc/list` with
+        // nothing has told us what it supports, and T4 is then the true answer for it.
+        self.caps.degraded_reason().is_none()
     }
 
     /// How long to wait before polling again.
@@ -92,15 +94,17 @@ impl MountPoller {
     /// idle. A mount that cannot be observed has nothing to re-derive every second, and a
     /// partially observed one with real entries in its queue still has to be watched.
     ///
-    /// A disk-derived (T4) state is always the slow cadence however much it found: each
-    /// poll behind it is a full walk of the metadata tree.
+    /// A disk-derived (T4) state takes the slower of the two cadences however much it
+    /// found: each poll behind it is a full walk of the metadata tree. The *slower*, not
+    /// the idle one — nothing stops a config naming an idle interval shorter than its
+    /// active one, and that must not be a way to walk the tree every second.
     ///
     /// Neither cadence can be zero: `Config::validate` refuses that, because a mount with
     /// something outstanding would then be polled in a loop with no wait at all.
     pub fn interval(state: &TransferState, poll: &Poll) -> Duration {
         let idle = Duration::from_secs(poll.idle_secs);
         if state.fidelity == Some(Tier::T4) {
-            return idle;
+            return idle.max(Duration::from_secs(poll.active_secs));
         }
         if state.pending.files > 0 {
             Duration::from_secs(poll.active_secs)
@@ -1039,6 +1043,18 @@ mod tests {
         assert_eq!(
             MountPoller::interval(&busy, &poll),
             Duration::from_secs(600)
+        );
+
+        // And it is the slower of the two, not the idle one. Nothing forbids a config
+        // whose idle interval is the shorter, and that must not become a way to walk the
+        // whole tree every second.
+        let inverted = Poll {
+            active_secs: 30,
+            idle_secs: 1,
+        };
+        assert_eq!(
+            MountPoller::interval(&busy, &inverted),
+            Duration::from_secs(30)
         );
     }
 

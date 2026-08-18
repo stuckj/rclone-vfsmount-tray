@@ -7,7 +7,7 @@
 use crate::registry::{self, Change, Registry};
 use crate::watch::Nudge;
 use rvt_core::ipc::{self, IpcError, MountView, TransferView};
-use rvt_core::supervisor::MountSupervisor;
+use rvt_core::supervisor::{MountSupervisor, SupervisorError};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
@@ -47,8 +47,9 @@ impl MountManager {
 
     async fn mount(&self, name: &str) -> Result<(), IpcError> {
         let result = self.sup.mount(name).await;
-        // Whether it worked or not: a failed attempt leaves a state worth publishing.
-        self.nudge.acted_on(name);
+        if touched_something(&result) {
+            self.nudge.acted_on(name);
+        }
         result.map_err(|e| {
             tracing::warn!(mount = name, error = %e, "mount refused");
             e.into()
@@ -72,7 +73,9 @@ impl MountManager {
             );
         }
         let result = self.sup.unmount(name, force).await;
-        self.nudge.acted_on(name);
+        if touched_something(&result) {
+            self.nudge.acted_on(name);
+        }
         result.map_err(|e| {
             tracing::warn!(mount = name, error = %e, "unmount refused");
             e.into()
@@ -131,6 +134,19 @@ impl MountManager {
             .tier()
             .map_or_else(|| "unknown".to_string(), |t| ipc::tier_name(t).to_string())
     }
+}
+
+/// Whether an operation got far enough to leave anything for a sweep to find.
+///
+/// A sweep is not free — it lists units, reads `/proc`, canonicalises every configured
+/// point and shells out to `journalctl` for anything failed — so a refusal that acted on
+/// nothing must not force one. Both of these are decided before the supervisor touches a
+/// unit, and neither leaves a row whose state has moved.
+fn touched_something(result: &Result<(), SupervisorError>) -> bool {
+    !matches!(
+        result,
+        Err(SupervisorError::UnknownMount(_) | SupervisorError::NotManaged(_))
+    )
 }
 
 /// Publish one change to whoever is listening.
@@ -197,12 +213,24 @@ mod tests {
     struct FakeSupervisor {
         calls: StdMutex<Vec<String>>,
         refuse_unmount: Option<String>,
+        refuse_mount: Option<SupervisorError>,
     }
 
     impl MountSupervisor for FakeSupervisor {
         fn mount<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>> {
             self.calls.lock().unwrap().push(format!("mount {name}"));
-            Box::pin(async { Ok(()) })
+            let refusal = self.refuse_mount.as_ref().map(|e| e.to_string());
+            let unknown = matches!(self.refuse_mount, Some(SupervisorError::UnknownMount(_)));
+            Box::pin(async move {
+                match refusal {
+                    None => Ok(()),
+                    Some(text) if unknown => Err(SupervisorError::UnknownMount(text)),
+                    Some(text) => Err(SupervisorError::RcloneFailed {
+                        reason: text,
+                        source: None,
+                    }),
+                }
+            })
         }
 
         fn unmount<'a>(
@@ -255,17 +283,20 @@ mod tests {
         sup: Arc<dyn MountSupervisor>,
         mounts: Vec<MountView>,
     ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
+        connected_with(sup, mounts, Arc::new(Nudge::default())).await
+    }
+
+    async fn connected_with(
+        sup: Arc<dyn MountSupervisor>,
+        mounts: Vec<MountView>,
+        nudge: Arc<Nudge>,
+    ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
         let registry = Arc::new(Mutex::new(Registry::default()));
         registry.lock().await.observe_mounts(mounts);
 
         let (server_sock, client_sock) = tokio::net::UnixStream::pair().unwrap();
         let guid = zbus::Guid::generate();
-        let manager = MountManager::new(
-            sup,
-            registry.clone(),
-            Arc::new(Nudge::default()),
-            "v1.75.0".to_string(),
-        );
+        let manager = MountManager::new(sup, registry.clone(), nudge, "v1.75.0".to_string());
 
         let server = zbus::connection::Builder::socket(server_sock)
             .server(guid)
@@ -396,6 +427,40 @@ mod tests {
             Err(IpcError::Busy(detail)) => assert!(detail.contains("still in use"), "{detail}"),
             other => panic!("expected a Busy refusal, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_call_that_did_nothing_does_not_buy_a_sweep() {
+        // A sweep lists units, reads /proc and shells out to journalctl. Any peer on the
+        // session bus can call `Mount`, so a name the service itself refuses must not be
+        // a way to spend its CPU — and the init system's — in a loop.
+        let sup = Arc::new(FakeSupervisor {
+            refuse_mount: Some(SupervisorError::UnknownMount("nope".into())),
+            ..Default::default()
+        });
+        let nudge = Arc::new(Nudge::default());
+        let (_server, client, _reg) = connected_with(sup, Vec::new(), nudge.clone()).await;
+
+        assert!(proxy(&client).await.mount("nope").await.is_err());
+        assert!(
+            nudge.nothing_pending(),
+            "a refusal that touched nothing asked for a sweep anyway"
+        );
+
+        // A refusal that *did* act still publishes: the mount tried and failed, and that
+        // is a state a client has to see.
+        let acted = Arc::new(FakeSupervisor {
+            refuse_mount: Some(SupervisorError::RcloneFailed {
+                reason: "exited 1".into(),
+                source: None,
+            }),
+            ..Default::default()
+        });
+        let nudge = Arc::new(Nudge::default());
+        let (_s2, c2, _r2) = connected_with(acted, Vec::new(), nudge.clone()).await;
+
+        assert!(proxy(&c2).await.mount("photos").await.is_err());
+        assert!(!nudge.nothing_pending());
     }
 
     #[tokio::test]

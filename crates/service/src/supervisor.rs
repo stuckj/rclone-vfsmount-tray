@@ -1280,9 +1280,6 @@ pub(crate) fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
 /// What replaces an `extra_args` entry found in rclone's output.
 const REDACTED: &str = "<redacted>";
 
-/// Characters rclone puts around a logged parameter, stripped before comparing.
-const WRAPPERS: [char; 4] = ['"', '[', ']', ','];
-
 /// Take a mount's own `extra_args` back out of rclone's log.
 ///
 /// This text becomes a mount's failure reason, which crosses D-Bus. `extra_args` reaches
@@ -1291,46 +1288,22 @@ const WRAPPERS: [char; 4] = ['"', '[', ']', ','];
 /// 1.75.0, which does not log that line at its default level — so this bites only for a
 /// mount that asked for `-vv`.
 ///
-/// Two forms, because one is not enough. rclone renders each parameter with Go's `%q`, so
-/// a value holding a space or a quote appears **only** as an escaped quoted span and never
-/// as a whitespace-delimited token: `--header "Authorization: Bearer s3cret"` logs as one
-/// span, and a JSON credential logs with its quotes backslashed. Rust's `{:?}` produces
-/// that same spelling, so the quoted form is searched as a substring — which is safe from
-/// shredding the message precisely because it is quoted. The bare form is then matched
-/// whole-token, so an entry that is also an ordinary word — `1`, `true` — cannot.
+/// **Only the quoted spelling is matched.** rclone renders every parameter with Go's
+/// `%q`, and Rust's `{:?}` produces the same, so that is the form the argv echo is in —
+/// including for a value holding a space or a quote, which appears escaped and as one span
+/// rather than as separate words. Matching the bare value instead would rewrite it
+/// wherever it happened to appear: an entry of `1` turns rclone's own `exit status 1` into
+/// `exit status <redacted>`, which reads as though a secret had been there.
 ///
-/// Not a guarantee that nothing sensitive crosses: the text is rclone's, rclone can be
-/// told to log a great deal, and a value echoed unquoted inside some other sentence is not
-/// matched. This closes the argv echo. See DESIGN.md, "D-Bus, and only for sandboxed
-/// callers".
+/// So this closes the argv echo and nothing else. The text is rclone's, rclone can be told
+/// to log a great deal, and a value it prints unquoted somewhere is left alone. See
+/// DESIGN.md, "D-Bus, and only for sandboxed callers".
 fn redact_extra_args(text: &str, extra_args: &[String]) -> String {
-    let args: Vec<&String> = extra_args.iter().filter(|a| !a.is_empty()).collect();
-    if args.is_empty() {
-        return text.to_string();
-    }
-
     let mut out = text.to_string();
-    for arg in &args {
+    for arg in extra_args.iter().filter(|a| !a.is_empty()) {
         out = out.replace(&format!("{arg:?}"), &format!("{REDACTED:?}"));
     }
-
-    out.split_inclusive(char::is_whitespace)
-        .map(|piece| {
-            let token = piece.trim_end();
-            let space = &piece[token.len()..];
-            let core = token.trim_matches(WRAPPERS);
-            if core.is_empty() || !args.iter().any(|a| *a == core) {
-                return piece.to_string();
-            }
-            let lead = token.len() - token.trim_start_matches(WRAPPERS).len();
-            let trail = token.len() - token.trim_end_matches(WRAPPERS).len();
-            format!(
-                "{}{REDACTED}{}{space}",
-                &token[..lead],
-                &token[token.len() - trail..]
-            )
-        })
-        .collect()
+    out
 }
 
 /// Clear what a hard-killed rclone leaves behind, so a start can succeed.
@@ -3429,20 +3402,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redacting_takes_whole_arguments_and_leaves_the_message_readable() {
-        // Substring matching would rewrite every "1" and "mount" in the text, which is
-        // most of it.
+    async fn redacting_leaves_rclones_own_words_alone() {
+        // `1` is an ordinary word as well as an argument. Matching the bare value would
+        // turn rclone's own "exit status 1" into "exit status <redacted>", which reads to
+        // a user as though a secret had been standing there.
+        let journal = concat!(
+            "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
+            "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" \"-vv\" ",
+            "\"--transfers\" \"1\" \"--drive-token\" \"SECRET-TOKEN-abc123\"]\n",
+            "ERROR+4: Fatal error: failed to mount FUSE fs: fusermount: exit status 1"
+        );
         let sup = with_extra_args(
-            "reason-whole-tokens",
-            &["--transfers", "1", "--drive-token", "SECRET-TOKEN-abc123"],
-            ARGV_ECHO,
+            "reason-ordinary-words",
+            &[
+                "-vv",
+                "--transfers",
+                "1",
+                "--drive-token",
+                "SECRET-TOKEN-abc123",
+            ],
+            journal,
         );
 
         let reason = sup.failure_reason("rvt-mount-backup.service").await;
-        assert!(reason.contains("Version"), "{reason}");
         assert!(
-            reason.contains("didn't find section in config file"),
-            "{reason}"
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "the secret still has to go: {reason}"
+        );
+        assert!(
+            reason.contains("exit status 1"),
+            "rclone's own words were rewritten: {reason}"
         );
         assert!(
             reason.contains("v1.75.0"),

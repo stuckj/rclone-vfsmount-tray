@@ -23,6 +23,15 @@ use tokio::sync::{Mutex, Notify};
 /// mount appearing, or one of ours dying in a way systemd could not restart.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Closest together two sweeps may be when something asks for one.
+///
+/// A sweep lists units, reads `/proc`, canonicalises every configured mount point and runs
+/// `journalctl` for each failed one — and any peer on the session bus can ask for one by
+/// calling `Mount`. Without a floor, a caller in a loop spends the service's CPU and the
+/// init system's for as long as it likes. An action's result is still published within
+/// this, which is far inside the seconds a mount takes anyway.
+const MIN_SWEEP_GAP: Duration = Duration::from_secs(1);
+
 /// Wakes the watcher, and names the mounts whose poller can no longer be trusted.
 ///
 /// A sweep cannot tell that a mount cycled: an unmount and a remount between two of them
@@ -46,6 +55,12 @@ impl Nudge {
         self.woken.notified().await
     }
 
+    /// Whether nothing has asked for a sweep since the last one was taken.
+    #[cfg(test)]
+    pub fn nothing_pending(&self) -> bool {
+        self.cycled.lock().expect("lock").is_empty()
+    }
+
     fn take_cycled(&self) -> std::collections::BTreeSet<String> {
         std::mem::take(&mut self.cycled.lock().expect("lock"))
     }
@@ -63,6 +78,8 @@ pub struct Watcher {
     /// When each mount is next worth asking.
     due: HashMap<String, Instant>,
     sweep_due: Instant,
+    /// When the last sweep finished, which is what [`MIN_SWEEP_GAP`] is measured from.
+    last_sweep: Instant,
     nudge: Arc<Nudge>,
 }
 
@@ -82,6 +99,7 @@ impl Watcher {
             pollers: HashMap::new(),
             due: HashMap::new(),
             sweep_due: Instant::now(),
+            last_sweep: Instant::now() - MIN_SWEEP_GAP,
             nudge,
         }
     }
@@ -101,7 +119,8 @@ impl Watcher {
             // Measured from the end of the sweep, not its start. A systemd slow enough to
             // take longer than the interval would otherwise leave the deadline already
             // past and sweep without pause.
-            self.sweep_due = Instant::now() + SWEEP_INTERVAL;
+            self.last_sweep = Instant::now();
+            self.sweep_due = self.last_sweep + SWEEP_INTERVAL;
         }
         changes.extend(self.poll_due(now).await);
 
@@ -132,7 +151,7 @@ impl Watcher {
             tokio::select! {
                 _ = tokio::time::sleep(wait) => {}
                 // An action of ours has landed; publish its result now.
-                _ = nudge.woken() => self.sweep_due = Instant::now(),
+                _ = nudge.woken() => self.sweep_due = self.last_sweep + MIN_SWEEP_GAP,
             }
         }
     }

@@ -378,8 +378,7 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   differently by install path. What remains is an explicit `force` defaulting to off, and a
   logged line naming the caller's connection. If this is revisited, the mechanism that would
   actually tell a sandboxed caller apart is peer-credential inspection, as the desktop
-  portals do it —
-  not polkit.
+  portals do it — not polkit.
 
 One further surface to keep in mind: the on-disk cache scanner walks a path taken from an rc
 response, so it must treat that path as untrusted input and refuse to follow it outside the

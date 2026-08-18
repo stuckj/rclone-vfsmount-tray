@@ -1286,34 +1286,33 @@ const REDACTED: &str = "<redacted>";
 /// both, which is what lets one rule cover them. Measured against rclone 1.75.0.
 const ARGV_ECHO: &str = "starting with parameters";
 
-/// What stands in for that line when the mount has arguments of its own.
-const ARGV_WITHHELD: &str = "[rclone's command line withheld: this mount sets extra_args]";
+/// What stands in for that line.
+const ARGV_WITHHELD: &str = "[rclone's command line withheld]";
 
-/// Take a mount's own `extra_args` back out of rclone's log.
+/// Take rclone's own command line, and a mount's `extra_args`, out of its log.
 ///
 /// This text becomes a mount's failure reason, which crosses D-Bus. `extra_args` reaches
 /// rclone as verbatim argv, so a credential flag put there is one rclone echoes at debug
 /// level, in the line [`ARGV_ECHO`] names. Measured against rclone 1.75.0, which does not
-/// log it at its default level — so this bites only for a mount that asked for `-vv`.
+/// log it at its default level.
 ///
-/// **The whole line goes, rather than the secret within it**, and only for a mount that
-/// has `extra_args` at all. Finding the value instead means knowing how rclone spelled it,
-/// and it spells the same argument three ways: bare, quoted by Go's `%q`, and quoted then
-/// escaped again under `--use-json-log`. A rule that has to recognise the spelling fails
-/// silently on the one it does not, which is the wrong direction to fail in. Dropping the
-/// line costs a mount's generated arguments — cache mode, socket path — which are useful
-/// and not secret, so a mount with no `extra_args` keeps them.
+/// **The whole line goes, always.** Not the secret within it: finding that means knowing
+/// how rclone spelled it, and it spells one argument three ways — bare, quoted by Go's
+/// `%q`, and quoted then escaped again under `--use-json-log` — so a rule that has to
+/// recognise the spelling fails silently on the one it does not. And not "only for a
+/// mount that has `extra_args`": the journal outlives the config. `journalctl` is read by
+/// name, so the echo can come from an invocation started before the user moved a token out
+/// of `extra_args` and restarted the service, at which point a condition read off today's
+/// config withholds nothing. What is lost is a command line this service composed from
+/// configuration the user already has.
 ///
-/// The value is then also replaced wherever else it appears quoted, which costs nothing
-/// and catches an echo somewhere other than that line.
+/// The configured values are then also replaced wherever else they appear quoted, which
+/// costs nothing and catches an echo somewhere other than that line.
 ///
 /// Not a guarantee that nothing sensitive crosses: the text is rclone's, and rclone can be
 /// told to log a great deal. See DESIGN.md, "D-Bus, and only for sandboxed callers".
 fn redact_extra_args(text: &str, extra_args: &[String]) -> String {
     let args: Vec<&String> = extra_args.iter().filter(|a| !a.is_empty()).collect();
-    if args.is_empty() {
-        return text.to_string();
-    }
 
     let mut out: Vec<String> = Vec::new();
     for line in text.lines() {
@@ -3482,14 +3481,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_mount_with_no_arguments_of_its_own_keeps_rclones_command_line() {
-        // Nothing in the argv this service composes is a secret, and it is worth reading
-        // when a mount will not start.
-        let sup = with_extra_args("reason-no-extra-args", &[], REAL_ECHO);
+    async fn the_command_line_goes_even_once_the_config_has_stopped_naming_it() {
+        // The journal outlives the config. A user who finds a token in a failure reason
+        // and moves it out of `extra_args` then restarts the service — which does not
+        // unmount, and does not clear the journal — and a rule keyed on today's config
+        // would hand the old invocation's argv, token and all, to every peer on the bus.
+        let sup = with_extra_args("reason-config-emptied", &[], REAL_ECHO);
 
         let reason = sup.failure_reason("rvt-mount-backup.service").await;
-        assert!(reason.contains("--vfs-cache-mode"), "{reason}");
-        assert!(reason.contains("exit status 1"), "{reason}");
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "the config no longer names it, so nothing looked for it: {reason}"
+        );
+        assert!(
+            reason.contains("exit status 1"),
+            "the reason still has to say what went wrong: {reason}"
+        );
     }
 
     #[tokio::test]
@@ -3517,7 +3524,7 @@ mod tests {
     }
 
     #[test]
-    fn redaction_leaves_a_mount_with_no_extra_args_untouched() {
+    fn text_with_no_command_line_in_it_is_left_alone() {
         let text = "CRITICAL: Failed to create file system";
         assert_eq!(redact_extra_args(text, &[]), text);
     }

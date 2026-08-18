@@ -133,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let mut watcher = watch::Watcher::new(
         sup.clone(),
         registry.clone(),
-        config,
+        config.clone(),
         runtime_dir,
         nudge.clone(),
     );
@@ -151,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
     let conn = dbus::serve(dbus::MountManager::new(
         sup,
         registry,
+        config,
         nudge,
         rclone.version().to_string(),
     ))

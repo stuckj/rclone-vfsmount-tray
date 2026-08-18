@@ -119,10 +119,14 @@ Asking it for something means a tray icon or a window, and neither is built. Unt
 only way is by hand:
 
 ```sh
-busctl --user call io.github.stuckj.RcloneVfsmountTray \
+busctl --user --timeout=120 call io.github.stuckj.RcloneVfsmountTray \
   /io/github/stuckj/RcloneVfsmountTray \
   io.github.stuckj.RcloneVfsmountTray1 Mount s photos
 ```
+
+The call does not come back until the mount is actually serving, which for a cold remote can
+take most of a minute. `busctl` gives up after 25 seconds unless you raise `--timeout`, and
+then reports a failure for a mount that is still on its way up.
 
 Use `--config <path>` to point it at a different file, and `--log-level debug` for more
 detail. Stopping it leaves every mount exactly as it is.

@@ -8,6 +8,7 @@ use crate::registry::{self, Change, Registry};
 use crate::watch::Nudge;
 use rvt_core::ipc::{self, IpcError, MountView, TransferView};
 use rvt_core::supervisor::{MountSupervisor, SupervisorError};
+use rvt_core::Config;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
@@ -17,6 +18,9 @@ use zbus::object_server::SignalEmitter;
 pub struct MountManager {
     sup: Arc<dyn MountSupervisor>,
     registry: Arc<Mutex<Registry>>,
+    /// Consulted alongside the registry, which holds only what the last *successful*
+    /// sweep found.
+    config: Arc<Config>,
     /// Poked after an action so the watcher publishes its result now rather than at the
     /// next sweep, and re-probes the mount that was acted on.
     nudge: Arc<Nudge>,
@@ -27,12 +31,14 @@ impl MountManager {
     pub fn new(
         sup: Arc<dyn MountSupervisor>,
         registry: Arc<Mutex<Registry>>,
+        config: Arc<Config>,
         nudge: Arc<Nudge>,
         rclone_version: impl Into<String>,
     ) -> Self {
         Self {
             sup,
             registry,
+            config,
             nudge,
             rclone_version: rclone_version.into(),
         }
@@ -44,11 +50,14 @@ impl MountManager {
     ///
     /// The supervisor reaches the same verdict, but only after sweeping systemd to check
     /// whether the name belongs to an orphan — work an unauthenticated caller should not
-    /// be able to buy with a string it made up. The registry already holds every mount,
-    /// configured or orphaned, and the configured set cannot change under a running
-    /// service until the config is reloadable (#64).
+    /// be able to buy with a string it made up.
+    ///
+    /// The config as well as the registry, because the registry holds what the last
+    /// *successful* sweep found: one failed call to systemd during start-up would
+    /// otherwise leave it empty, and every configured mount would answer "no such mount"
+    /// until the next sweep.
     async fn must_know(&self, name: &str) -> Result<(), IpcError> {
-        if self.registry.lock().await.mount(name).is_none() {
+        if self.config.mount(name).is_none() && self.registry.lock().await.mount(name).is_none() {
             return Err(IpcError::UnknownMount(format!("no mount named {name:?}")));
         }
         Ok(())
@@ -79,17 +88,19 @@ impl MountManager {
         name: &str,
         force: bool,
     ) -> Result<(), IpcError> {
+        // After the name is known to be one: this is the audit trail for the single
+        // destructive operation here, and an entry saying a write was severed when nothing
+        // was even addressed is worse than no entry. It would also let any peer write
+        // arbitrary text into the journal. See DESIGN.md, "D-Bus, and only for sandboxed
+        // callers".
+        self.must_know(name).await?;
         if force {
-            // The one destructive thing this interface can do, and the bus cannot say who
-            // asked for it beyond a connection name. Logging it is the whole of the audit
-            // trail. See DESIGN.md, "D-Bus, and only for sandboxed callers".
             tracing::warn!(
                 mount = name,
                 sender = ?header.sender(),
                 "forced unmount requested: a write in flight will be severed"
             );
         }
-        self.must_know(name).await?;
         let result = self.sup.unmount(name, force).await;
         if touched_something(&result) {
             self.nudge.acted_on(name);
@@ -332,7 +343,13 @@ mod tests {
 
         let (server_sock, client_sock) = tokio::net::UnixStream::pair().unwrap();
         let guid = zbus::Guid::generate();
-        let manager = MountManager::new(sup, registry.clone(), nudge, "v1.75.0".to_string());
+        let manager = MountManager::new(
+            sup,
+            registry.clone(),
+            Arc::new(Config::default()),
+            nudge,
+            "v1.75.0".to_string(),
+        );
 
         let server = zbus::connection::Builder::socket(server_sock)
             .server(guid)
@@ -377,6 +394,7 @@ mod tests {
             MountManager::new(
                 Arc::new(FakeSupervisor::default()),
                 Arc::new(Mutex::new(Registry::default())),
+                Arc::new(Config::default()),
                 Arc::new(Nudge::default()),
                 "v1.75.0".to_string(),
             )
@@ -485,6 +503,33 @@ mod tests {
             "",
             "an error with no cause must not log an empty field as though it had one"
         );
+    }
+
+    #[tokio::test]
+    async fn a_configured_mount_is_known_even_before_a_sweep_has_succeeded() {
+        // The registry holds what the last *successful* sweep found, so one failed call to
+        // systemd at start-up leaves it empty. Telling a client that a mount plainly in its
+        // config does not exist is worse than saying the sweep failed.
+        let config: rvt_core::Config = toml::from_str(
+            "version = 1\n[[mount]]\nname = \"photos\"\nremote = \"drive\"\nmount_point = \"/mnt/photos\"\n",
+        )
+        .expect("fixture config");
+
+        let sup = Arc::new(FakeSupervisor::default());
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let manager = MountManager::new(
+            sup.clone(),
+            registry,
+            Arc::new(config),
+            Arc::new(Nudge::default()),
+            "v1.75.0".to_string(),
+        );
+
+        manager
+            .must_know("photos")
+            .await
+            .expect("a configured mount is not an unknown one");
+        assert!(manager.must_know("nope").await.is_err());
     }
 
     #[tokio::test]

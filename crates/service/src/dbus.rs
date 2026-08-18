@@ -39,6 +39,22 @@ impl MountManager {
     }
 }
 
+impl MountManager {
+    /// Refuse a name no mount answers to, before anything expensive happens.
+    ///
+    /// The supervisor reaches the same verdict, but only after sweeping systemd to check
+    /// whether the name belongs to an orphan — work an unauthenticated caller should not
+    /// be able to buy with a string it made up. The registry already holds every mount,
+    /// configured or orphaned, and the configured set cannot change under a running
+    /// service until the config is reloadable (#64).
+    async fn must_know(&self, name: &str) -> Result<(), IpcError> {
+        if self.registry.lock().await.mount(name).is_none() {
+            return Err(IpcError::UnknownMount(format!("no mount named {name:?}")));
+        }
+        Ok(())
+    }
+}
+
 #[zbus::interface(name = "io.github.stuckj.RcloneVfsmountTray1")]
 impl MountManager {
     async fn list_mounts(&self) -> Vec<MountView> {
@@ -46,12 +62,13 @@ impl MountManager {
     }
 
     async fn mount(&self, name: &str) -> Result<(), IpcError> {
+        self.must_know(name).await?;
         let result = self.sup.mount(name).await;
         if touched_something(&result) {
             self.nudge.acted_on(name);
         }
         result.map_err(|e| {
-            tracing::warn!(mount = name, error = %e, "mount refused");
+            tracing::warn!(mount = name, error = %e, cause = %causes(&e), "mount refused");
             e.into()
         })
     }
@@ -72,12 +89,13 @@ impl MountManager {
                 "forced unmount requested: a write in flight will be severed"
             );
         }
+        self.must_know(name).await?;
         let result = self.sup.unmount(name, force).await;
         if touched_something(&result) {
             self.nudge.acted_on(name);
         }
         result.map_err(|e| {
-            tracing::warn!(mount = name, error = %e, "unmount refused");
+            tracing::warn!(mount = name, error = %e, cause = %causes(&e), "unmount refused");
             e.into()
         })
     }
@@ -134,6 +152,24 @@ impl MountManager {
             .tier()
             .map_or_else(|| "unknown".to_string(), |t| ipc::tier_name(t).to_string())
     }
+}
+
+/// The `source` chain under an error, as one line.
+///
+/// `Display` on these stops at the outermost message — that is what crosses D-Bus, since a
+/// D-Bus error body is a single string — so whatever said *why* systemd or rclone refused
+/// is only ever visible if it is logged here. Empty when there is no cause.
+fn causes(e: &SupervisorError) -> String {
+    let mut out = String::new();
+    let mut source = std::error::Error::source(e);
+    while let Some(e) = source {
+        if !out.is_empty() {
+            out.push_str(": ");
+        }
+        out.push_str(&e.to_string());
+        source = e.source();
+    }
+    out
 }
 
 /// Whether an operation got far enough to leave anything for a sweep to find.
@@ -429,6 +465,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_reason_a_failure_had_is_recoverable_from_the_log() {
+        // Only the outermost message crosses D-Bus, so unless this is logged, why systemd
+        // or rclone refused exists nowhere a person can read it.
+        let io = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let e = SupervisorError::Supervision {
+            context: "starting unit".into(),
+            source: Some(Box::new(io)),
+        };
+
+        assert!(
+            !e.to_string().contains("access denied"),
+            "if Display carried the cause there would be nothing here to recover"
+        );
+        assert!(causes(&e).contains("access denied"));
+        assert_eq!(
+            causes(&SupervisorError::UnknownMount("photos".into())),
+            "",
+            "an error with no cause must not log an empty field as though it had one"
+        );
+    }
+
     #[tokio::test]
     async fn a_call_that_did_nothing_does_not_buy_a_sweep() {
         // A sweep lists units, reads /proc and shells out to journalctl. Any peer on the
@@ -457,7 +515,8 @@ mod tests {
             ..Default::default()
         });
         let nudge = Arc::new(Nudge::default());
-        let (_s2, c2, _r2) = connected_with(acted, Vec::new(), nudge.clone()).await;
+        let (_s2, c2, _r2) =
+            connected_with(acted, vec![a_mount("photos", "unmounted")], nudge.clone()).await;
 
         assert!(proxy(&c2).await.mount("photos").await.is_err());
         assert!(!nudge.nothing_pending());

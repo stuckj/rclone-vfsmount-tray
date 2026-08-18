@@ -80,8 +80,8 @@ pub enum IpcError {
 
 impl From<SupervisorError> for IpcError {
     fn from(e: SupervisorError) -> Self {
-        // Rendered here rather than passed through, because `SupervisorError`'s `source`
-        // chain does not fit in a D-Bus error and the service logs it in full anyway.
+        // A D-Bus error body is one string, so the `source` chain cannot cross. It is the
+        // service's job to log what it drops here.
         let text = e.to_string();
         match e {
             SupervisorError::UnknownMount(_) => IpcError::UnknownMount(text),
@@ -363,9 +363,13 @@ pub trait RcloneVfsmountTray {
 
     /// The best tier any mount has resolved, or `"unknown"` before one has.
     ///
-    /// A property of this rclone, not of a reading: what a given mount can actually say
-    /// is its own `TransferView`'s `Fidelity`, which is lower whenever its cache mode
-    /// hides writes.
+    /// A property of this rclone, not of a reading, and **nothing may be rendered on the
+    /// strength of it**: what a given mount can say is its own `TransferView`'s
+    /// `Fidelity`, which is lower whenever its cache mode hides writes. In particular a
+    /// `"T1"` here does not mean per-file progress is available — no reading is ever `T1`,
+    /// because `core/stats` lags the queue and cannot be trusted for a total (#9, #45).
+    /// Every supported rclone registers `core/stats`, so in practice this says little
+    /// beyond "one mount has answered".
     #[zbus(property)]
     fn capability_tier(&self) -> Result<String, IpcError>;
 }

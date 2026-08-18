@@ -130,19 +130,34 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(tokio::sync::Mutex::new(registry::Registry::default()));
     let nudge = Arc::new(watch::Nudge::default());
 
-    // The name goes up before the first sweep, so a client that starts alongside this one
-    // connects and waits for signals rather than concluding the service is absent.
-    let conn = dbus::serve(dbus::MountManager::new(
+    let mut watcher = watch::Watcher::new(
         sup.clone(),
         registry.clone(),
+        config,
+        runtime_dir,
         nudge.clone(),
+    );
+
+    // Swept before the name goes up, and the changes dropped because nobody can be
+    // listening yet. A client that connected first would find an empty list and no way to
+    // tell it from "no mounts configured" — and would be told a mount it can see in the
+    // config is a name this service has never heard of. A client that cannot connect at
+    // all has to cope with that anyway (#52), so it is the honest half-second to spend.
+    let (found, _) = watcher.tick().await;
+    for change in &found {
+        report(change);
+    }
+
+    let conn = dbus::serve(dbus::MountManager::new(
+        sup,
+        registry,
+        nudge,
         rclone.version().to_string(),
     ))
     .await?;
     tracing::info!(name = rvt_core::ipc::BUS_NAME, "serving");
 
     let emitter = zbus::object_server::SignalEmitter::new(&conn, rvt_core::ipc::OBJECT_PATH)?;
-    let watcher = watch::Watcher::new(sup, registry, config, runtime_dir, nudge);
 
     tokio::select! {
         _ = watcher.run(emitter, report) => {}

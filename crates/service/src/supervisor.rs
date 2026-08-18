@@ -1280,80 +1280,54 @@ pub(crate) fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
 /// What replaces an `extra_args` entry found in rclone's output.
 const REDACTED: &str = "<redacted>";
 
+/// rclone's own words for the line that opens its log with its whole command line.
+///
+/// Present in both of its log formats — plain and `--use-json-log` — and unescaped in
+/// both, which is what lets one rule cover them. Measured against rclone 1.75.0.
+const ARGV_ECHO: &str = "starting with parameters";
+
+/// What stands in for that line when the mount has arguments of its own.
+const ARGV_WITHHELD: &str = "[rclone's command line withheld: this mount sets extra_args]";
+
 /// Take a mount's own `extra_args` back out of rclone's log.
 ///
 /// This text becomes a mount's failure reason, which crosses D-Bus. `extra_args` reaches
-/// rclone as verbatim argv, so a credential flag put there is one rclone can echo: at
-/// debug level it opens with `starting with parameters [...]`. Measured against rclone
-/// 1.75.0, which does not log that line at its default level — so this bites only for a
-/// mount that asked for `-vv`.
+/// rclone as verbatim argv, so a credential flag put there is one rclone echoes at debug
+/// level, in the line [`ARGV_ECHO`] names. Measured against rclone 1.75.0, which does not
+/// log it at its default level — so this bites only for a mount that asked for `-vv`.
 ///
-/// **Only the quoted spelling is matched.** rclone renders every parameter with Go's
-/// `%q`, and Rust's `{:?}` produces the same, so that is the form the argv echo is in —
-/// including for a value holding a space or a quote, which appears escaped and as one span
-/// rather than as separate words. Matching the bare value instead would rewrite it
-/// wherever it happened to appear: an entry of `1` turns rclone's own `exit status 1` into
-/// `exit status <redacted>`, which reads as though a secret had been there.
+/// **The whole line goes, rather than the secret within it**, and only for a mount that
+/// has `extra_args` at all. Finding the value instead means knowing how rclone spelled it,
+/// and it spells the same argument three ways: bare, quoted by Go's `%q`, and quoted then
+/// escaped again under `--use-json-log`. A rule that has to recognise the spelling fails
+/// silently on the one it does not, which is the wrong direction to fail in. Dropping the
+/// line costs a mount's generated arguments — cache mode, socket path — which are useful
+/// and not secret, so a mount with no `extra_args` keeps them.
 ///
-/// So this closes the argv echo and nothing else. The text is rclone's, rclone can be told
-/// to log a great deal, and a value it prints unquoted somewhere is left alone. See
-/// DESIGN.md, "D-Bus, and only for sandboxed callers".
+/// The value is then also replaced wherever else it appears quoted, which costs nothing
+/// and catches an echo somewhere other than that line.
+///
+/// Not a guarantee that nothing sensitive crosses: the text is rclone's, and rclone can be
+/// told to log a great deal. See DESIGN.md, "D-Bus, and only for sandboxed callers".
 fn redact_extra_args(text: &str, extra_args: &[String]) -> String {
-    let mut out = text.to_string();
-    for arg in extra_args.iter().filter(|a| !a.is_empty()) {
-        out = out.replace(&format!("{arg:?}"), &format!("{REDACTED:?}"));
-    }
-    redact_past_generated_flags(&out)
-}
-
-/// The last flag [`Mount::mount_args`] generates, after which everything is the user's.
-const LAST_GENERATED_FLAG: &str = "\"--rc-no-auth\"";
-
-/// Redact every parameter rclone echoes *after* the flags this service generates.
-///
-/// [`Mount::mount_args`] appends `extra_args` immediately behind `--rc-no-auth`, so in
-/// that echo every span past it came from the user. Matching by position rather than by
-/// value is what covers a credential the config no longer holds: the running unit keeps
-/// the argv it was started with, and a mount survives both a config edit and a service
-/// restart, so by the time it fails the config may name a rotated token — or none.
-///
-/// Quoted spans only, and only after that flag, so nothing outside the echo is touched.
-fn redact_past_generated_flags(text: &str) -> String {
-    let Some(start) = text.find(LAST_GENERATED_FLAG) else {
+    let args: Vec<&String> = extra_args.iter().filter(|a| !a.is_empty()).collect();
+    if args.is_empty() {
         return text.to_string();
-    };
-    let (head, tail) = text.split_at(start + LAST_GENERATED_FLAG.len());
+    }
 
-    let mut out = String::with_capacity(text.len());
-    out.push_str(head);
-
-    let mut rest = tail.chars();
-    while let Some(c) = rest.next() {
-        match c {
-            // The list is closed, or the line is: past here is rclone's own prose.
-            ']' | '\n' => {
-                out.push(c);
-                out.push_str(rest.as_str());
-                return out;
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.contains(ARGV_ECHO) {
+            out.push(ARGV_WITHHELD.to_string());
+        } else {
+            let mut line = line.to_string();
+            for arg in &args {
+                line = line.replace(&format!("{arg:?}"), &format!("{REDACTED:?}"));
             }
-            '"' => {
-                // Consume the whole span, honouring the backslash escapes Go's `%q` emits,
-                // so a quote inside a value cannot end it early.
-                while let Some(c) = rest.next() {
-                    match c {
-                        '\\' => {
-                            rest.next();
-                        }
-                        '"' => break,
-                        _ => {}
-                    }
-                }
-                out.push_str(&format!("{REDACTED:?}"));
-            }
-            _ => out.push(c),
+            out.push(line);
         }
     }
-    out
+    out.join("\n")
 }
 
 /// Clear what a hard-killed rclone leaves behind, so a start can succeed.
@@ -3419,14 +3393,28 @@ mod tests {
         )
     }
 
-    /// rclone 1.75.0's opening line at `-vv`, which is where a secret in `extra_args`
-    /// comes back out. Captured from a real run; it is absent at the default level.
-    const ARGV_ECHO: &str = concat!(
+    /// A real `journalctl` tail for a failed mount, captured from rclone 1.75.0 started
+    /// with the argv `Mount::mount_args` composes plus an `extra_args` carrying a secret.
+    /// The whole command line is in it, which is the point.
+    const REAL_ECHO: &str = concat!(
         "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
-        "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" \"-vv\" ",
-        "\"--drive-token\" \"SECRET-TOKEN-abc123\"]\n",
-        "CRITICAL: Failed to create file system for \"backup:pictures\": ",
-        "didn't find section in config file"
+        "[\"/home/claude/.local/bin/rclone\" \"mount\" \"localfs:/src\" \"/mnt/photos\" ",
+        "\"--vfs-cache-mode\" \"writes\" \"--rc\" \"--rc-addr\" ",
+        "\"unix:///run/user/1001/rclone-vfsmount-tray/photos.sock\" \"--rc-no-auth\" ",
+        "\"-vv\" \"--drive-token\" \"SECRET-TOKEN-abc123\"]\n",
+        "ERROR+4: Fatal error: failed to mount FUSE fs: fusermount: exit status 1"
+    );
+
+    /// The same run under `--use-json-log`, where rclone escapes every quote a second
+    /// time. Also captured, because a rule that reads the plain spelling silently does
+    /// nothing here.
+    const REAL_ECHO_JSON: &str = concat!(
+        r#"{"time":"2026-08-18T20:09:50Z","level":"debug","msg":"Version \"v1.75.0\" "#,
+        r#"starting with parameters [\"/home/claude/.local/bin/rclone\" \"mount\" "#,
+        r#"\"localfs:/src\" \"/mnt/photos\" \"--rc-no-auth\" \"-vv\" "#,
+        r#"\"--use-json-log\" \"--drive-token\" \"SECRET-TOKEN-abc123\"]","source":"x"}"#,
+        "\n",
+        r#"{"level":"error","msg":"Fatal error: failed to mount FUSE fs"}"#
     );
 
     #[tokio::test]
@@ -3437,7 +3425,7 @@ mod tests {
         let sup = with_extra_args(
             "reason-redacts",
             &["-vv", "--drive-token", "SECRET-TOKEN-abc123"],
-            ARGV_ECHO,
+            REAL_ECHO,
         );
 
         let reason = sup.failure_reason("rvt-mount-backup.service").await;
@@ -3446,47 +3434,33 @@ mod tests {
             "a credential from extra_args reached the wire: {reason}"
         );
         assert!(
-            reason.contains("didn't find section in config file"),
+            reason.contains("exit status 1"),
             "the reason still has to say what went wrong: {reason}"
         );
     }
 
     #[tokio::test]
-    async fn redacting_leaves_rclones_own_words_alone() {
-        // `1` is an ordinary word as well as an argument. Matching the bare value would
-        // turn rclone's own "exit status 1" into "exit status <redacted>", which reads to
-        // a user as though a secret had been standing there.
-        let journal = concat!(
-            "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
-            "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" \"-vv\" ",
-            "\"--transfers\" \"1\" \"--drive-token\" \"SECRET-TOKEN-abc123\"]\n",
-            "ERROR+4: Fatal error: failed to mount FUSE fs: fusermount: exit status 1"
-        );
+    async fn the_json_log_spelling_is_covered_too() {
+        // Under `--use-json-log` every quote is escaped again, so nothing matches the
+        // spelling the plain format uses. A rule keyed on that spelling does nothing here
+        // and says nothing about it, which is the wrong way round to fail.
         let sup = with_extra_args(
-            "reason-ordinary-words",
+            "reason-json-log",
             &[
                 "-vv",
-                "--transfers",
-                "1",
+                "--use-json-log",
                 "--drive-token",
                 "SECRET-TOKEN-abc123",
             ],
-            journal,
+            REAL_ECHO_JSON,
         );
 
         let reason = sup.failure_reason("rvt-mount-backup.service").await;
         assert!(
             !reason.contains("SECRET-TOKEN-abc123"),
-            "the secret still has to go: {reason}"
+            "the json spelling let a credential through: {reason}"
         );
-        assert!(
-            reason.contains("exit status 1"),
-            "rclone's own words were rewritten: {reason}"
-        );
-        assert!(
-            reason.contains("v1.75.0"),
-            "the version is not a secret: {reason}"
-        );
+        assert!(reason.contains("Fatal error"), "{reason}");
     }
 
     #[tokio::test]
@@ -3497,41 +3471,48 @@ mod tests {
         let sup = with_extra_args(
             "reason-rotated",
             &["-vv", "--drive-token", "SECRET-THE-NEW-ONE"],
-            concat!(
-                "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
-                "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" ",
-                "\"--rc-no-auth\" \"-vv\" \"--drive-token\" \"SECRET-THE-OLD-ONE\"]\n",
-                "CRITICAL: Failed to create file system for \"backup:pictures\""
-            ),
+            REAL_ECHO,
         );
 
         let reason = sup.failure_reason("rvt-mount-backup.service").await;
         assert!(
-            !reason.contains("SECRET-THE-OLD-ONE"),
+            !reason.contains("SECRET-TOKEN-abc123"),
             "a credential the config has since dropped still reached the bus: {reason}"
-        );
-        assert!(
-            reason.contains("Failed to create file system for \"backup:pictures\""),
-            "rclone's own words are outside the parameter list and stay: {reason}"
         );
     }
 
-    #[test]
-    fn extra_args_really_do_follow_the_flag_the_redaction_keys_on() {
-        // `redact_past_generated_flags` treats everything after `--rc-no-auth` in the echo
-        // as the user's. That is only true while `mount_args` keeps appending them there.
-        let mut m = a_mount("backup", PathBuf::from("/mnt/backup"));
-        m.extra_args = vec!["--drive-token".into(), "s3cret".into()];
-        let argv = m.mount_args(Path::new("/run/user/1000/rvt/backup.sock"));
+    #[tokio::test]
+    async fn a_mount_with_no_arguments_of_its_own_keeps_rclones_command_line() {
+        // Nothing in the argv this service composes is a secret, and it is worth reading
+        // when a mount will not start.
+        let sup = with_extra_args("reason-no-extra-args", &[], REAL_ECHO);
 
-        let last_generated = argv
-            .iter()
-            .position(|a| a == "--rc-no-auth")
-            .expect("the redaction keys on this flag being generated");
-        assert_eq!(
-            &argv[last_generated + 1..],
-            &["--drive-token".to_string(), "s3cret".to_string()],
-            "extra_args no longer come last, so the redaction's boundary is wrong"
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(reason.contains("--vfs-cache-mode"), "{reason}");
+        assert!(reason.contains("exit status 1"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn redacting_leaves_rclones_own_words_alone() {
+        // `1` is an ordinary word as well as an argument, and rclone's own "exit status 1"
+        // must not come out as "exit status <redacted>" — which reads to a user as though
+        // a secret had been standing there.
+        let sup = with_extra_args(
+            "reason-ordinary-words",
+            &[
+                "-vv",
+                "--transfers",
+                "1",
+                "--drive-token",
+                "SECRET-TOKEN-abc123",
+            ],
+            REAL_ECHO,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            reason.contains("exit status 1"),
+            "rclone's own words were rewritten: {reason}"
         );
     }
 
@@ -3539,64 +3520,6 @@ mod tests {
     fn redaction_leaves_a_mount_with_no_extra_args_untouched() {
         let text = "CRITICAL: Failed to create file system";
         assert_eq!(redact_extra_args(text, &[]), text);
-    }
-
-    /// Captured from rclone 1.75.0 run with `--header 'Authorization: Bearer ...'`. The
-    /// value holds spaces, so rclone's `%q` renders it as one quoted span — there is no
-    /// whitespace-delimited token equal to it anywhere in this line.
-    const ARGV_ECHO_WITH_SPACES: &str = concat!(
-        "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
-        "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" \"-vv\" ",
-        "\"--header\" \"Authorization: Bearer SECRET-TOKEN-xyz\"]\n",
-        "CRITICAL: Failed to create file system for \"backup:pictures\""
-    );
-
-    /// The same, for a value holding quotes — the shape of a service-account credential.
-    /// rclone backslashes them, so the logged spelling is not the configured one.
-    const ARGV_ECHO_WITH_QUOTES: &str = concat!(
-        "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
-        "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" \"-vv\" ",
-        "\"--drive-service-account-credentials\" ",
-        "\"{\\\"private_key\\\":\\\"abc def\\\"}\"]\n",
-        "CRITICAL: Failed to create file system for \"backup:pictures\""
-    );
-
-    #[tokio::test]
-    async fn a_secret_holding_spaces_is_taken_out_too() {
-        let sup = with_extra_args(
-            "reason-spaces",
-            &["-vv", "--header", "Authorization: Bearer SECRET-TOKEN-xyz"],
-            ARGV_ECHO_WITH_SPACES,
-        );
-
-        let reason = sup.failure_reason("rvt-mount-backup.service").await;
-        assert!(
-            !reason.contains("SECRET-TOKEN-xyz"),
-            "a value with a space is one quoted span, not a token: {reason}"
-        );
-        assert!(reason.contains("Failed to create file system"), "{reason}");
-    }
-
-    #[tokio::test]
-    async fn a_secret_holding_quotes_is_taken_out_in_the_spelling_rclone_logs() {
-        // rclone escapes the quotes, so the logged form differs from the configured one.
-        // Matching has to be done in rclone's spelling, not the config's.
-        let sup = with_extra_args(
-            "reason-quotes",
-            &[
-                "-vv",
-                "--drive-service-account-credentials",
-                r#"{"private_key":"abc def"}"#,
-            ],
-            ARGV_ECHO_WITH_QUOTES,
-        );
-
-        let reason = sup.failure_reason("rvt-mount-backup.service").await;
-        assert!(
-            !reason.contains("private_key") && !reason.contains("abc def"),
-            "a value rclone backslashed is still the value: {reason}"
-        );
-        assert!(reason.contains("Failed to create file system"), "{reason}");
     }
 
     #[tokio::test]

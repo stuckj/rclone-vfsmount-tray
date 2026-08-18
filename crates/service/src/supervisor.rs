@@ -366,10 +366,9 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             let (Some(serving), Some(name)) = (u.serving.as_ref(), orphan_name(&u.name)) else {
                 continue;
             };
-            // Named by the config and serving exactly where it says. Compared as written:
-            // both spellings come from the same `mount_point` field, so an unedited entry
-            // matches byte for byte and the healthy path canonicalises nothing. A
-            // respelling falls through to `configured_unit_holds`, which lets it go.
+            // Compared as written: both spellings come from the same `mount_point` field,
+            // so an unedited entry matches byte for byte and the healthy path canonicalises
+            // nothing. A respelling falls through to `configured_unit_holds`.
             if ours.get(&u.name) == Some(&serving.mount_point.as_path()) {
                 continue;
             }
@@ -418,7 +417,6 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     ) -> bool {
         for (_, unit) in configured.iter().filter(|(p, _)| p == point) {
             match serving_argv.get(unit.as_str()) {
-                // Not serving, so it holds nothing.
                 None => continue,
                 Some(None) => return true,
                 Some(Some(argv)) => {
@@ -2562,8 +2560,7 @@ mod tests {
         (scratch, sup, held)
     }
 
-    /// Half of #90: the entry's own unit `Active` and its configured path empty read as
-    /// coming up, and nothing was coming.
+    /// Half of #90: the entry's own unit is `Active` and its configured path is empty.
     #[tokio::test]
     async fn a_moved_mount_point_does_not_report_itself_mounting_forever() {
         let (_sc, s, held) = moved("moved-state");
@@ -2578,8 +2575,7 @@ mod tests {
         }
     }
 
-    /// The other half: the path the unit still holds was nobody's, so it listed as
-    /// somebody else's. Both halves are one row, because both are one mount.
+    /// The other half, and one mount, so one row: the path the unit still holds.
     #[tokio::test]
     async fn a_moved_mount_point_is_listed_once_and_as_ours() {
         let (_sc, s, _) = moved("moved-list");
@@ -2625,8 +2621,7 @@ mod tests {
         );
     }
 
-    /// A unit is still "serving" to the sweep right through `Deactivating`, so without care
-    /// the advice to unmount it survives the whole teardown.
+    /// A unit is still "serving" to the sweep right through `Deactivating`.
     #[tokio::test]
     async fn a_moved_mount_being_torn_down_reports_as_unmounting() {
         let (_sc, s, _) = moved("moved-stopping");
@@ -2727,8 +2722,7 @@ mod tests {
     }
 
     /// Two entries whose mount points were exchanged, each unit serving the path the
-    /// *other* entry now names. Asking only whether a configured unit is running has both
-    /// vouching for a point neither holds.
+    /// *other* entry now names, so neither holds the point its entry claims.
     #[tokio::test]
     async fn mounts_that_swapped_their_points_do_not_vouch_for_each_other() {
         let scratch = Scratch::new("swapped");

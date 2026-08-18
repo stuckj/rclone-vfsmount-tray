@@ -1199,10 +1199,6 @@ mod tests {
     /// 1.75.0 — the floor of the supported range, a point inside it, and the newest — as
     /// `rclone mount --vfs-cache-max-size=<value>`, counting a value refused when rclone's
     /// own error names the flag. All three agree on every row (#93).
-    ///
-    /// Only the accept list has to hold exactly: a value refused here stops the service.
-    /// Missing one rclone refuses costs rclone's error instead of ours, and
-    /// `what_the_cache_limit_checks_deliberately_do_not_catch` holds those.
     #[test]
     fn a_size_matches_rclone_on_every_spelling_measured() {
         for good in [
@@ -1294,8 +1290,7 @@ mod tests {
     #[test]
     fn validate_rejects_a_cache_limit_rclone_would_refuse() {
         // The value the example config's `10G` invites, and the age spelling that looks
-        // like the size one. Both reach rclone verbatim, so validate is the only thing
-        // between them and a unit that never starts.
+        // like the size one.
         let mut size = with(vec![mount("a", "/mnt/one")]);
         size.mounts[0].cache_max_size = Some("10GB".into());
         let msg = size.validate().unwrap_err().to_string();

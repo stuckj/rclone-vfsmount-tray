@@ -361,9 +361,11 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   configuration at all: a client is told a mount's name, state, point and `remote:path`, and
   the choice between redacting and gating falls due when editing lands. **Gating the field
   is not enough on its own**, because rclone echoes its own argv when asked to log at debug
-  level, and a failed mount's reason is rclone's output — so a mount's `extra_args` are
-  taken back out of that text before it crosses. Which is the narrower claim: the reason is
-  rclone's, and rclone can be told to log a great deal that this does not know to remove.
+  level, and a failed mount's reason is rclone's output — so the line it echoes on does not
+  cross at all. Removing the *value* instead was tried and abandoned: rclone spells one
+  argument three ways, and a rule that has to recognise the spelling fails silently on the
+  one it does not. Which is the narrower claim either way: the reason is rclone's, and
+  rclone can be told to log a great deal that this does not know to remove.
 - **Safety checks live service-side**, so a client cannot skip one by leaving a parameter out.
   A forced unmount is destructive, and `force` is explicit and defaults to off — a guard
   against accident and bugs, not against malice.
@@ -371,9 +373,9 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   settled as: accept the risk, no polkit** (#40). Not because there is nothing to authorise —
   a sandboxed app that cannot reach the mount point can still ask this service to unmount it,
   which is a confused deputy and exactly polkit's shape. It is that polkit cannot tell that
-  caller from the tray: it identifies a subject by uid and pid, both of which a sandboxed app
-  shares with every other process of this user, so the prompt would land on every forced
-  unmount including the ordinary ones and be trained away within a week. It also costs a
+  caller from the tray: a policy decides on the action and the user, and a sandboxed app is
+  the same user, so every process of theirs gets the same answer. The prompt would land on
+  every forced unmount including the ordinary ones and be trained away within a week. It also costs a
   system-wide policy file, which a per-user install cannot place, so the applet would behave
   differently by install path. What remains is an explicit `force` defaulting to off, and a
   logged line naming the caller's connection. If this is revisited, the mechanism that would

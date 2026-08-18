@@ -134,6 +134,18 @@ pub fn nothing_to_say(mount: &MountView) -> TransferView {
     ))
 }
 
+/// An empty reading for a configured mount no sweep has reached yet.
+///
+/// Only [`Registry`] knows what is serving, and until the first sweep succeeds it knows
+/// nothing — which is not the same as a mount that is down, and must not be answered as
+/// though the figures were merely zero.
+pub fn not_swept_yet(name: &str) -> TransferView {
+    TransferView::from(&TransferState::unmonitored(
+        name,
+        "no sweep has reported on this mount yet",
+    ))
+}
+
 /// Why a mount has no reading, in words a client can show.
 ///
 /// Every one of these is an ordinary state rather than a failure, which is why it is a

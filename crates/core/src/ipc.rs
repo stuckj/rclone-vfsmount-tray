@@ -407,6 +407,82 @@ mod tests {
         assert_eq!(round_trip(&a_mount_view()), a_mount_view());
     }
 
+    /// The keys a value actually serialises to, read back without this module's help.
+    ///
+    /// A round trip through the same codec on both sides proves nothing about the names:
+    /// rename a field and the test renames with it. This decodes into a plain map so the
+    /// spellings have to be written down somewhere they cannot follow a refactor.
+    fn keys_on_the_wire<T: serde::Serialize + Type>(v: &T) -> Vec<String> {
+        let ctx = Context::new_dbus(Endian::native(), 0);
+        let bytes = zbus::zvariant::to_bytes(ctx, v).expect("serialize");
+        let (dict, _) = bytes
+            .deserialize::<HashMap<String, zbus::zvariant::OwnedValue>>()
+            .expect("deserialize");
+        let mut keys: Vec<String> = dict.into_keys().collect();
+        keys.sort();
+        keys
+    }
+
+    #[test]
+    fn the_keys_on_the_wire_are_the_ones_clients_were_built_against() {
+        // These strings are the wire, exactly as `state_name`'s vocabulary is. A field
+        // renamed in Rust renames a published key, and the failure is silent: an older
+        // client finds the key absent, reads it as "this tier cannot say", and shows
+        // nothing outstanding for the life of the connection.
+        //
+        // A key *added* fails this too, which is the point — that is an additive revision
+        // and `INTERFACE_VERSION` has to move with it.
+        // Every optional field filled, since an absent one is legitimately no key at all.
+        let complete = MountView {
+            reason: Some("rclone exited".into()),
+            ..a_mount_view()
+        };
+        assert_eq!(
+            keys_on_the_wire(&complete),
+            [
+                "Live",
+                "Managed",
+                "MountPoint",
+                "Name",
+                "Reason",
+                "Remote",
+                "State"
+            ]
+        );
+
+        let mut outstanding = a_transfer_state();
+        outstanding.degraded_reason = Some("rclone unreachable".into());
+        assert_eq!(
+            keys_on_the_wire(&TransferView::from(&outstanding)),
+            [
+                "DegradedReason",
+                "ErroredFiles",
+                "Fidelity",
+                "Files",
+                "HasProgress",
+                "Mount",
+                "OutOfSpace",
+                "OutstandingKnown",
+                "PendingFiles",
+                "PendingKnownBytes",
+                "PendingUnknownSizeFiles",
+                "RateBytesPerSec",
+                "Uploading",
+            ]
+        );
+
+        assert_eq!(
+            keys_on_the_wire(&TransferFileView {
+                name: "holiday.mp4".into(),
+                size: Some(1),
+                in_flight: Some(true),
+                tries: Some(1),
+                bytes_sent: Some(1),
+            }),
+            ["BytesSent", "InFlight", "Name", "Size", "Tries"]
+        );
+    }
+
     #[test]
     fn a_key_this_build_does_not_know_is_ignored() {
         // The whole reason the payloads are dictionaries: a client must keep working

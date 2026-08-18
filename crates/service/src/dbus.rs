@@ -112,16 +112,21 @@ impl MountManager {
     }
 
     async fn get_transfer_state(&self, name: &str) -> Result<TransferView, IpcError> {
+        // Through the same gate as `Mount` and `Unmount`: a name those two accept and this
+        // one calls unknown is a client dropping a row for a mount it can still act on.
+        self.must_know(name).await?;
+
         let registry = self.registry.lock().await;
         if let Some(view) = registry.transfer(name) {
             return Ok(view.clone());
         }
-        let mount = registry
-            .mount(name)
-            .ok_or_else(|| IpcError::UnknownMount(format!("no mount named {name:?}")))?;
         // The same empty answer the registry publishes when it drops a reading, so a
-        // client that asks and a client that listens cannot be told different things.
-        Ok(registry::nothing_to_say(mount))
+        // client that asks and a client that listens cannot be told different things. A
+        // mount the registry has not seen yet is described from the config instead.
+        Ok(match registry.mount(name) {
+            Some(mount) => registry::nothing_to_say(mount),
+            None => registry::not_swept_yet(name),
+        })
     }
 
     /// A mount's state changed, or a row appeared.
@@ -333,23 +338,35 @@ mod tests {
         connected_with(sup, mounts, Arc::new(Nudge::default())).await
     }
 
+    async fn connected_with_config(
+        sup: Arc<dyn MountSupervisor>,
+        mounts: Vec<MountView>,
+        config: Arc<Config>,
+    ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
+        connected_inner(sup, mounts, Arc::new(Nudge::default()), config).await
+    }
+
     async fn connected_with(
         sup: Arc<dyn MountSupervisor>,
         mounts: Vec<MountView>,
         nudge: Arc<Nudge>,
+    ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
+        connected_inner(sup, mounts, nudge, Arc::new(Config::default())).await
+    }
+
+    async fn connected_inner(
+        sup: Arc<dyn MountSupervisor>,
+        mounts: Vec<MountView>,
+        nudge: Arc<Nudge>,
+        config: Arc<Config>,
     ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
         let registry = Arc::new(Mutex::new(Registry::default()));
         registry.lock().await.observe_mounts(mounts);
 
         let (server_sock, client_sock) = tokio::net::UnixStream::pair().unwrap();
         let guid = zbus::Guid::generate();
-        let manager = MountManager::new(
-            sup,
-            registry.clone(),
-            Arc::new(Config::default()),
-            nudge,
-            "v1.75.0".to_string(),
-        );
+        let manager =
+            MountManager::new(sup, registry.clone(), config, nudge, "v1.75.0".to_string());
 
         let server = zbus::connection::Builder::socket(server_sock)
             .server(guid)
@@ -530,6 +547,38 @@ mod tests {
             .await
             .expect("a configured mount is not an unknown one");
         assert!(manager.must_know("nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_three_methods_agree_about_which_names_exist() {
+        // A name Mount accepts and GetTransferState calls unknown is a client dropping a
+        // row for a mount it can still act on. The registry is empty here, standing in for
+        // a first sweep that has not run or did not succeed.
+        let config: rvt_core::Config = toml::from_str(
+            "version = 1\n[[mount]]\nname = \"photos\"\nremote = \"drive\"\nmount_point = \"/mnt/photos\"\n",
+        )
+        .expect("fixture config");
+
+        let (_server, client, _reg) = connected_with_config(
+            Arc::new(FakeSupervisor::default()),
+            Vec::new(),
+            Arc::new(config),
+        )
+        .await;
+        let p = proxy(&client).await;
+
+        p.mount("photos").await.expect("a configured mount");
+        let view = p
+            .get_transfer_state("photos")
+            .await
+            .expect("the same name, so the same verdict");
+        assert!(
+            !view.outstanding_known,
+            "nothing has been read, and an exact zero would read as safe to unmount"
+        );
+        assert!(view.degraded_reason.is_some());
+
+        assert!(p.get_transfer_state("nope").await.is_err());
     }
 
     #[tokio::test]

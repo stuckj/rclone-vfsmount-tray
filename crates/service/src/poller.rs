@@ -11,6 +11,12 @@ use rvt_core::transfer::{RateEstimator, TransferState};
 use std::fmt::Write as _;
 use std::time::Duration;
 
+/// How long the on-disk fallback may take before it is reported as unreadable.
+///
+/// Generous, because it walks a metadata tree: this is not a latency budget but a bound on
+/// the one await in the poll path that could otherwise never finish.
+const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
+
 use rvt_core::config::Poll;
 
 /// What `vfs/stats` was able to say about this mount's write-back cache.
@@ -307,10 +313,29 @@ impl MountPoller {
             return TransferState::unmonitored(&self.name, e.to_string());
         };
 
-        let scanned = tokio::task::spawn_blocking(move || {
-            rvt_core::scan::scan(std::path::Path::new(&meta), std::path::Path::new(&data))
-        })
+        // Bounded, and the bound is not about a slow disk. `spawn_blocking` cannot be
+        // cancelled once it has started, so a probe wedged on a dead FUSE mount holds its
+        // thread for good (#103); enough of those and this scan never gets one. Waiting
+        // for it stops the watcher, which stops every sweep and every signal — and leaves
+        // the last reading standing as though it were current. Giving up says "cannot
+        // tell", which is the honest answer and one the caller already handles.
+        let scanned = tokio::time::timeout(
+            SCAN_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                rvt_core::scan::scan(std::path::Path::new(&meta), std::path::Path::new(&data))
+            }),
+        )
         .await;
+
+        let scanned = match scanned {
+            Ok(joined) => joined,
+            Err(_) => {
+                return TransferState::unmonitored(
+                    &self.name,
+                    format!("{e}; and the cache on disk could not be read within {SCAN_TIMEOUT:?}"),
+                )
+            }
+        };
 
         match scanned {
             // The tree `vfs/stats` told us about is gone. A cache directory disappearing

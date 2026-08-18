@@ -57,10 +57,20 @@ impl MountManager {
     /// otherwise leave it empty, and every configured mount would answer "no such mount"
     /// until the next sweep.
     async fn must_know(&self, name: &str) -> Result<(), IpcError> {
-        if self.config.mount(name).is_none() && self.registry.lock().await.mount(name).is_none() {
-            return Err(IpcError::UnknownMount(format!("no mount named {name:?}")));
+        if self.config.mount(name).is_some() {
+            return Ok(());
         }
-        Ok(())
+        match self.registry.lock().await.mount(name) {
+            None => Err(IpcError::UnknownMount(format!("no mount named {name:?}"))),
+            // Listed, so a client has the name, but somebody else started it. The
+            // supervisor reaches the same verdict — after sweeping systemd for an orphan
+            // by that name, which no foreign row can be, since a name with a `/` in it is
+            // one `Config::validate` refuses and `Mount::unit_name` could not produce.
+            Some(mount) if !mount.managed => Err(IpcError::NotManaged(format!(
+                "{name:?} was started outside this service"
+            ))),
+            Some(_) => Ok(()),
+        }
     }
 }
 
@@ -519,7 +529,7 @@ mod tests {
         assert_eq!(
             causes(&SupervisorError::UnknownMount("photos".into())),
             "",
-            "an error with no cause must not log an empty field as though it had one"
+            "an error with no cause has nothing to add to the message"
         );
     }
 
@@ -588,23 +598,24 @@ mod tests {
         // session bus can call `Mount`, so a refusal must not be a way to spend its CPU —
         // and the init system's — in a loop.
         //
-        // The name has to be one the registry holds, or `must_know` refuses it first and
-        // the supervisor is never reached. A foreign row is the real shape of that: it is
-        // listed, so a client has the name, and `Mount` on it refuses because no config
-        // entry says how to start it.
+        // The name has to be one that gets past `must_know`, or the supervisor is never
+        // reached and this proves nothing. An orphan is that case: it is listed and it is
+        // ours, so the gate admits it, and the supervisor refuses it — either because
+        // nothing describes how to start it, or because the sweep that listed it is out of
+        // date and the unit is already gone.
         let sup = Arc::new(FakeSupervisor {
-            refuse_mount: Some(SupervisorError::UnknownMount("/mnt/theirs".into())),
+            refuse_mount: Some(SupervisorError::UnknownMount("stale".into())),
             ..Default::default()
         });
         let nudge = Arc::new(Nudge::default());
         let (_server, client, _reg) = connected_with(
             sup.clone(),
-            vec![a_mount("/mnt/theirs", "foreign")],
+            vec![a_mount("stale", "orphaned")],
             nudge.clone(),
         )
         .await;
 
-        assert!(proxy(&client).await.mount("/mnt/theirs").await.is_err());
+        assert!(proxy(&client).await.mount("stale").await.is_err());
         assert!(
             !sup.calls.lock().unwrap().is_empty(),
             "the supervisor was never asked, so nothing here exercised the refusal"
@@ -629,6 +640,32 @@ mod tests {
 
         assert!(proxy(&c2).await.mount("photos").await.is_err());
         assert!(!nudge.nothing_pending());
+    }
+
+    #[tokio::test]
+    async fn a_foreign_mount_is_refused_as_not_ours_rather_than_as_absent() {
+        // `ListMounts` publishes foreign rows, so a client has the name and will sometimes
+        // try it. "No such mount" would tell it to drop a row it can see in its own list;
+        // "not ours" tells it the row is real and the action is not available on it. It is
+        // also refused here rather than by the supervisor, which would sweep systemd for an
+        // orphan under a name no orphan can have.
+        let sup = Arc::new(FakeSupervisor::default());
+        let (_server, client, _reg) =
+            connected(sup.clone(), vec![a_mount("/mnt/theirs", "foreign")]).await;
+        let p = proxy(&client).await;
+
+        match p.mount("/mnt/theirs").await {
+            Err(IpcError::NotManaged(_)) => {}
+            other => panic!("expected NotManaged, got {other:?}"),
+        }
+        match p.unmount("/mnt/theirs", true).await {
+            Err(IpcError::NotManaged(_)) => {}
+            other => panic!("expected NotManaged, got {other:?}"),
+        }
+        assert!(
+            sup.calls.lock().unwrap().is_empty(),
+            "the supervisor was asked, which is the systemd sweep this avoids"
+        );
     }
 
     #[tokio::test]

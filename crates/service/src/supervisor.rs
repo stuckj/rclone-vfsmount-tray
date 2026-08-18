@@ -1303,6 +1303,56 @@ fn redact_extra_args(text: &str, extra_args: &[String]) -> String {
     for arg in extra_args.iter().filter(|a| !a.is_empty()) {
         out = out.replace(&format!("{arg:?}"), &format!("{REDACTED:?}"));
     }
+    redact_past_generated_flags(&out)
+}
+
+/// The last flag [`Mount::mount_args`] generates, after which everything is the user's.
+const LAST_GENERATED_FLAG: &str = "\"--rc-no-auth\"";
+
+/// Redact every parameter rclone echoes *after* the flags this service generates.
+///
+/// [`Mount::mount_args`] appends `extra_args` immediately behind `--rc-no-auth`, so in
+/// that echo every span past it came from the user. Matching by position rather than by
+/// value is what covers a credential the config no longer holds: the running unit keeps
+/// the argv it was started with, and a mount survives both a config edit and a service
+/// restart, so by the time it fails the config may name a rotated token — or none.
+///
+/// Quoted spans only, and only after that flag, so nothing outside the echo is touched.
+fn redact_past_generated_flags(text: &str) -> String {
+    let Some(start) = text.find(LAST_GENERATED_FLAG) else {
+        return text.to_string();
+    };
+    let (head, tail) = text.split_at(start + LAST_GENERATED_FLAG.len());
+
+    let mut out = String::with_capacity(text.len());
+    out.push_str(head);
+
+    let mut rest = tail.chars();
+    while let Some(c) = rest.next() {
+        match c {
+            // The list is closed, or the line is: past here is rclone's own prose.
+            ']' | '\n' => {
+                out.push(c);
+                out.push_str(rest.as_str());
+                return out;
+            }
+            '"' => {
+                // Consume the whole span, honouring the backslash escapes Go's `%q` emits,
+                // so a quote inside a value cannot end it early.
+                while let Some(c) = rest.next() {
+                    match c {
+                        '\\' => {
+                            rest.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+                out.push_str(&format!("{REDACTED:?}"));
+            }
+            _ => out.push(c),
+        }
+    }
     out
 }
 
@@ -3436,6 +3486,52 @@ mod tests {
         assert!(
             reason.contains("v1.75.0"),
             "the version is not a secret: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secret_the_config_no_longer_names_is_still_taken_out() {
+        // The running unit keeps the argv it was started with, and a mount survives both a
+        // config edit and a service restart. So by the time it fails, the config may name
+        // a rotated token — or none at all — while the journal still holds the old one.
+        let sup = with_extra_args(
+            "reason-rotated",
+            &["-vv", "--drive-token", "SECRET-THE-NEW-ONE"],
+            concat!(
+                "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
+                "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\" ",
+                "\"--rc-no-auth\" \"-vv\" \"--drive-token\" \"SECRET-THE-OLD-ONE\"]\n",
+                "CRITICAL: Failed to create file system for \"backup:pictures\""
+            ),
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-THE-OLD-ONE"),
+            "a credential the config has since dropped still reached the bus: {reason}"
+        );
+        assert!(
+            reason.contains("Failed to create file system for \"backup:pictures\""),
+            "rclone's own words are outside the parameter list and stay: {reason}"
+        );
+    }
+
+    #[test]
+    fn extra_args_really_do_follow_the_flag_the_redaction_keys_on() {
+        // `redact_past_generated_flags` treats everything after `--rc-no-auth` in the echo
+        // as the user's. That is only true while `mount_args` keeps appending them there.
+        let mut m = a_mount("backup", PathBuf::from("/mnt/backup"));
+        m.extra_args = vec!["--drive-token".into(), "s3cret".into()];
+        let argv = m.mount_args(Path::new("/run/user/1000/rvt/backup.sock"));
+
+        let last_generated = argv
+            .iter()
+            .position(|a| a == "--rc-no-auth")
+            .expect("the redaction keys on this flag being generated");
+        assert_eq!(
+            &argv[last_generated + 1..],
+            &["--drive-token".to_string(), "s3cret".to_string()],
+            "extra_args no longer come last, so the redaction's boundary is wrong"
         );
     }
 

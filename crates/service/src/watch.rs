@@ -109,10 +109,7 @@ impl Watcher {
         let now = Instant::now();
         let mut changes = Vec::new();
 
-        for name in self.nudge.take_cycled() {
-            self.pollers.remove(&name);
-            self.due.remove(&name);
-        }
+        self.forget_cycled();
 
         if self.sweep_due <= now {
             changes.extend(self.sweep().await);
@@ -153,6 +150,17 @@ impl Watcher {
                 // An action of ours has landed; publish its result now.
                 _ = nudge.woken() => self.sweep_due = self.last_sweep + MIN_SWEEP_GAP,
             }
+        }
+    }
+
+    /// Throw away the pollers for mounts something has acted on.
+    ///
+    /// The poller, not just its deadline: it holds a capability probe and a rate estimate
+    /// belonging to the rclone that was serving the mount before.
+    fn forget_cycled(&mut self) {
+        for name in self.nudge.take_cycled() {
+            self.pollers.remove(&name);
+            self.due.remove(&name);
         }
     }
 
@@ -482,17 +490,26 @@ mod tests {
         w.tick().await;
         assert_eq!(w.pollers.len(), 1, "the mount is serving, so it is polled");
 
-        // Not due again for ten minutes. Without the nudge nothing would touch it, and the
-        // poller connected to the old rclone would still be there when it was.
+        // The poller itself, not merely its deadline: it holds the capability probe and
+        // the rate estimate of the rclone that was serving before. A tick would drop it
+        // and immediately build a new one, so the drop is checked on its own.
+        nudge.acted_on("photos");
+        w.forget_cycled();
+        assert!(
+            !w.pollers.contains_key("photos"),
+            "the poller survived, so it spans two rclone processes"
+        );
+
+        // And a tick re-probes rather than leaving the mount unpolled: not due again for
+        // ten minutes, yet asked anyway.
         let far_off = Instant::now() + Duration::from_secs(600);
         w.due.insert("photos".into(), far_off);
-
         nudge.acted_on("photos");
         w.tick().await;
 
         assert!(
             w.due["photos"] < far_off,
-            "the mount was not re-probed, so the poller spans two rclone processes"
+            "the mount was not re-probed after it cycled"
         );
     }
 

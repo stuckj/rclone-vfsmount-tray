@@ -320,8 +320,17 @@ pub trait RcloneVfsmountTray {
     /// Bring up a mount. Returns once it is serving, not once rclone has been spawned.
     fn mount(&self, name: &str) -> Result<(), IpcError>;
 
-    /// Tear one down. `force` severs whatever is still using the mount point, so it is
-    /// always the caller's explicit decision.
+    /// Tear one down.
+    ///
+    /// `force` means one thing and one thing only: **detach the mount point from whatever
+    /// still holds it**, severing a write in progress — so it is always the caller's
+    /// explicit decision, never inferred.
+    ///
+    /// It is *not* "unmount despite pending uploads". Those are unrelated decisions — one
+    /// costs the tail of a file, the other costs only delay, since the write-back cache is
+    /// on disk and resumes. Nothing weighs pending uploads yet ([`IpcError::PendingUploads`],
+    /// #19); when something does, the choice it offers needs its own way to be expressed
+    /// rather than borrowing this one.
     fn unmount(&self, name: &str, force: bool) -> Result<(), IpcError>;
 
     /// What one mount still has to upload, as of the last poll.

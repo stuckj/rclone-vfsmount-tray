@@ -207,13 +207,18 @@ pub trait MountSupervisor: Send + Sync {
     /// Reconcile against reality on startup — the service may have restarted while mounts
     /// stayed up.
     ///
-    /// Returns every configured mount, plus a row for every live mount that no
-    /// *configured unit* is serving: [`MountState::Foreign`] for the ones we did not
+    /// Returns every configured mount, plus a row for every live mount no unit of ours is
+    /// serving where the config puts it: [`MountState::Foreign`] for the ones we did not
     /// start, [`MountState::Orphaned`] for our own units left running under a name the
     /// config has since renamed or dropped. A rename therefore reports the path twice —
     /// once for the config entry that wants it, once for the unit that still holds it.
     /// A configured mount that is down is reported [`MountState::Unmounted`], not
     /// omitted.
+    ///
+    /// A unit left behind by a changed `mount_point` is still named by its entry, so it is
+    /// reported once under that name as [`MountState::Failed`] and the path it holds gets
+    /// no row of its own (#90). "Stop the leftover unit" therefore cannot key on
+    /// [`MountState::Orphaned`] alone.
     fn reconcile(&self) -> BoxFuture<'_, Result<Vec<DiscoveredMount>, SupervisorError>>;
 }
 

@@ -1222,10 +1222,12 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             let mut out = Vec::new();
 
             for m in &self.config.mounts {
-                out.push(DiscoveredMount::new(
-                    &m.name,
-                    self.resolve(m, &orphans).await?,
-                ));
+                // The configured spelling rather than the canonicalised one: it is what
+                // the user wrote and what they will recognise in a client.
+                out.push(
+                    DiscoveredMount::new(&m.name, self.resolve(m, &orphans).await?)
+                        .at(m.mount_point.clone()),
+                );
             }
 
             // Canonicalised, exactly as `resolve` compares them: matching the raw path
@@ -1238,19 +1240,22 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // the sweep below, or the point would appear twice — theirs, then ours.
             for o in orphans {
                 let named = self.config.mounts.iter().any(|m| m.unit_name() == o.unit);
-                claimed.push(o.point);
+                claimed.push(o.point.clone());
                 // A moved entry's unit is still named by the config and `resolve` has
                 // reported it under that name. A second row would put two states on one
                 // name, which is what a client keys on.
                 if !named {
-                    out.push(DiscoveredMount::new(o.name, MountState::Orphaned));
+                    out.push(DiscoveredMount::new(o.name, MountState::Orphaned).at(o.point));
                 }
             }
             for e in live.iter().filter(|e| e.is_rclone()) {
                 if claimed.contains(&e.mount_point) {
                     continue;
                 }
-                out.push(DiscoveredMount::new(foreign_name(e), MountState::Foreign));
+                out.push(
+                    DiscoveredMount::new(foreign_name(e), MountState::Foreign)
+                        .at(e.mount_point.clone()),
+                );
             }
             Ok(out)
         })
@@ -1262,7 +1267,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 /// This service's runtime directory joined with the shared socket file name. The client
 /// resolves the same name against `XDG_RUNTIME_DIR`; `RcClient::socket_file_name` is the
 /// single definition both use, and explains why the name is escaped rather than folded.
-fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
     runtime_dir.join(rvt_core::RcClient::socket_file_name(name))
 }
 

@@ -1,0 +1,248 @@
+//! What the service believes about its mounts, and what a client has not been told yet.
+//!
+//! Everything the D-Bus surface answers with comes from here rather than from a fresh
+//! sweep, so a client's menu never waits on `/proc` and systemd. The watcher (see
+//! [`crate::watch`]) is what keeps it current.
+
+use rvt_core::ipc::{MountView, TransferView};
+use rvt_core::Tier;
+use std::collections::BTreeMap;
+
+/// Something that has happened since a client was last told.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Change {
+    /// A mount appeared, or its state changed.
+    Mount(MountView),
+    /// A row went away: a foreign mount unmounted, or an orphan was stopped.
+    Removed(String),
+    /// A mount's outstanding work changed.
+    Transfer(TransferView),
+}
+
+/// The mounts, and the last reading taken for each.
+#[derive(Debug, Default)]
+pub struct Registry {
+    /// Ordered so [`Self::mounts`] answers in a stable order; a client renders a list.
+    mounts: BTreeMap<String, MountView>,
+    transfers: BTreeMap<String, TransferView>,
+    /// Richest tier any mount has resolved, which is a property of the rclone binary all
+    /// of them share. `None` until one has connected.
+    tier: Option<Tier>,
+}
+
+impl Registry {
+    /// Take in a whole sweep, and report what changed.
+    ///
+    /// The sweep is the entire truth about which mounts exist, so a name missing from it
+    /// is a removal. A reading for a mount that is no longer serving is dropped with it:
+    /// the last figures before an unmount describe a mount that is no longer there, and
+    /// serving them on would be the confident-but-wrong answer the tier rules exist to
+    /// prevent.
+    pub fn observe_mounts(&mut self, found: Vec<MountView>) -> Vec<Change> {
+        let mut changes = Vec::new();
+        let mut seen = BTreeMap::new();
+
+        for view in found {
+            let changed = self.mounts.get(&view.name) != Some(&view);
+            if !pollable(&view) {
+                self.transfers.remove(&view.name);
+            }
+            if changed {
+                changes.push(Change::Mount(view.clone()));
+            }
+            seen.insert(view.name.clone(), view);
+        }
+
+        for name in self.mounts.keys() {
+            if !seen.contains_key(name) {
+                self.transfers.remove(name);
+                changes.push(Change::Removed(name.clone()));
+            }
+        }
+
+        self.mounts = seen;
+        changes
+    }
+
+    /// Record a fresh reading for one mount, reporting whether it said anything new.
+    pub fn observe_transfer(&mut self, view: TransferView) -> Option<Change> {
+        if self.transfers.get(&view.mount) == Some(&view) {
+            return None;
+        }
+        self.transfers.insert(view.mount.clone(), view.clone());
+        Some(Change::Transfer(view))
+    }
+
+    /// Every mount, in name order.
+    pub fn mounts(&self) -> Vec<MountView> {
+        self.mounts.values().cloned().collect()
+    }
+
+    /// One mount by name.
+    pub fn mount(&self, name: &str) -> Option<&MountView> {
+        self.mounts.get(name)
+    }
+
+    /// Record what a mount's rc connection turned out to support.
+    ///
+    /// Kept at the richest seen: `Tier` orders by detail, so `min` is the best of them.
+    pub fn note_tier(&mut self, tier: Tier) {
+        self.tier = Some(self.tier.map_or(tier, |best| best.min(tier)));
+    }
+
+    /// The richest tier any mount has resolved, or `None` before one has.
+    pub fn tier(&self) -> Option<Tier> {
+        self.tier
+    }
+
+    /// The last reading for a mount, if one has been taken since it came up.
+    pub fn transfer(&self, name: &str) -> Option<&TransferView> {
+        self.transfers.get(name)
+    }
+
+    /// The mounts worth polling: serving, and started by us.
+    pub fn pollable(&self) -> Vec<String> {
+        self.mounts
+            .values()
+            .filter(|v| pollable(v))
+            .map(|v| v.name.clone())
+            .collect()
+    }
+}
+
+/// Whether this mount has an rc socket of ours to ask.
+///
+/// `Mounted` alone, not `live && managed`. An orphan is both, and does still answer on
+/// the socket it was started with, but no config entry describes it any more, so there is
+/// nothing to report it against. A foreign mount's socket is unknown by definition (#70).
+fn pollable(view: &MountView) -> bool {
+    view.state == rvt_core::ipc::state_name(&rvt_core::MountState::Mounted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(name: &str, state: &str) -> MountView {
+        MountView {
+            name: name.into(),
+            state: state.into(),
+            live: state == "mounted",
+            managed: true,
+            reason: None,
+            mount_point: Some(format!("/mnt/{name}")),
+            remote: Some(format!("drive:{name}")),
+        }
+    }
+
+    fn transfer(mount: &str, files: u64) -> TransferView {
+        TransferView {
+            mount: mount.into(),
+            fidelity: Some("T2".into()),
+            outstanding_known: true,
+            has_progress: false,
+            pending_files: files,
+            pending_known_bytes: files * 1024,
+            pending_unknown_size_files: 0,
+            uploading: None,
+            errored_files: None,
+            out_of_space: None,
+            rate_bytes_per_sec: None,
+            files: Vec::new(),
+            degraded_reason: None,
+        }
+    }
+
+    #[test]
+    fn a_first_sweep_is_all_new() {
+        let mut r = Registry::default();
+        let changes = r.observe_mounts(vec![view("photos", "mounted"), view("docs", "unmounted")]);
+        assert_eq!(changes.len(), 2);
+        assert_eq!(r.mounts().len(), 2);
+    }
+
+    #[test]
+    fn an_unchanged_sweep_says_nothing() {
+        let mut r = Registry::default();
+        r.observe_mounts(vec![view("photos", "mounted")]);
+        assert!(r.observe_mounts(vec![view("photos", "mounted")]).is_empty());
+    }
+
+    #[test]
+    fn a_state_transition_is_reported_once() {
+        let mut r = Registry::default();
+        r.observe_mounts(vec![view("photos", "unmounted")]);
+
+        let changes = r.observe_mounts(vec![view("photos", "mounted")]);
+        assert_eq!(changes, vec![Change::Mount(view("photos", "mounted"))]);
+        assert!(r.observe_mounts(vec![view("photos", "mounted")]).is_empty());
+    }
+
+    #[test]
+    fn a_row_that_vanishes_is_reported_as_removed() {
+        // Configured mounts never vanish — a foreign mount somebody else unmounted does,
+        // and a client left holding the row would show a mount that is not there.
+        let mut r = Registry::default();
+        r.observe_mounts(vec![
+            view("photos", "mounted"),
+            view("/mnt/theirs", "foreign"),
+        ]);
+
+        let changes = r.observe_mounts(vec![view("photos", "mounted")]);
+        assert_eq!(changes, vec![Change::Removed("/mnt/theirs".into())]);
+        assert!(r.mount("/mnt/theirs").is_none());
+    }
+
+    #[test]
+    fn the_tier_reported_is_the_richest_any_mount_reached() {
+        let mut r = Registry::default();
+        assert_eq!(
+            r.tier(),
+            None,
+            "no tier may be named before one is resolved"
+        );
+
+        r.note_tier(Tier::T3);
+        r.note_tier(Tier::T2);
+        r.note_tier(Tier::T4);
+        assert_eq!(r.tier(), Some(Tier::T2));
+    }
+
+    #[test]
+    fn a_reading_does_not_outlive_the_mount_it_describes() {
+        let mut r = Registry::default();
+        r.observe_mounts(vec![view("photos", "mounted")]);
+        r.observe_transfer(transfer("photos", 3));
+        assert!(r.transfer("photos").is_some());
+
+        r.observe_mounts(vec![view("photos", "unmounted")]);
+        assert_eq!(
+            r.transfer("photos"),
+            None,
+            "figures from before an unmount describe a mount that is no longer serving"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_reading_is_not_re_announced() {
+        let mut r = Registry::default();
+        r.observe_mounts(vec![view("photos", "mounted")]);
+
+        assert!(r.observe_transfer(transfer("photos", 3)).is_some());
+        assert!(r.observe_transfer(transfer("photos", 3)).is_none());
+        assert!(r.observe_transfer(transfer("photos", 2)).is_some());
+    }
+
+    #[test]
+    fn only_mounts_with_a_socket_of_ours_are_polled() {
+        let mut r = Registry::default();
+        r.observe_mounts(vec![
+            view("photos", "mounted"),
+            view("docs", "unmounted"),
+            view("stale", "orphaned"),
+            view("/mnt/theirs", "foreign"),
+            view("broken", "failed"),
+        ]);
+        assert_eq!(r.pollable(), vec!["photos".to_string()]);
+    }
+}

@@ -31,6 +31,9 @@ version = 1
 # either way — rclone's cache is on disk and resumes — but a file being written when the
 # mount goes is truncated where it stood, and an unmount you did not ask for is
 # disruptive regardless.
+#
+# Not acted on yet (#99), so turning it on does nothing today. Leaving it off is what the
+# service already does.
 unmount_on_service_stop = false
 
 [global.poll]
@@ -94,7 +97,8 @@ cache_mode = "writes"
 cache_max_size = "10G"
 cache_max_age = "24h"
 
-# Mount when the service starts.
+# Mount when the service starts. Not acted on yet (#98) — the service comes up and waits
+# to be asked, whatever this says.
 auto_mount = true
 
 # read_only = false

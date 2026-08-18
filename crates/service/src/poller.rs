@@ -11,10 +11,7 @@ use rvt_core::transfer::{RateEstimator, TransferState};
 use std::fmt::Write as _;
 use std::time::Duration;
 
-/// Poll interval while something is outstanding.
-const ACTIVE: Duration = Duration::from_secs(1);
-/// Poll interval while the queue is empty. An idle mount should cost nothing.
-const IDLE: Duration = Duration::from_secs(15);
+use rvt_core::config::Poll;
 
 /// What `vfs/stats` was able to say about this mount's write-back cache.
 ///
@@ -87,14 +84,18 @@ impl MountPoller {
     ///
     /// A disk-derived (T4) state is always the slow cadence however much it found: each
     /// poll behind it is a full walk of the metadata tree.
-    pub fn interval(state: &TransferState) -> Duration {
+    ///
+    /// Neither cadence can be zero: `Config::validate` refuses that, because a mount with
+    /// something outstanding would then be polled in a loop with no wait at all.
+    pub fn interval(state: &TransferState, poll: &Poll) -> Duration {
+        let idle = Duration::from_secs(poll.idle_secs);
         if state.fidelity == Some(Tier::T4) {
-            return IDLE;
+            return idle;
         }
         if state.pending.files > 0 {
-            ACTIVE
+            Duration::from_secs(poll.active_secs)
         } else {
-            IDLE
+            idle
         }
     }
 
@@ -451,6 +452,14 @@ mod tests {
     use rvt_testutil::Scratch;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+
+    fn active() -> Duration {
+        Duration::from_secs(Poll::default().active_secs)
+    }
+
+    fn idle() -> Duration {
+        Duration::from_secs(Poll::default().idle_secs)
+    }
 
     /// The rc bodies to answer with, shared so a test can change one between polls.
     type Routes = std::sync::Arc<std::sync::Mutex<Vec<(&'static str, String)>>>;
@@ -977,7 +986,7 @@ mod tests {
         let mut p = MountPoller::connect("backup", fake.client()).await;
         let busy = p.poll().await;
         assert!(!busy.is_idle(), "the capture has a queued file");
-        assert_eq!(MountPoller::interval(&busy), ACTIVE);
+        assert_eq!(MountPoller::interval(&busy, &Poll::default()), active());
 
         // An empty queue rclone actually reported. `VfsQueue::default()` is not that: its
         // key is absent, which is how a cacheless VFS answers and is not idle at all.
@@ -985,8 +994,8 @@ mod tests {
         let empty = TransferState::from_queue("backup", &reported_empty);
         assert!(empty.is_idle());
         assert_eq!(
-            MountPoller::interval(&empty),
-            IDLE,
+            MountPoller::interval(&empty, &Poll::default()),
+            idle(),
             "an idle mount must not be polled every second"
         );
 
@@ -994,6 +1003,32 @@ mod tests {
         assert!(
             !unreported.is_idle(),
             "no queue key means no queue, which is the opposite of an empty one"
+        );
+    }
+
+    #[test]
+    fn the_cadence_is_the_one_the_config_asked_for() {
+        let poll = Poll {
+            active_secs: 3,
+            idle_secs: 600,
+        };
+        let reported_empty: VfsQueue = serde_json::from_str(r#"{"queue":[]}"#).unwrap();
+        let empty = TransferState::from_queue("backup", &reported_empty);
+        assert_eq!(
+            MountPoller::interval(&empty, &poll),
+            Duration::from_secs(600)
+        );
+
+        let mut busy = empty.clone();
+        busy.pending.files = 1;
+        assert_eq!(MountPoller::interval(&busy, &poll), Duration::from_secs(3));
+
+        // The one cadence the config does not get to raise: each T4 poll walks the whole
+        // metadata tree.
+        busy.fidelity = Some(Tier::T4);
+        assert_eq!(
+            MountPoller::interval(&busy, &poll),
+            Duration::from_secs(600)
         );
     }
 
@@ -1222,8 +1257,8 @@ mod tests {
             .expect("the user has to be told why");
         assert!(why.contains("vfs-cache-mode off"), "{why}");
         assert_eq!(
-            MountPoller::interval(&s),
-            IDLE,
+            MountPoller::interval(&s, &Poll::default()),
+            idle(),
             "re-deriving 'still cannot see it' every second is a busy loop over a fact \
              that cannot change until the mount is restarted"
         );
@@ -1415,8 +1450,8 @@ mod tests {
             "this is a fallback, and the user should be told which one"
         );
         assert_eq!(
-            MountPoller::interval(&after),
-            IDLE,
+            MountPoller::interval(&after, &Poll::default()),
+            idle(),
             "a disk-derived state has files outstanding but must not drive the 1s cadence \
              — each poll behind it is a full walk of the metadata tree"
         );

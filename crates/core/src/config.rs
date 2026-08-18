@@ -585,6 +585,19 @@ impl Config {
             }
         }
 
+        // Zero is not "as fast as possible": this is the wait *between* polls, so a mount
+        // with anything outstanding would be re-polled with no wait at all.
+        for (field, secs) in [
+            ("active_secs", self.global.poll.active_secs),
+            ("idle_secs", self.global.poll.idle_secs),
+        ] {
+            if secs == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "global.poll.{field} must be at least 1 second"
+                )));
+            }
+        }
+
         let mut names = BTreeSet::new();
         let mut points = BTreeSet::new();
 
@@ -1285,6 +1298,23 @@ mod tests {
                 "{through:?} is left for rclone to refuse"
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_a_poll_interval_that_would_spin() {
+        for field in ["active_secs", "idle_secs"] {
+            let mut c = with(vec![mount("a", "/mnt/one")]);
+            match field {
+                "active_secs" => c.global.poll.active_secs = 0,
+                _ => c.global.poll.idle_secs = 0,
+            }
+            let msg = c.validate().unwrap_err().to_string();
+            assert!(
+                msg.contains(field),
+                "the refusal must name the field: {msg:?}"
+            );
+        }
+        assert!(with(vec![mount("a", "/mnt/one")]).validate().is_ok());
     }
 
     #[test]

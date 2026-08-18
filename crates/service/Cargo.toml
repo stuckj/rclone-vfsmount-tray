@@ -34,3 +34,9 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 rvt-testutil = { path = "../testutil" }
+# `StreamExt`, to take one signal off a proxy's stream. zbus re-exports only what its own
+# macros need, and that does not include this.
+futures-util = { version = "0.3", default-features = false }
+# Builds a `Config` for the watcher's tests from the TOML a user would write, rather than
+# from a struct literal that cannot fail the way a real file can.
+toml = { workspace = true }

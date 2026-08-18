@@ -1,4 +1,5 @@
 //! Core logic for `rclone-vfsmount-tray`: [`config`] (the applet's own settings),
+//! [`ipc`] (the D-Bus contract the service and its clients are both built from),
 //! [`models`] (rc API and cache metadata), [`rclone`] (finding and querying the binary),
 //! [`scan`] (pending uploads read off disk),
 //! [`supervisor`] (mount lifecycle), and [`resolve_log_filter`].
@@ -7,6 +8,7 @@
 
 pub mod capabilities;
 pub mod config;
+pub mod ipc;
 pub mod models;
 pub mod mountinfo;
 pub mod rc;
@@ -17,6 +19,7 @@ pub mod transfer;
 
 pub use capabilities::{Capabilities, Tier};
 pub use config::{CacheMode, Config, ConfigError, Mount};
+pub use ipc::{IpcError, MountView, TransferView};
 pub use models::Pending;
 pub use rc::{RcClient, RcError};
 pub use rclone::{Rclone, RcloneError};

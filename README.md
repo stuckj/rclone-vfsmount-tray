@@ -2,12 +2,12 @@
 
 A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mountain Duck.
 
-> **Status: early development — not usable yet.** There is no tray icon and no window, and
-> running it will not mount anything for you. What exists is the machinery underneath: it
-> finds rclone, reads its configuration, reports the state of every mount it can see, and
-> knows how to start, stop and adopt them as systemd user units and how to work out what
-> each one still has to upload. Nothing yet drives that on your behalf — the service reports
-> what it found and exits. Follow the
+> **Status: early development — not usable yet.** There is no tray icon and no window, so
+> nothing yet asks for anything on your behalf. The service itself now works: it finds
+> rclone, reads your configuration, stays running, keeps track of every mount it can see and
+> what each one still has to upload, and mounts or unmounts on request. Two things are still
+> missing before that is any use to you — a front end to ask it, and bringing your mounts up
+> by itself when it starts. Follow the
 > [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1) for progress.
 
 ## What it will do
@@ -110,13 +110,22 @@ time you start it.
 ./target/release/rclone-vfsmount-trayd
 ```
 
-Today that finds rclone, reads your config, and logs the state of every mount it can see —
-including any rclone mount already running that this project did not start. Then it exits.
-It will **not** mount anything for you, so a fresh setup reports each of your mounts as
-unmounted and has no upload figures to show yet. Use `--config <path>` to point it at a
-different file, and `--log-level debug` for more detail once there is something to report.
+That finds rclone, reads your config and stays running. It watches every mount it can see —
+including any rclone mount already running that this project did not start — and will mount
+and unmount on request. It does **not** bring anything up on its own yet, so a fresh setup
+starts with all of your mounts unmounted.
 
-Bringing mounts up on your behalf, and staying running to watch them, is what 0.1.0 is for.
+Asking it for something means a tray icon or a window, and neither is built. Until then the
+only way is by hand:
+
+```sh
+busctl --user call io.github.stuckj.RcloneVfsmountTray \
+  /io/github/stuckj/RcloneVfsmountTray \
+  io.github.stuckj.RcloneVfsmountTray1 Mount s photos
+```
+
+Use `--config <path>` to point it at a different file, and `--log-level debug` for more
+detail. Stopping it leaves every mount exactly as it is.
 
 ## Documentation
 

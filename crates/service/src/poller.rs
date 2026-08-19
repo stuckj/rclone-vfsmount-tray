@@ -101,12 +101,9 @@ impl MountPoller {
     /// partially observed one with real entries in its queue still has to be watched.
     ///
     /// A disk-derived (T4) state takes the slower of the two cadences however much it
-    /// found: each poll behind it is a full walk of the metadata tree. The *slower*, not
-    /// the idle one — nothing stops a config naming an idle interval shorter than its
-    /// active one, and that must not be a way to walk the tree every second.
-    ///
-    /// Neither cadence can be zero: `Config::validate` refuses that, because a mount with
-    /// something outstanding would then be polled in a loop with no wait at all.
+    /// found: each poll behind it is a full walk of the metadata tree. The slower, because
+    /// nothing orders the two — an idle interval below the active one must not become a
+    /// way to walk that tree every second.
     pub fn interval(state: &TransferState, poll: &Poll) -> Duration {
         let idle = Duration::from_secs(poll.idle_secs);
         if state.fidelity == Some(Tier::T4) {

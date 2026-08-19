@@ -14,9 +14,8 @@
 //! **Subscribe, then list, then apply what arrived in between.** Signals are deltas and
 //! the service sends one only when something changes, so a client that lists first and
 //! subscribes afterwards can miss the change that happened in the gap and never hear of it
-//! again. Subscribing first and applying the snapshot *before* the buffered signals gets
-//! the ordering right in both directions: a signal older than the snapshot re-applies what
-//! the snapshot already has, and a newer one lands on top of it.
+//! again. Applying the snapshot *before* the signals buffered since is what orders the two
+//! correctly.
 //!
 //! What is *not* here is as deliberate: no method takes an rc command, a path outside a
 //! configured mount, or anything from rclone's own configuration. See DESIGN.md,
@@ -327,10 +326,9 @@ pub trait RcloneVfsmountTray {
     /// explicit decision, never inferred.
     ///
     /// It is *not* "unmount despite pending uploads". Those are unrelated decisions — one
-    /// costs the tail of a file, the other costs only delay, since the write-back cache is
-    /// on disk and resumes. Nothing weighs pending uploads yet ([`IpcError::PendingUploads`],
-    /// #19); when something does, the choice it offers needs its own way to be expressed
-    /// rather than borrowing this one.
+    /// costs the tail of a file, the other only delay, since the write-back cache is on
+    /// disk and resumes. Nothing weighs pending uploads yet ([`IpcError::PendingUploads`],
+    /// #19).
     fn unmount(&self, name: &str, force: bool) -> Result<(), IpcError>;
 
     /// What one mount still has to upload, as of the last poll.

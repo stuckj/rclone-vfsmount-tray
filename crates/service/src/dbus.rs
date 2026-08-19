@@ -62,10 +62,9 @@ impl MountManager {
         }
         match self.registry.lock().await.mount(name) {
             None => Err(IpcError::UnknownMount(format!("no mount named {name:?}"))),
-            // Listed, so a client has the name, but somebody else started it. The
-            // supervisor reaches the same verdict — after sweeping systemd for an orphan
-            // by that name, which no foreign row can be, since a name with a `/` in it is
-            // one `Config::validate` refuses and `Mount::unit_name` could not produce.
+            // Listed, so a client has the name, but somebody else started it. No orphan
+            // can answer to it either: a name with a `/` in it is one `Config::validate`
+            // refuses and `Mount::unit_name` could not produce.
             Some(mount) if !mount.managed => Err(IpcError::NotManaged(format!(
                 "{name:?} was started outside this service"
             ))),
@@ -200,10 +199,9 @@ fn causes(e: &SupervisorError) -> String {
 
 /// Whether an operation got far enough to leave anything for a sweep to find.
 ///
-/// A sweep is not free — it lists units, reads `/proc`, canonicalises every configured
-/// point and shells out to `journalctl` for anything failed — so a refusal that acted on
-/// nothing must not force one. Both of these are decided before the supervisor touches a
-/// unit, and neither leaves a row whose state has moved.
+/// Both of these are decided before the supervisor touches a unit, and neither leaves a
+/// row whose state has moved, so neither is worth what a sweep costs (see
+/// [`crate::watch::MIN_SWEEP_GAP`]).
 fn touched_something(result: &Result<(), SupervisorError>) -> bool {
     !matches!(
         result,
@@ -594,9 +592,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_that_did_nothing_does_not_buy_a_sweep() {
-        // A sweep lists units, reads /proc and shells out to journalctl. Any peer on the
-        // session bus can call `Mount`, so a refusal must not be a way to spend its CPU —
-        // and the init system's — in a loop.
+        // Any peer on the session bus can call `Mount`, so a refusal must not be a way to
+        // spend the service's CPU, and the init system's, in a loop.
         //
         // The name has to be one that gets past `must_know`, or the supervisor is never
         // reached and this proves nothing. An orphan is that case: it is listed and it is

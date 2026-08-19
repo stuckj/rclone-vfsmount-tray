@@ -1296,18 +1296,15 @@ const ARGV_WITHHELD: &str = "[rclone's command line withheld]";
 /// level, in the line [`ARGV_ECHO`] names. Measured against rclone 1.75.0, which does not
 /// log it at its default level.
 ///
-/// **The whole line goes, always.** Not the secret within it: finding that means knowing
-/// how rclone spelled it, and it spells one argument three ways — bare, quoted by Go's
-/// `%q`, and quoted then escaped again under `--use-json-log` — so a rule that has to
-/// recognise the spelling fails silently on the one it does not. And not "only for a
-/// mount that has `extra_args`": the journal outlives the config. `journalctl` is read by
-/// name, so the echo can come from an invocation started before the user moved a token out
-/// of `extra_args` and restarted the service, at which point a condition read off today's
-/// config withholds nothing. What is lost is a command line this service composed from
-/// configuration the user already has.
+/// **The whole line goes, always.** Two alternatives look right and are not. Redacting the
+/// value needs its spelling, and rclone spells one argument three ways — bare, quoted by
+/// Go's `%q`, and quoted then escaped again under `--use-json-log` — so such a rule fails
+/// silently on the one it does not know. Withholding only from mounts that currently set
+/// `extra_args` reads today's config to judge a line written by a past invocation, and the
+/// journal outlives the config.
 ///
-/// The configured values are then also replaced wherever else they appear quoted, which
-/// costs nothing and catches an echo somewhere other than that line.
+/// The configured values are replaced wherever else they appear quoted, which catches an
+/// echo somewhere other than that line.
 ///
 /// Not a guarantee that nothing sensitive crosses: the text is rclone's, and rclone can be
 /// told to log a great deal. See DESIGN.md, "D-Bus, and only for sandboxed callers".

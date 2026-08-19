@@ -30,14 +30,13 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(15);
 /// calling `Mount`. Without a floor, a caller in a loop spends the service's CPU and the
 /// init system's for as long as it likes. An action's result is still published within
 /// this, which is far inside the seconds a mount takes anyway.
-const MIN_SWEEP_GAP: Duration = Duration::from_secs(1);
+pub(crate) const MIN_SWEEP_GAP: Duration = Duration::from_secs(1);
 
 /// Wakes the watcher, and names the mounts whose poller can no longer be trusted.
 ///
 /// A sweep cannot tell that a mount cycled: an unmount and a remount between two of them
-/// look exactly like no change, and the poller would carry a capability probe and a rate
-/// estimate across two different rclone processes. Only the caller that performed the
-/// action knows, so it says so here.
+/// look exactly like no change. Only the caller that performed the action knows, so it
+/// says so here.
 #[derive(Default)]
 pub struct Nudge {
     woken: Notify,
@@ -73,7 +72,8 @@ pub struct Watcher {
     /// Where the rc sockets live, for the mounts this service started.
     runtime_dir: PathBuf,
     /// One per mount being polled, kept across ticks: capabilities are probed once and
-    /// the rate estimator needs two readings to say anything.
+    /// the rate estimator needs two readings to say anything. Both belong to the rclone
+    /// process it connected to, so a poller must never outlive one.
     pollers: HashMap<String, MountPoller>,
     /// When each mount is next worth asking.
     due: HashMap<String, Instant>,
@@ -153,10 +153,8 @@ impl Watcher {
         }
     }
 
-    /// Throw away the pollers for mounts something has acted on.
-    ///
-    /// The poller, not just its deadline: it holds a capability probe and a rate estimate
-    /// belonging to the rclone that was serving the mount before.
+    /// Throw away the pollers for mounts something has acted on — the poller itself, not
+    /// just its deadline. See [`Watcher::pollers`].
     fn forget_cycled(&mut self) {
         for name in self.nudge.take_cycled() {
             self.pollers.remove(&name);
@@ -191,8 +189,7 @@ impl Watcher {
 
     async fn poll_due(&mut self, now: Instant) -> Vec<Change> {
         let pollable = self.registry.lock().await.pollable();
-        // A mount that stopped serving keeps no poller: a remount is a different rclone
-        // with different capabilities, and its rate estimator must not span the gap.
+        // A mount that stopped serving keeps no poller: a remount is a different rclone.
         self.pollers.retain(|name, _| pollable.contains(name));
         self.due.retain(|name, _| pollable.contains(name));
 

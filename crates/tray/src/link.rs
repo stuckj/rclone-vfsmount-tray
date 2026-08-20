@@ -16,14 +16,14 @@ pub(crate) const UNIT: &str = "rclone-vfsmount-trayd";
 /// `start_hint` cannot drift apart.
 pub(crate) const START_HINT: &str = "systemctl --user start rclone-vfsmount-trayd";
 
-/// The lowest interface version whose vocabulary these subcommands use.
+/// The lowest interface version whose vocabulary this build uses.
 ///
-/// Every method and property they call was published at version 1, so a service reporting
-/// anything lower is too old to answer them. No released service does — but the check turns
-/// a future gap into a sentence rather than an `UnknownMethod` surfacing halfway through.
+/// Every method and property it calls was published at version 1, so a service reporting
+/// anything lower is too old to answer them. No released service does — but the check turns a
+/// future gap into a sentence rather than an `UnknownMethod` surfacing halfway through.
 pub(crate) const MIN_INTERFACE: u32 = 1;
 
-/// Why a subcommand could not be carried out.
+/// Why the service could not be reached, or could not be understood.
 ///
 /// [`Self::Refused`] is set apart from the rest: it is the service answering and saying no,
 /// and it is the only kind that says anything about a mount. Everything else is the question
@@ -47,7 +47,8 @@ pub(crate) enum LinkError {
 }
 
 impl LinkError {
-    /// A distinct code per failure so a script can branch without parsing prose.
+    /// A distinct code per failure so a script can branch without parsing prose. Used by the
+    /// subcommands; the tray shows [`Self::message`] instead.
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             LinkError::Refused(_) => 1,
@@ -158,8 +159,9 @@ pub(crate) fn from_ipc(e: IpcError) -> LinkError {
 ///
 /// Reading `InterfaceVersion` first is the handshake: it is the cheapest call, and it is
 /// where an absent or incompatible interface surfaces as one clear failure instead of each
-/// later method failing on its own. Property caching is off — a one-shot process reads each
-/// once and has no use for a `PropertiesChanged` subscription.
+/// later method failing on its own. Property caching is off: the four properties are read
+/// once per attachment, and the service does not announce a change to any of them, so a cache
+/// would be a `GetAll` and a subscription bought for nothing.
 pub(crate) async fn open(
     conn: &zbus::Connection,
 ) -> Result<RcloneVfsmountTrayProxy<'static>, LinkError> {

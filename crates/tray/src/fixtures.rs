@@ -25,10 +25,10 @@ pub(crate) fn service() -> ServiceInfo {
 
 /// A row as the service would publish it.
 ///
-/// Built through the real conversion rather than by filling the fields in: `live` and
-/// `managed` are derived from the state, and a fixture that writes them by hand agrees with
-/// the code until someone changes one of them. The service crate learned this the same way —
-/// see the note on `registry.rs`'s own fixture.
+/// Built through the real conversion rather than by filling the fields in. `live` and
+/// `managed` are derived from the state, and a fixture that writes them out by hand asks the
+/// same question twice: it agrees with the code until one of the two changes, and then it
+/// asserts the old answer.
 pub(crate) fn mount(name: &str, state: &str) -> MountView {
     let parsed =
         rvt_core::ipc::state_from_name(state, Some("rclone exited before the mount appeared"))

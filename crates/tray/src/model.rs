@@ -236,6 +236,18 @@ impl TrayModel {
         self.notice = None;
     }
 
+    /// The service's name has changed hands: forget the rows, and say nothing yet about why.
+    ///
+    /// Distinct from [`Self::go_down`], which is an answer. Whoever holds the name now has
+    /// not been asked anything, so "not running" would be a claim — and offering to start it
+    /// would be offering to start what is already there.
+    pub(crate) fn go_connecting(&mut self) {
+        self.link = Link::Connecting;
+        self.mounts.clear();
+        self.transfers.clear();
+        self.notice = None;
+    }
+
     /// Re-read everything from the *same* service. Unlike [`Self::go_up`] this keeps the
     /// notice: it describes something that happened during this service's lifetime, and the
     /// user asking for a refresh is not asking to be told less.
@@ -953,12 +965,6 @@ mod tests {
         m.act(Action::Mount("photos".into()));
         assert_eq!(rx.try_recv(), Ok(Action::Mount("photos".into())));
     }
-}
-
-#[cfg(test)]
-mod round_one {
-    use super::*;
-    use crate::fixtures::{connected, idle_transfer, mount, pending, service};
 
     #[test]
     fn a_serving_mount_that_has_said_nothing_is_not_called_synced() {
@@ -1046,12 +1052,6 @@ mod round_one {
         );
         assert!(d.headline.contains("connection reset"));
     }
-}
-
-#[cfg(test)]
-mod round_two {
-    use super::*;
-    use crate::fixtures::{connected, idle_transfer, mount, pending};
 
     #[test]
     fn no_estimate_is_offered_while_any_mount_cannot_be_read() {

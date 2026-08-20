@@ -214,56 +214,42 @@ async fn attach_and_serve(
             };
         }
         Err(e) => {
-            down(handle, proxy_tx, &link::from_zbus(e.into())).await;
-            return bus_lost(handle, proxy_tx).await;
+            let why = link::from_zbus(e.into());
+            return if down(handle, proxy_tx, &why).await {
+                Step::Bus
+            } else {
+                Step::Gone
+            };
         }
     };
 
-    let subscriptions = match link::open_owner(conn, owner.clone()).await {
+    let subscriptions = match attaching(link::open_owner(conn, owner.clone())).await {
         Ok(p) => p,
-        Err(e) => {
-            return if down(handle, proxy_tx, &e).await {
-                Step::Backoff
-            } else {
-                Step::Gone
-            };
-        }
+        Err(e) => return give_up(handle, proxy_tx, e).await,
     };
-    let proxy = match link::open_owner(calls, owner).await {
+    let proxy = match attaching(link::open_owner(calls, owner)).await {
         Ok(p) => p,
-        Err(e) => {
-            // The name is owned but the handshake failed: an incompatible service, or one
-            // that is up but not yet answering. Neither is fixed by asking again at once.
-            return if down(handle, proxy_tx, &e).await {
-                Step::Backoff
-            } else {
-                Step::Gone
-            };
-        }
+        // The name is owned but the handshake failed: an incompatible service, or one that is
+        // up and not yet answering. Neither is fixed by asking again at once.
+        Err(e) => return give_up(handle, proxy_tx, e).await,
     };
 
     let mut states = match subscriptions.receive_mount_state_changed().await {
         Ok(s) => s,
-        Err(e) => return retry_after(handle, proxy_tx, e).await,
+        Err(e) => return give_up(handle, proxy_tx, link::from_zbus(e)).await,
     };
     let mut removals = match subscriptions.receive_mount_removed().await {
         Ok(s) => s,
-        Err(e) => return retry_after(handle, proxy_tx, e).await,
+        Err(e) => return give_up(handle, proxy_tx, link::from_zbus(e)).await,
     };
     let mut transfers = match subscriptions.receive_transfer_state_changed().await {
         Ok(s) => s,
-        Err(e) => return retry_after(handle, proxy_tx, e).await,
+        Err(e) => return give_up(handle, proxy_tx, link::from_zbus(e)).await,
     };
 
-    let snapshot = match gather(&proxy).await {
+    let snapshot = match attaching(gather(&proxy)).await {
         Ok(s) => s,
-        Err(e) => {
-            return if down(handle, proxy_tx, &e).await {
-                Step::Backoff
-            } else {
-                Step::Gone
-            }
-        }
+        Err(e) => return give_up(handle, proxy_tx, e).await,
     };
     let (info, mounts, first_transfers) = snapshot;
     tracing::info!(
@@ -316,7 +302,8 @@ async fn attach_and_serve(
                 // handshake — mid-reconcile, say — and until it does, the previous one's
                 // mount table is not something the tray knows to be true.
                 let Some(_) = ev else { return bus_lost(handle, proxy_tx).await };
-                return if down(handle, proxy_tx, &LinkError::NotRunning).await {
+                proxy_tx.send_replace(None);
+                return if edit(handle, |m| m.go_connecting()).await {
                     Step::Now
                 } else {
                     Step::Gone
@@ -327,7 +314,7 @@ async fn attach_and_serve(
                 // over. Reattaching would re-resolve the name, re-add three match rules and
                 // drop the notice explaining why the last action was refused — all to learn
                 // the same thing this asks for directly.
-                match gather(&proxy).await {
+                match attaching(gather(&proxy)).await {
                     Ok((info, mounts, readings)) => {
                         let applied = handle
                             .update(move |m| {
@@ -340,16 +327,28 @@ async fn attach_and_serve(
                             .is_some();
                         if !applied { return Step::Gone }
                     }
-                    Err(e) => {
-                        return if down(handle, proxy_tx, &e).await {
-                            Step::Backoff
-                        } else {
-                            Step::Gone
-                        }
-                    }
+                    Err(e) => return give_up(handle, proxy_tx, e).await,
                 }
             }
         }
+    }
+}
+
+/// Bound an attach step, so a name owner that never replies cannot hold the tray.
+///
+/// zbus imposes no reply timeout, and the bus daemon's is five minutes. Everything wrapped
+/// here is answered from memory or from one lock, so a wait this long is not slowness — it is
+/// something that will not answer. Deliberately not applied to `mount`, which legitimately
+/// takes the best part of a minute on a cold remote.
+async fn attaching<T>(
+    step: impl std::future::Future<Output = Result<T, LinkError>>,
+) -> Result<T, LinkError> {
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+    match tokio::time::timeout(PATIENCE, step).await {
+        Ok(done) => done,
+        Err(_) => Err(LinkError::Transport(zbus::Error::Failure(
+            "the service holds its name but is not answering".into(),
+        ))),
     }
 }
 
@@ -376,18 +375,6 @@ async fn gather(proxy: &Proxy) -> Result<Snapshot, LinkError> {
     Ok((info, mounts, transfers))
 }
 
-async fn retry_after(
-    handle: &Handle<TrayModel>,
-    proxy_tx: &watch::Sender<Option<Proxy>>,
-    e: zbus::Error,
-) -> Step {
-    if down(handle, proxy_tx, &link::from_zbus(e)).await {
-        Step::Backoff
-    } else {
-        Step::Gone
-    }
-}
-
 /// The bus connection itself has ended, which every arm of the session loop can discover.
 ///
 /// Routed through one function so that none of them can return leaving the model rendering
@@ -399,6 +386,28 @@ async fn bus_lost(handle: &Handle<TrayModel>, proxy_tx: &watch::Sender<Option<Pr
         Step::Bus
     } else {
         Step::Gone
+    }
+}
+
+/// Report an attempt that failed, and say how much has to be rebuilt before the next one.
+///
+/// A refusal, a mismatched version or a silent service is worth retrying against the same
+/// pair of connections. A transport failure is not: it may be the calls connection alone that
+/// has died, and only [`Step::Bus`] rebuilds that one — retrying would otherwise ask a dead
+/// socket the same question every minute for the rest of the session.
+async fn give_up(
+    handle: &Handle<TrayModel>,
+    proxy_tx: &watch::Sender<Option<Proxy>>,
+    e: LinkError,
+) -> Step {
+    let broken = matches!(e, LinkError::Transport(_) | LinkError::NoSessionBus(_));
+    if !down(handle, proxy_tx, &e).await {
+        return Step::Gone;
+    }
+    if broken {
+        Step::Bus
+    } else {
+        Step::Backoff
     }
 }
 

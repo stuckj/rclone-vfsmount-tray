@@ -163,8 +163,8 @@ The icon says what is happening, and its tooltip spells it out:
 
 The menu lists every mount with its state. Each opens onto where it is mounted, an **Open**
 item that hands the mount point to your file manager, and **Mount** or **Unmount**. Mounts this
-service did not start are listed apart and cannot be acted on, because the service will not act
-on them. What is still to upload is summarised at the top — "3 files, 1.2 GiB pending", a rate,
+service did not start are listed apart, and offer only **Open**: the service will not mount or
+unmount something it did not start. What is still to upload is summarised at the top — "3 files, 1.2 GiB pending", a rate,
 and an estimate where one can be derived honestly — and again per mount, listing up to ten
 files. When a figure comes from reading the cache directory rather than from rclone, the menu
 says so instead of passing it off as live progress.

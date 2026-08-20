@@ -73,14 +73,16 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
     let mut items = notice_lines(m.notice());
 
     let summary = m.summary();
-    items.extend(text(summary.mounted_line()));
-    items.extend(summary.pending_line().into_iter().flat_map(text));
-    items.extend(summary.rate_line().into_iter().flat_map(text));
-    if summary.dirty_on_disk_only {
-        items.extend(text(
-            "Some figures are unuploaded files on disk, not live upload progress.",
-        ));
-    }
+    // Four rows, always, some of them hidden. This block changes with all but every poll
+    // while an upload runs — a rate that comes and goes, a total that empties — and a row
+    // appearing or disappearing is a layout change, which throws away every menu id and makes
+    // the panel refetch. Kept a fixed shape, those are property changes instead.
+    items.push(one_row(summary.mounted_line()));
+    items.push(row_or_gap(summary.pending_line()));
+    items.push(row_or_gap(summary.rate_line()));
+    items.push(row_or_gap(summary.dirty_on_disk_only.then(|| {
+        "Some figures are files on disk, not live upload progress.".to_string()
+    })));
 
     let (managed, foreign): (Vec<_>, Vec<_>) = m.mounts().partition(|v| v.managed);
 
@@ -96,12 +98,16 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
 
     if !managed.is_empty() {
         items.push(MenuItem::Separator);
-    }
-    if managed.iter().any(|v| !v.live) {
-        items.push(bulk("Mount all", true));
-    }
-    if managed.iter().any(|v| v.live) {
-        items.push(bulk("Unmount all", false));
+        items.push(bulk(
+            "Mount all",
+            true,
+            managed.iter().any(|v| settled(v) && !v.live),
+        ));
+        items.push(bulk(
+            "Unmount all",
+            false,
+            managed.iter().any(|v| settled(v) && v.live),
+        ));
     }
 
     items.push(MenuItem::Separator);
@@ -134,7 +140,9 @@ fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
         _ => sub.push(disabled_action("Open")),
     }
     if v.managed {
-        sub.push(toggle(v.name.clone(), !v.live));
+        // Two items, exactly one of them usable, rather than one that changes its verb.
+        sub.push(verb(v.name.clone(), Verb::Mount, settled(v) && !v.live));
+        sub.push(verb(v.name.clone(), Verb::Unmount, settled(v) && v.live));
     } else {
         // The service refuses to act on a mount it did not start, so offering the action
         // here would only produce a refusal the user cannot do anything about.
@@ -179,7 +187,16 @@ fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
         )));
     }
 
-    for f in t.files.iter().take(FILE_CAP) {
+    // A fixed number of rows, hidden where there is no file for them. `ksni` treats any
+    // change in a node's child count as a layout change, which invalidates every menu id and
+    // makes the panel refetch; the queue drains a file at a time while an upload runs, so a
+    // list that shrank with it would do that about once a second and swallow any click the
+    // panel had already sent. Hiding a row is a property change, which does neither.
+    for slot in 0..FILE_CAP {
+        let Some(f) = t.files.get(slot) else {
+            lines.push(hidden());
+            continue;
+        };
         let mut line = f.name.clone();
         if let Some(size) = f.size {
             line.push_str(&format!(" — {}", human_bytes(size)));
@@ -198,11 +215,14 @@ fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
                 }
             }
         }
-        lines.extend(text(line));
+        // One row per file, whatever its name: a name long enough to wrap would change the
+        // count and reshape the menu, which is what the fixed number of slots avoids.
+        lines.push(one_row(clip(&line)));
     }
-    if t.files.len() > FILE_CAP {
-        lines.extend(text(format!("and {} more…", t.files.len() - FILE_CAP)));
-    }
+    lines.push(match t.files.len().checked_sub(FILE_CAP) {
+        Some(rest) if rest > 0 => one_row(format!("and {rest} more…")),
+        _ => hidden(),
+    });
 
     if t.errored_files.unwrap_or(0) > 0 {
         lines.extend(text(format!(
@@ -248,42 +268,75 @@ fn stop_service() -> MenuItem<TrayModel> {
     submenu("Stop service", items)
 }
 
-/// Ask for a mount to be up, or to be down — whichever its label offered.
+/// Which of the two things a menu item asks for. Fixed when the item is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verb {
+    Mount,
+    Unmount,
+}
+
+/// One item that only ever asks for one thing.
 ///
-/// The panel can hold a click for an item drawn before the mount last changed state, and
-/// `ksni` keeps an item's id as long as the menu's *shape* is unchanged, which two states of
-/// one mount can share. So the label is read as the request it made, and a request the mount
-/// already satisfies does nothing: a click on "Mount" must never take a mount down.
-fn toggle(name: String, want_live: bool) -> MenuItem<TrayModel> {
+/// `ksni` replaces every stored callback each time the tray is updated and dispatches a click
+/// to whichever callback now sits at the clicked index, while the panel is still drawing the
+/// labels it last fetched. A single item that swapped between "Mount" and "Unmount" would
+/// therefore run the opposite of what was clicked whenever the mount changed state between
+/// the draw and the click. Two items keep each index's meaning fixed, and keep the row the
+/// same shape as the mount goes up and down, so the panel's ids stay valid across it.
+fn verb(name: String, verb: Verb, enabled: bool) -> MenuItem<TrayModel> {
     StandardItem {
-        label: escape(if want_live { "Mount" } else { "Unmount" }),
+        label: escape(match verb {
+            Verb::Mount => "Mount",
+            Verb::Unmount => "Unmount",
+        }),
+        enabled,
         activate: Box::new(move |m: &mut TrayModel| {
-            let Some(live) = m.mounts().find(|v| v.name == name).map(|v| v.live) else {
+            // The model can move between a callback being stored and being called: the tray
+            // is edited under one lock and redrawn under another. A row that has gone, or a
+            // mount already in the state being asked for, means there is nothing to do.
+            let Some(state) = m
+                .mounts()
+                .find(|v| v.name == name)
+                .map(|v| (v.live, settled(v)))
+            else {
                 return;
             };
-            if live == want_live {
+            // Disabling an item is a request to the panel, not a guarantee: a click sent
+            // against an earlier layout still arrives, so the callback re-checks.
+            let (live, settled) = state;
+            if !settled {
                 return;
             }
-            m.act(if want_live {
-                Action::Mount(name.clone())
-            } else {
-                Action::Unmount(name.clone())
-            });
+            match verb {
+                Verb::Mount if !live => m.act(Action::Mount(name.clone())),
+                Verb::Unmount if live => m.act(Action::Unmount(name.clone())),
+                _ => {}
+            }
         }),
         ..Default::default()
     }
     .into()
 }
 
+/// Whether a mount is somewhere it can be asked to leave.
+///
+/// `mounting` and `unmounting` are both `live == false`, and acting on either means asking
+/// for something already under way: a second `mount` that queues behind the first, or — after
+/// "Unmount all" — a "Mount all" that brings straight back up what was just taken down.
+fn settled(v: &MountView) -> bool {
+    !matches!(v.state.as_str(), "mounting" | "unmounting")
+}
+
 /// Mount or unmount every managed mount that is not already in that state, decided when the
 /// item is clicked rather than when the menu was drawn.
-fn bulk(label: &str, mount: bool) -> MenuItem<TrayModel> {
+fn bulk(label: &str, mount: bool, enabled: bool) -> MenuItem<TrayModel> {
     StandardItem {
         label: escape(label),
+        enabled,
         activate: Box::new(move |m: &mut TrayModel| {
             let names: Vec<String> = m
                 .mounts()
-                .filter(|v| v.managed && v.live != mount)
+                .filter(|v| v.managed && settled(v) && v.live != mount)
                 .map(|v| v.name.clone())
                 .collect();
             for name in names {
@@ -351,6 +404,33 @@ fn disabled_action(label: &str) -> MenuItem<TrayModel> {
     .into()
 }
 
+/// One row exactly, whatever it holds. For a list whose length has to stay fixed.
+fn one_row(label: impl Into<String>) -> MenuItem<TrayModel> {
+    StandardItem {
+        label: escape(&clip(&label.into())),
+        enabled: false,
+        ..Default::default()
+    }
+    .into()
+}
+
+/// One row if there is something to say, and a placeholder if not.
+fn row_or_gap(label: Option<String>) -> MenuItem<TrayModel> {
+    match label {
+        Some(l) => one_row(l),
+        None => hidden(),
+    }
+}
+
+/// A row that holds a place in the layout without being drawn.
+fn hidden() -> MenuItem<TrayModel> {
+    StandardItem {
+        visible: false,
+        ..Default::default()
+    }
+    .into()
+}
+
 /// A submenu's label is one row that cannot be broken up, so it is cut instead.
 fn submenu(label: impl Into<String>, items: Vec<MenuItem<TrayModel>>) -> MenuItem<TrayModel> {
     SubMenu {
@@ -389,7 +469,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     /// Every label in the tree, submenus included. Separators have none and are skipped.
-    pub(super) fn labels(items: &[MenuItem<TrayModel>]) -> Vec<String> {
+    fn labels(items: &[MenuItem<TrayModel>]) -> Vec<String> {
         let mut out = Vec::new();
         walk(items, &mut |item| match item {
             MenuItem::Standard(s) => out.push(s.label.clone()),
@@ -399,7 +479,7 @@ mod tests {
         out
     }
 
-    pub(super) fn walk(items: &[MenuItem<TrayModel>], f: &mut impl FnMut(&MenuItem<TrayModel>)) {
+    fn walk(items: &[MenuItem<TrayModel>], f: &mut impl FnMut(&MenuItem<TrayModel>)) {
         for item in items {
             f(item);
             if let MenuItem::SubMenu(s) = item {
@@ -428,11 +508,7 @@ mod tests {
     }
 
     /// Click the item with this label, and return what the tray was asked to do.
-    pub(super) fn click(
-        m: &mut TrayModel,
-        rx: &mut UnboundedReceiver<Action>,
-        label: &str,
-    ) -> Vec<Action> {
+    fn click(m: &mut TrayModel, rx: &mut UnboundedReceiver<Action>, label: &str) -> Vec<Action> {
         let items = build(m);
         let mut fired = false;
         walk(&items, &mut |i| {
@@ -452,7 +528,7 @@ mod tests {
         actions
     }
 
-    pub(super) fn says(items: &[MenuItem<TrayModel>], needle: &str) -> bool {
+    fn says(items: &[MenuItem<TrayModel>], needle: &str) -> bool {
         labels(items).iter().any(|l| l.contains(needle))
     }
 
@@ -654,20 +730,14 @@ mod tests {
     }
 
     #[test]
-    fn a_bulk_item_appears_only_when_there_is_something_for_it_to_do() {
+    fn a_bulk_item_is_usable_only_when_there_is_something_for_it_to_do() {
+        // Present either way: an item coming and going is a layout change, and the panel
+        // throws away every menu id when the layout changes.
         let (all_up, _a) = connected(vec![mount("photos", "mounted")], vec![]);
-        let l = labels(&build(&all_up));
-        assert!(l.contains(&"Unmount all".to_string()));
-        assert!(!l.contains(&"Mount all".to_string()));
+        let items = build(&all_up);
+        assert!(item(&items, "Unmount all").enabled);
+        assert!(!item(&items, "Mount all").enabled);
     }
-}
-
-#[cfg(test)]
-mod round_one {
-    use super::tests::{labels, says};
-    use super::*;
-    use crate::fixtures::{connected, idle_transfer, mount, pending};
-    use crate::link::LinkError;
 
     #[test]
     fn the_per_mount_line_carries_the_same_qualifier_as_the_summary() {
@@ -748,14 +818,6 @@ mod round_one {
         assert!(says(&items, "unknown"), "{:?}", labels(&items));
         assert!(!says(&items, "All synced"), "{:?}", labels(&items));
     }
-}
-
-#[cfg(test)]
-mod round_two {
-    use super::tests::labels;
-    use super::*;
-    use crate::fixtures::{connected, idle_transfer, mount};
-    use crate::link::LinkError;
 
     /// A paragraph of the shape the service actually produces: rclone's stderr, or its busy
     /// refusal, which carries the mount point twice and so has a long unbreakable run in it.
@@ -825,14 +887,6 @@ mod round_two {
             "a reason shown in part must say so: {all:?}"
         );
     }
-}
-
-#[cfg(test)]
-mod round_three {
-    use super::tests::{click, labels, walk};
-    use super::*;
-    use crate::fixtures::{connected, idle_transfer, mount, pending};
-    use tokio::sync::mpsc::UnboundedReceiver;
 
     /// Click an item in a menu drawn earlier, which is what a panel holding a click does.
     fn click_stale(
@@ -914,6 +968,161 @@ mod round_three {
         assert!(
             all.iter().any(|l| l.contains("and possibly more")),
             "{all:?}"
+        );
+    }
+
+    /// Every state name the service's own vocabulary contains.
+    const EVERY_STATE: [&str; 7] = [
+        "unmounted",
+        "mounting",
+        "mounted",
+        "unmounting",
+        "failed",
+        "foreign",
+        "orphaned",
+    ];
+
+    #[test]
+    fn a_mount_on_its_way_somewhere_is_not_asked_to_go_there_again() {
+        // Both transitional states are `live == false`, so a toggle derived from that alone
+        // offers "Mount" to a mount that is already mounting, and — worse — offers "Mount
+        // all" to a set of mounts that are in the middle of coming down.
+        for busy in ["mounting", "unmounting"] {
+            let (mut m, mut rx) = connected(vec![mount("photos", busy)], vec![]);
+            let items = build(&m);
+            for offered in ["Mount", "Unmount", "Mount all", "Unmount all"] {
+                assert!(!item(&items, offered).enabled, "{busy}: {offered}");
+                // Disabling is a request to the panel, not a guarantee, so the callbacks
+                // have to refuse as well.
+                assert_eq!(click(&mut m, &mut rx, offered), [], "{busy}: {offered}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_click_does_what_its_own_label_says_and_not_the_other_thing() {
+        // `ksni` replaces every callback on each update and dispatches by index, so the two
+        // items have to mean one thing each. A single item that swapped verbs would run the
+        // opposite of what the panel drew whenever the mount moved in between.
+        let (mut m, mut rx) = connected(vec![mount("photos", "unmounted")], vec![]);
+        assert_eq!(click(&mut m, &mut rx, "Unmount"), [], "already down");
+        assert_eq!(
+            click(&mut m, &mut rx, "Mount"),
+            [Action::Mount("photos".into())]
+        );
+
+        m.upsert_mount(mount("photos", "mounted"));
+        assert_eq!(click(&mut m, &mut rx, "Mount"), [], "already up");
+        assert_eq!(
+            click(&mut m, &mut rx, "Unmount"),
+            [Action::Unmount("photos".into())]
+        );
+    }
+
+    #[test]
+    fn a_mounts_row_keeps_its_shape_as_the_mount_comes_and_goes() {
+        // `ksni` invalidates every menu id when a node's child count changes, so a row that
+        // reshaped as its mount toggled would throw away the click the panel already sent.
+        let counts: Vec<usize> = ["unmounted", "mounting", "mounted", "unmounting"]
+            .iter()
+            .map(|state| {
+                let (m, _rx) =
+                    connected(vec![mount("photos", state)], vec![idle_transfer("photos")]);
+                submenu_rows(&build(&m), "photos")
+            })
+            .collect();
+        assert!(
+            counts.windows(2).all(|w| w[0] == w[1]),
+            "the row changes shape as the mount moves: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn the_file_list_keeps_its_shape_as_the_queue_drains() {
+        let counts: Vec<usize> = [0usize, 1, FILE_CAP, FILE_CAP + 5]
+            .iter()
+            .map(|n| {
+                let mut t = idle_transfer("photos");
+                pending(&mut t, *n as u64, 1024 * *n as u64, 0);
+                t.files = (0..*n)
+                    .map(|i| rvt_core::ipc::TransferFileView {
+                        name: format!("clip{i}.mp4"),
+                        size: Some(1024),
+                        in_flight: Some(false),
+                        tries: Some(1),
+                        bytes_sent: None,
+                    })
+                    .collect();
+                let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+                submenu_rows(&build(&m), "photos")
+            })
+            .collect();
+        assert!(
+            counts.windows(2).all(|w| w[0] == w[1]),
+            "the menu reshapes as the queue drains: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn every_state_the_service_can_publish_gets_a_menu() {
+        for state in EVERY_STATE {
+            let (m, _rx) = connected(vec![mount("photos", state)], vec![idle_transfer("photos")]);
+            let l = labels(&build(&m));
+            assert!(
+                l.iter().any(|row| row.contains(state)),
+                "{state} is not named anywhere: {l:?}"
+            );
+        }
+    }
+
+    /// Items in one mount's submenu, hidden ones included: what `ksni` counts when deciding
+    /// whether the layout changed, and so whether every menu id is thrown away.
+    fn submenu_rows(items: &[MenuItem<TrayModel>], name: &str) -> usize {
+        let mut n = None;
+        walk(items, &mut |i| {
+            if let MenuItem::SubMenu(s) = i {
+                if s.label.starts_with(name) {
+                    n = Some(s.submenu.len());
+                }
+            }
+        });
+        n.unwrap_or_else(|| panic!("no submenu for {name:?}"))
+    }
+
+    #[test]
+    fn the_whole_menu_keeps_its_shape_while_an_upload_runs() {
+        // The summary block used to gain and lose rows with every poll: a rate that comes and
+        // goes, a total that empties. Each of those threw away every menu id.
+        let shapes: Vec<usize> = [
+            (0u64, None),
+            (3, Some(4 * 1024 * 1024)),
+            (3, None),
+            (1, Some(1024)),
+            (0, None),
+        ]
+        .iter()
+        .map(|(files, rate)| {
+            let mut t = idle_transfer("photos");
+            pending(&mut t, *files, 1024 * *files, 0);
+            t.rate_bytes_per_sec = *rate;
+            t.files = (0..*files)
+                .map(|i| rvt_core::ipc::TransferFileView {
+                    name: format!("clip{i}.mp4"),
+                    size: Some(1024),
+                    in_flight: Some(i == 0),
+                    tries: Some(1),
+                    bytes_sent: None,
+                })
+                .collect();
+            let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+            let mut n = 0;
+            walk(&build(&m), &mut |_| n += 1);
+            n
+        })
+        .collect();
+        assert!(
+            shapes.windows(2).all(|w| w[0] == w[1]),
+            "the menu reshapes as an upload progresses: {shapes:?}"
         );
     }
 }

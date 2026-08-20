@@ -2,13 +2,13 @@
 
 A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mountain Duck.
 
-> **Status: early development — not usable yet.** There is no tray icon and no window, so
-> nothing yet asks for anything on your behalf. The service itself now works: it finds
-> rclone, reads your configuration, stays running, keeps track of every mount it can see —
-> and of what each one it started still has to upload — and mounts or unmounts on request.
-> Two things are still
-> missing before that is any use to you — a front end to ask it, and bringing your mounts up
-> by itself when it starts. Follow the
+> **Status: early development — no graphical front end yet.** There is no tray icon and no
+> window. The service works: it finds rclone, reads your configuration, stays running, keeps
+> track of every mount it can see — and of what each one it started still has to upload — and
+> mounts or unmounts on request. And there is now a command-line client to ask it, so from a
+> terminal or a script it is usable today; over SSH it is the whole interface. Two things are
+> still missing before it is comfortable on a desktop — the tray icon and window, and bringing
+> your mounts up by itself when it starts. Follow the
 > [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1) for progress.
 
 ## What it will do
@@ -116,24 +116,30 @@ including any rclone mount already running that this project did not start — a
 and unmount on request. It does **not** bring anything up on its own yet, so a fresh setup
 starts with all of your mounts unmounted.
 
-Asking it for something means a tray icon or a window, and neither is built. Until then the
-only way is by hand:
+There is no tray icon or window yet, but the `rclone-vfsmount-tray` binary is also a
+command-line client for the service — the way to drive it from a terminal, a script, or over
+SSH:
 
 ```sh
-busctl --user --timeout=120 call io.github.stuckj.RcloneVfsmountTray \
-  /io/github/stuckj/RcloneVfsmountTray \
-  io.github.stuckj.RcloneVfsmountTray1 Mount s photos
+rclone-vfsmount-tray list                # every mount and its state
+rclone-vfsmount-tray mount photos        # returns once it is actually serving
+rclone-vfsmount-tray unmount photos      # refused while the mount is in use, unless --force
+rclone-vfsmount-tray status --json       # machine-readable state and outstanding uploads
 ```
 
-The call does not come back until the mount is actually serving, which for a cold remote can
-take most of a minute. `busctl` gives up after 25 seconds unless you raise `--timeout`, and
-then reports a failure for a mount that is still on its way up.
+`mount` does not come back until the mount is serving, which for a cold remote can take most
+of a minute — the client waits rather than reporting a failure for one still on its way up. If
+the service is not running the client says so and how to start it; it never starts the service
+itself, and never reports "no mounts" when it simply could not reach it. See
+[docs/CLI.md](docs/CLI.md) for every subcommand, the exit codes, and the `status --json`
+schema.
 
-Use `--config <path>` to point it at a different file, and `--log-level debug` for more
-detail. Stopping it leaves every mount exactly as it is.
+The service takes `--config <path>` to point it at a different file, and `--log-level debug`
+for more detail. Stopping it leaves every mount exactly as it is.
 
 ## Documentation
 
+- [docs/CLI.md](docs/CLI.md) — the command-line client: subcommands, exit codes, `status --json`
 - [DESIGN.md](DESIGN.md) — how the pieces fit together and why
 - [CONTRIBUTING.md](CONTRIBUTING.md) — building, testing and submitting changes
 - [Roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1)

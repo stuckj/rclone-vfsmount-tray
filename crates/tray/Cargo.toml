@@ -15,12 +15,12 @@ path = "src/main.rs"
 # Pure Rust — ksni 0.3 speaks StatusNotifierItem over zbus, so this links no system
 # C libraries and stays cheap. It runs all day in a panel; keep it that way.
 #
-# NOTE: most of these are not referenced by the stub in src/main.rs yet. They are
-# declared deliberately, not by accident: they are what the tier-1 CI job actually
-# compiles, so if any of them ever starts pulling in a system C library, CI breaks on
-# a bare runner and we find out immediately. Do not prune them as "unused" — that
-# disarms the tripwire. They are all used by the issues that fill this crate in
-# (#25, #26, #52).
+# The CLI client uses most of these. `ksni` and `anyhow` are not referenced yet: they are
+# declared ahead of the tray GUI that fills this crate in (#25, #26), deliberately, not by
+# accident. They are what the tier-1 CI job compiles, so if either ever starts pulling in a
+# system C library — `ksni` speaks StatusNotifierItem and is the one to watch — CI breaks on
+# a bare runner and we find out immediately. Do not prune them as "unused"; that disarms the
+# tripwire.
 [dependencies]
 rvt-core = { path = "../core" }
 ksni = "0.3"

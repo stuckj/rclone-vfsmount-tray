@@ -1,0 +1,31 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH rclone-vfsmount-trayd 1  "rclone-vfsmount-trayd 0.1.0" 
+.SH NAME
+rclone\-vfsmount\-trayd \- Service that owns rclone VFS mounts and serves their state over D\-Bus
+.SH SYNOPSIS
+\fBrclone\-vfsmount\-trayd\fR [\fB\-\-config\fR] [\fB\-\-log\-level\fR] [\fB\-\-foreground\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] [\fIsubcommands\fR]
+.SH DESCRIPTION
+Service that owns rclone VFS mounts and serves their state over D\-Bus
+.SH OPTIONS
+.TP
+\fB\-\-config\fR \fI<PATH>\fR
+Path to the configuration file. Defaults to `$XDG_CONFIG_HOME/rclone\-vfsmount\-tray/config.toml`
+.TP
+\fB\-\-log\-level\fR \fI<LEVEL>\fR
+Log verbosity. Takes precedence over `RUST_LOG`; defaults to `info`
+.TP
+\fB\-\-foreground\fR
+Accepted and ignored. It will mean "stay in the foreground and log to stderr" once there is a background mode to opt out of; today that is all the service does
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+rclone\-vfsmount\-trayd\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.1.0

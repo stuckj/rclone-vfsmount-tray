@@ -53,6 +53,11 @@ http-body-util = "0.1"
 # hand-written FFI signature in the security-critical path.
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+# Generate the committed man pages and shell completions from the same `clap` command the
+# binary parses with, so `tests/…cli_docs` can prove the two never drift. Dev-only: pulled
+# in by the two binaries' test builds, not by `cargo build`.
+clap_mangen = "0.2"
+clap_complete = "4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

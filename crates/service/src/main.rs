@@ -2,14 +2,17 @@
 //! stops rclone mounts, polls VFS state, serves D-Bus to the tray and GTK clients.
 //!
 //! Mounts outlive it — restarting the service leaves them up. See DESIGN.md.
-//!
-//! Scaffolding only; see #12, #17, #40.
 
+mod dbus;
 mod poller;
+mod registry;
 mod supervisor;
 mod systemd;
+mod watch;
 
 use clap::{Parser, Subcommand};
+use registry::Change;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -64,6 +67,16 @@ fn runtime_dir() -> anyhow::Result<std::path::PathBuf> {
     Ok(std::path::PathBuf::from(base).join("rclone-vfsmount-tray"))
 }
 
+/// Resolves on `SIGTERM` — what systemd sends — or on `Ctrl-C` when run by hand.
+async fn stop_requested() -> anyhow::Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = term.recv() => {}
+        result = tokio::signal::ctrl_c() => result?,
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
@@ -86,13 +99,14 @@ async fn main() -> anyhow::Result<()> {
         Some(p) => std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()),
         None => rvt_core::Config::default_path()?,
     };
-    let config = std::sync::Arc::new(rvt_core::Config::load(&config_path)?);
+    let config = Arc::new(rvt_core::Config::load(&config_path)?);
+    let runtime_dir = runtime_dir()?;
 
     if let Some(Command::PrepareMount { name }) = &args.command {
         // Runs while systemd waits on it, so it must not ask systemd anything.
         supervisor::prepare_for_start(
             &config,
-            &runtime_dir()?,
+            &runtime_dir,
             std::path::Path::new("/proc/self/mountinfo"),
             name,
         )
@@ -105,50 +119,74 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %rclone.path().display(), version = %rclone.version(), "found rclone");
 
     let units = systemd::dbus::SystemdUnits::connect().await?;
-    let sup = supervisor::SystemdSupervisor::new(
+    let sup = Arc::new(supervisor::SystemdSupervisor::new(
         config.clone(),
         rclone.path().to_path_buf(),
         units,
-        runtime_dir()?,
+        runtime_dir.clone(),
         config_path.clone(),
+    ));
+
+    let registry = Arc::new(tokio::sync::Mutex::new(registry::Registry::default()));
+    let nudge = Arc::new(watch::Nudge::default());
+
+    let mut watcher = watch::Watcher::new(
+        sup.clone(),
+        registry.clone(),
+        config.clone(),
+        runtime_dir,
+        nudge.clone(),
     );
 
-    // Reconcile before doing anything else. The service may have restarted while its
-    // mounts stayed up, and a mount somebody else started is still worth reporting.
-    let found = rvt_core::supervisor::MountSupervisor::reconcile(&sup).await?;
-    for m in &found {
-        tracing::info!(name = %m.name, state = ?m.state, "found mount");
+    // Swept before the name goes up, and the changes dropped because nobody can be
+    // listening yet. A client that connected first would find an empty list and no way to
+    // tell it from "no mounts configured". A client that cannot connect at all has to cope
+    // with that anyway (#52), so the wait is the honest place to spend it — and it is a
+    // wait: a mount point that has wedged makes this tens of seconds (#103).
+    let (found, _) = watcher.tick().await;
+    for change in &found {
+        report(change);
     }
 
-    // One poll per mount we started, so the tier and what is outstanding are visible in
-    // the log before there is anywhere to publish them. The loop that keeps this current,
-    // and the D-Bus surface that serves it, are #40.
-    //
-    // `Mounted` rather than `is_live()`, which also admits `Foreign` and `Orphaned`. We
-    // did not start a foreign mount, so none of our rc sockets addresses it and its own is
-    // unknown by definition; reaching it at all is #70. An orphan does still answer on the
-    // socket it was started with, but the config no longer describes it, so there is
-    // nothing here to report it against.
-    for m in found
-        .iter()
-        .filter(|m| matches!(m.state, rvt_core::supervisor::MountState::Mounted))
-    {
-        let socket = sup.socket_path(&m.name);
-        let mut p = poller::MountPoller::connect(&m.name, rvt_core::RcClient::new(&socket)).await;
-        tracing::debug!(mount = %m.name, tier = ?p.tier(), "resolved capability tier");
-        let state = p.poll().await;
-        tracing::info!(
-            mount = %state.mount,
-            tier = ?state.fidelity,
-            outstanding_known = state.outstanding_known,
-            pending_files = state.pending.files,
-            pending_bytes = state.pending.known_bytes,
-            degraded = ?state.degraded_reason,
-            next_poll_secs = poller::MountPoller::interval(&state).as_secs(),
-            "polled"
-        );
+    let conn = dbus::serve(dbus::MountManager::new(
+        sup,
+        registry,
+        config,
+        nudge,
+        rclone.version().to_string(),
+    ))
+    .await?;
+    tracing::info!(name = rvt_core::ipc::BUS_NAME, "serving");
+
+    let emitter = zbus::object_server::SignalEmitter::new(&conn, rvt_core::ipc::OBJECT_PATH)?;
+
+    tokio::select! {
+        _ = watcher.run(emitter, report) => {}
+        result = stop_requested() => result?,
     }
 
-    tracing::warn!("serving is not implemented yet — see issue #40");
+    // Nothing is unmounted on the way out. See DESIGN.md, "The lifetime rule".
+    tracing::info!("stopping; mounts are left as they are");
     Ok(())
+}
+
+/// What each change is worth in the journal.
+///
+/// Transfers move constantly and would drown everything else, so only the mount set is
+/// reported at `info`.
+fn report(change: &Change) {
+    match change {
+        Change::Mount(view) => {
+            tracing::info!(mount = %view.name, state = %view.state, "mount state")
+        }
+        Change::Removed(name) => tracing::info!(mount = %name, "no longer listed"),
+        Change::CapabilityTier => tracing::info!("capability tier resolved"),
+        Change::Transfer(view) => tracing::debug!(
+            mount = %view.mount,
+            fidelity = ?view.fidelity,
+            pending_files = view.pending_files,
+            pending_bytes = view.pending_known_bytes,
+            "outstanding"
+        ),
+    }
 }

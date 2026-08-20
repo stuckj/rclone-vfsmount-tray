@@ -40,8 +40,11 @@ To run the service against your own config while developing:
 cargo run -p rclone-vfsmount-trayd -- --log-level debug
 ```
 
-It reconciles, logs, and exits; it does not mount anything or stay up. `--foreground` is
-accepted but does nothing yet — there is no background mode for it to opt out of.
+It reconciles, takes `io.github.stuckj.RcloneVfsmountTray` on the session bus and stays up
+serving it. It mounts nothing on its own — `auto_mount` is not acted on yet (#98) — so it
+waits to be asked. If a service is already running it exits saying the name is taken, so
+stop that one first. `--foreground` is accepted but does nothing yet: there is no background
+mode for it to opt out of.
 
 ## Before opening a pull request
 

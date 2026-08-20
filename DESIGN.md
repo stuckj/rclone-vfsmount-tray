@@ -79,6 +79,16 @@ it is one of two equal front-ends. Clients never write the configuration file ei
 goes through the service (#16), so one authority validates a change and one authority
 announces it.
 
+**The contract between them belongs to `rvt-core`, not to the service** (#40). One description
+that the service implements and every client is built from, so a payload changed on one side
+alone fails to compile rather than to decode. Two consequences are deliberate. It is versioned
+from the outset, because a client and a service are separately installable and will not always
+match (#52); and a client one release behind must lose a *field* rather than the connection,
+which rules out any payload whose shape has to be agreed exactly. Freshness is the service's
+job, not the clients': it publishes what changed, and a client keeps a model rather than asking
+again. Otherwise every front-end would poll on its own schedule and each would show a different
+answer.
+
 **Only `crates/gtk` may link a system C library.** That boundary is load-bearing and enforced
 from the start: the other four lint and test on a bare runner with no `apt-get` step, which is
 what keeps the common path fast. `crates/gtk` is excluded from the workspace `default-members`
@@ -347,14 +357,28 @@ reason this interface is a boundary at all. Everything here is scoped to that:
   rclone as verbatim argv, so a user can put a credential flag in a mount, and mount
   configuration crosses this interface in both directions once clients can edit it (#16,
   #42). The surface has to treat that field as secret-bearing — redacted or gated — rather
-  than assume nothing here can be a secret.
+  than assume nothing here can be a secret. It is gated for now, by not publishing mount
+  configuration at all: a client is told a mount's name, state, point and `remote:path`, and
+  the choice between redacting and gating falls due when editing lands. **Gating the field
+  is not enough on its own**, because rclone echoes its own argv when asked to log at debug
+  level, and a failed mount's reason is rclone's output — so the line it echoes on does not
+  cross at all. Which is the narrower claim: the reason is rclone's, and rclone can be told
+  to log a great deal that this does not know to remove.
 - **Safety checks live service-side**, so a client cannot skip one by leaving a parameter out.
   A forced unmount is destructive, and `force` is explicit and defaults to off — a guard
   against accident and bugs, not against malice.
-- Closing the malice case needs an authorization decision the bus cannot make for us: a polkit
-  action for forced unmount, or accepting the risk on the grounds that a sandboxed app able to
-  destroy unuploaded data is a narrow threat. **This is deliberately left open** and must be
-  settled when the interface is implemented rather than discovered afterwards.
+- Closing the malice case needs an authorization decision the bus cannot make for us. **It is
+  settled as: accept the risk, no polkit** (#40). Not because there is nothing to authorise —
+  a sandboxed app that cannot reach the mount point can still ask this service to unmount it,
+  which is a confused deputy and exactly polkit's shape. It is that polkit cannot tell that
+  caller from the tray: a policy decides on the action and the user, and a sandboxed app is
+  the same user, so every process of theirs gets the same answer. The prompt would land on
+  every forced unmount including the ordinary ones and be trained away within a week. It also costs a
+  system-wide policy file, which a per-user install cannot place, so the applet would behave
+  differently by install path. What remains is an explicit `force` defaulting to off, and a
+  logged line naming the caller's connection. If this is revisited, the mechanism that would
+  actually tell a sandboxed caller apart is peer-credential inspection, as the desktop
+  portals do it — not polkit.
 
 One further surface to keep in mind: the on-disk cache scanner walks a path taken from an rc
 response, so it must treat that path as untrusted input and refuse to follow it outside the

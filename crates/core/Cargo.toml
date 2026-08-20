@@ -1,6 +1,6 @@
 [package]
 name = "rvt-core"
-description = "Core logic for rclone-vfsmount-tray: rc API models and mount supervision"
+description = "Core logic for rclone-vfsmount-tray: rc API models, mount supervision and the D-Bus contract"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,6 +26,9 @@ hyper = { workspace = true }
 hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 libc = { workspace = true }
+# The D-Bus contract lives here so the service and both clients are built from one
+# description of it rather than three that have to agree. Pure Rust; it links nothing.
+zbus = { workspace = true }
 
 [dev-dependencies]
 rvt-testutil = { path = "../testutil" }

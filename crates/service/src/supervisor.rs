@@ -684,10 +684,16 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     async fn failure_reason(&self, unit: &str) -> String {
         let out = self.units.recent_output(unit).await;
         if out.is_empty() {
-            format!("rclone logged nothing; check `journalctl --user -u {unit}`")
-        } else {
-            out
+            return format!("rclone logged nothing; check `journalctl --user -u {unit}`");
         }
+        let extra_args = self
+            .config
+            .mounts
+            .iter()
+            .find(|m| m.unit_name() == unit)
+            .map(|m| m.extra_args.as_slice())
+            .unwrap_or_default();
+        redact_extra_args(&out, extra_args)
     }
 
     /// Create the runtime directory private to this user.
@@ -1222,10 +1228,12 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             let mut out = Vec::new();
 
             for m in &self.config.mounts {
-                out.push(DiscoveredMount::new(
-                    &m.name,
-                    self.resolve(m, &orphans).await?,
-                ));
+                // The configured spelling rather than the canonicalised one: it is what
+                // the user wrote and what they will recognise in a client.
+                out.push(
+                    DiscoveredMount::new(&m.name, self.resolve(m, &orphans).await?)
+                        .at(m.mount_point.clone()),
+                );
             }
 
             // Canonicalised, exactly as `resolve` compares them: matching the raw path
@@ -1238,19 +1246,22 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
             // the sweep below, or the point would appear twice — theirs, then ours.
             for o in orphans {
                 let named = self.config.mounts.iter().any(|m| m.unit_name() == o.unit);
-                claimed.push(o.point);
+                claimed.push(o.point.clone());
                 // A moved entry's unit is still named by the config and `resolve` has
                 // reported it under that name. A second row would put two states on one
                 // name, which is what a client keys on.
                 if !named {
-                    out.push(DiscoveredMount::new(o.name, MountState::Orphaned));
+                    out.push(DiscoveredMount::new(o.name, MountState::Orphaned).at(o.point));
                 }
             }
             for e in live.iter().filter(|e| e.is_rclone()) {
                 if claimed.contains(&e.mount_point) {
                     continue;
                 }
-                out.push(DiscoveredMount::new(foreign_name(e), MountState::Foreign));
+                out.push(
+                    DiscoveredMount::new(foreign_name(e), MountState::Foreign)
+                        .at(e.mount_point.clone()),
+                );
             }
             Ok(out)
         })
@@ -1262,8 +1273,57 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
 /// This service's runtime directory joined with the shared socket file name. The client
 /// resolves the same name against `XDG_RUNTIME_DIR`; `RcClient::socket_file_name` is the
 /// single definition both use, and explains why the name is escaped rather than folded.
-fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
+pub(crate) fn rc_socket_path(runtime_dir: &Path, name: &str) -> PathBuf {
     runtime_dir.join(rvt_core::RcClient::socket_file_name(name))
+}
+
+/// What replaces an `extra_args` entry found in rclone's output.
+const REDACTED: &str = "<redacted>";
+
+/// rclone's own words for the line that opens its log with its whole command line.
+///
+/// Present in both of its log formats — plain and `--use-json-log` — and unescaped in
+/// both, which is what lets one rule cover them. Measured against rclone 1.75.0.
+const ARGV_ECHO: &str = "starting with parameters";
+
+/// What stands in for that line.
+const ARGV_WITHHELD: &str = "[rclone's command line withheld]";
+
+/// Take rclone's own command line, and a mount's `extra_args`, out of its log.
+///
+/// This text becomes a mount's failure reason, which crosses D-Bus. `extra_args` reaches
+/// rclone as verbatim argv, so a credential flag put there is one rclone echoes at debug
+/// level, in the line [`ARGV_ECHO`] names. Measured against rclone 1.75.0, which does not
+/// log it at its default level.
+///
+/// **The whole line goes, always.** Two alternatives look right and are not. Redacting the
+/// value needs its spelling, and rclone spells one argument three ways — bare, quoted by
+/// Go's `%q`, and quoted then escaped again under `--use-json-log` — so such a rule fails
+/// silently on the one it does not know. Withholding only from mounts that currently set
+/// `extra_args` reads today's config to judge a line written by a past invocation, and the
+/// journal outlives the config.
+///
+/// The configured values are replaced wherever else they appear quoted, which catches an
+/// echo somewhere other than that line.
+///
+/// Not a guarantee that nothing sensitive crosses: the text is rclone's, and rclone can be
+/// told to log a great deal. See DESIGN.md, "D-Bus, and only for sandboxed callers".
+fn redact_extra_args(text: &str, extra_args: &[String]) -> String {
+    let args: Vec<&String> = extra_args.iter().filter(|a| !a.is_empty()).collect();
+
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.contains(ARGV_ECHO) {
+            out.push(ARGV_WITHHELD.to_string());
+        } else {
+            let mut line = line.to_string();
+            for arg in &args {
+                line = line.replace(&format!("{arg:?}"), &format!("{REDACTED:?}"));
+            }
+            out.push(line);
+        }
+    }
+    out.join("\n")
 }
 
 /// Clear what a hard-killed rclone leaves behind, so a start can succeed.
@@ -1377,6 +1437,9 @@ mod tests {
         /// what pins a mount is the holder's own descriptor, so killing rclone leaves it
         /// exactly as busy. Measured — see [`Release`].
         busy: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+        /// What the journal would hand back for a failed unit. `None` gives the ordinary
+        /// one-line failure the lifecycle tests expect.
+        output: Mutex<Option<String>>,
     }
 
     impl UnitManager for FakeUnits {
@@ -1436,7 +1499,13 @@ mod tests {
             })
         }
         fn recent_output<'a>(&'a self, _unit: &'a str) -> BoxFuture<'a, String> {
-            Box::pin(async { "rclone: couldn't connect: permission denied".to_string() })
+            Box::pin(async {
+                self.output
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "rclone: couldn't connect: permission denied".to_string())
+            })
         }
     }
 
@@ -3294,5 +3363,197 @@ mod tests {
         ] {
             assert_eq!(orphan_name(not_ours), None, "{not_ours}");
         }
+    }
+
+    /// A supervisor whose one mount carries `extra_args`, and whose journal says whatever
+    /// the test wants it to.
+    fn with_extra_args(
+        tag: &str,
+        extra_args: &[&str],
+        journal: &str,
+    ) -> SystemdSupervisor<FakeUnits> {
+        let scratch = Scratch::new(tag);
+        let mut mount = a_mount("backup", mount_point(&scratch));
+        mount.extra_args = extra_args.iter().map(|s| s.to_string()).collect();
+        let mut config = Config::default();
+        config.mounts.push(mount);
+
+        let units = FakeUnits::default();
+        *units.output.lock().unwrap() = Some(journal.to_string());
+        SystemdSupervisor::new(
+            Arc::new(config),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            scratch.join("run"),
+            PathBuf::from("/nonexistent/config.toml"),
+        )
+    }
+
+    /// A real `journalctl` tail for a failed mount, captured from rclone 1.75.0 started
+    /// with the argv `Mount::mount_args` composes plus an `extra_args` carrying a secret.
+    /// The whole command line is in it, which is the point.
+    const REAL_ECHO: &str = concat!(
+        "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
+        "[\"/home/claude/.local/bin/rclone\" \"mount\" \"localfs:/src\" \"/mnt/photos\" ",
+        "\"--vfs-cache-mode\" \"writes\" \"--rc\" \"--rc-addr\" ",
+        "\"unix:///run/user/1001/rclone-vfsmount-tray/photos.sock\" \"--rc-no-auth\" ",
+        "\"-vv\" \"--drive-token\" \"SECRET-TOKEN-abc123\"]\n",
+        "ERROR+4: Fatal error: failed to mount FUSE fs: fusermount: exit status 1"
+    );
+
+    /// The same run under `--use-json-log`, where rclone escapes every quote a second
+    /// time. Also captured, because a rule that reads the plain spelling silently does
+    /// nothing here.
+    const REAL_ECHO_JSON: &str = concat!(
+        r#"{"time":"2026-08-18T20:09:50Z","level":"debug","msg":"Version \"v1.75.0\" "#,
+        r#"starting with parameters [\"/home/claude/.local/bin/rclone\" \"mount\" "#,
+        r#"\"localfs:/src\" \"/mnt/photos\" \"--rc-no-auth\" \"-vv\" "#,
+        r#"\"--use-json-log\" \"--drive-token\" \"SECRET-TOKEN-abc123\"]","source":"x"}"#,
+        "\n",
+        r#"{"level":"error","msg":"Fatal error: failed to mount FUSE fs"}"#
+    );
+
+    #[tokio::test]
+    async fn a_failure_reason_does_not_carry_a_secret_from_extra_args_onto_the_bus() {
+        // The reason reaches every session-bus peer as `MountView.Reason`, and
+        // `extra_args` is the one field of this project's config that can hold a
+        // credential. See DESIGN.md, "D-Bus, and only for sandboxed callers".
+        let sup = with_extra_args(
+            "reason-redacts",
+            &["-vv", "--drive-token", "SECRET-TOKEN-abc123"],
+            REAL_ECHO,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "a credential from extra_args reached the wire: {reason}"
+        );
+        assert!(
+            reason.contains("exit status 1"),
+            "the reason still has to say what went wrong: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_json_log_spelling_is_covered_too() {
+        // Under `--use-json-log` every quote is escaped again, so nothing matches the
+        // spelling the plain format uses. A rule keyed on that spelling does nothing here
+        // and says nothing about it, which is the wrong way round to fail.
+        let sup = with_extra_args(
+            "reason-json-log",
+            &[
+                "-vv",
+                "--use-json-log",
+                "--drive-token",
+                "SECRET-TOKEN-abc123",
+            ],
+            REAL_ECHO_JSON,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "the json spelling let a credential through: {reason}"
+        );
+        assert!(reason.contains("Fatal error"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_secret_the_config_no_longer_names_is_still_taken_out() {
+        // The running unit keeps the argv it was started with, and a mount survives both a
+        // config edit and a service restart. So by the time it fails, the config may name
+        // a rotated token — or none at all — while the journal still holds the old one.
+        let sup = with_extra_args(
+            "reason-rotated",
+            &["-vv", "--drive-token", "SECRET-THE-NEW-ONE"],
+            REAL_ECHO,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "a credential the config has since dropped still reached the bus: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_command_line_goes_even_once_the_config_has_stopped_naming_it() {
+        // The journal outlives the config. A user who finds a token in a failure reason
+        // and moves it out of `extra_args` then restarts the service — which does not
+        // unmount, and does not clear the journal — and a rule keyed on today's config
+        // would hand the old invocation's argv, token and all, to every peer on the bus.
+        let sup = with_extra_args("reason-config-emptied", &[], REAL_ECHO);
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "the config no longer names it, so nothing looked for it: {reason}"
+        );
+        assert!(
+            reason.contains("exit status 1"),
+            "the reason still has to say what went wrong: {reason}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_echoed_off_the_command_line_is_replaced_too() {
+        // The line drop covers the argv echo. This is the other half of the function: a
+        // value rclone quotes somewhere else entirely. Without a fixture that puts one
+        // there, that half could stop working and nothing would say so.
+        let journal = concat!(
+            "DEBUG : rclone: Version \"v1.75.0\" starting with parameters ",
+            "[\"/usr/bin/rclone\" \"mount\" \"backup:pictures\"]\n",
+            "ERROR+4: Failed to read token \"SECRET-TOKEN-abc123\": malformed"
+        );
+        let sup = with_extra_args(
+            "reason-echoed-elsewhere",
+            &["-vv", "--drive-token", "SECRET-TOKEN-abc123"],
+            journal,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            !reason.contains("SECRET-TOKEN-abc123"),
+            "a value quoted outside the argv echo crossed: {reason}"
+        );
+        assert!(reason.contains("malformed"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn redacting_leaves_rclones_own_words_alone() {
+        // `1` is an ordinary word as well as an argument, and rclone's own "exit status 1"
+        // must not come out as "exit status <redacted>" — which reads to a user as though
+        // a secret had been standing there.
+        let sup = with_extra_args(
+            "reason-ordinary-words",
+            &[
+                "-vv",
+                "--transfers",
+                "1",
+                "--drive-token",
+                "SECRET-TOKEN-abc123",
+            ],
+            REAL_ECHO,
+        );
+
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(
+            reason.contains("exit status 1"),
+            "rclone's own words were rewritten: {reason}"
+        );
+    }
+
+    #[test]
+    fn text_with_no_command_line_in_it_is_left_alone() {
+        let text = "CRITICAL: Failed to create file system";
+        assert_eq!(redact_extra_args(text, &[]), text);
+    }
+
+    #[tokio::test]
+    async fn a_journal_that_said_nothing_still_says_where_to_look() {
+        let sup = with_extra_args("reason-empty", &["--drive-token", "s3cret"], "");
+        let reason = sup.failure_reason("rvt-mount-backup.service").await;
+        assert!(reason.contains("journalctl"), "{reason}");
     }
 }

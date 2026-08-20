@@ -157,6 +157,12 @@ pub struct DiscoveredMount {
     /// Configured name, or a derived one for mounts we did not start.
     pub name: String,
     pub state: MountState,
+    /// Where it is mounted, or where the config puts it. `None` when the implementation
+    /// records no path for it.
+    ///
+    /// A client needs this to open the mount in a file manager, and to say anything
+    /// useful about a foreign one — whose name is only ever a rendering of this path.
+    pub mount_point: Option<std::path::PathBuf>,
 }
 
 impl DiscoveredMount {
@@ -164,7 +170,14 @@ impl DiscoveredMount {
         Self {
             name: name.into(),
             state,
+            mount_point: None,
         }
+    }
+
+    /// Record where this mount is, or is configured to be.
+    pub fn at(mut self, mount_point: impl Into<std::path::PathBuf>) -> Self {
+        self.mount_point = Some(mount_point.into());
+        self
     }
 }
 

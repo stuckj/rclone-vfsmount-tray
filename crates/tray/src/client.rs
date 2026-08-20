@@ -316,13 +316,17 @@ fn status_json(snap: &StatusSnapshot) -> String {
 }
 
 fn disconnected_json(e: &CliError) -> String {
+    // These are exactly the reasons documented in docs/CLI.md. `Refused` is folded into the
+    // generic bucket rather than given a name of its own: it cannot reach here — the only
+    // caller, `run_status`, reaches this on a failure to gather, and every call it makes is
+    // infallible service-side — so a distinct, undocumented reason string would only ever
+    // describe a state that does not occur.
     let reason = match e {
         CliError::NotRunning => "service not running",
         CliError::NoSessionBus(_) => "no session bus",
         CliError::Incompatible => "interface incompatible",
         CliError::TooOld { .. } => "service too old",
-        CliError::Transport(_) => "service unreachable",
-        CliError::Refused(_) => "request refused",
+        CliError::Transport(_) | CliError::Refused(_) => "service unreachable",
     };
     let mut doc = serde_json::json!({
         "connected": false,

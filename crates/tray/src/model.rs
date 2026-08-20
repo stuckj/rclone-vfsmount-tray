@@ -109,6 +109,9 @@ pub(crate) struct Notice {
 /// a figure that cannot be vouched for must not be presented as progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrayState {
+    /// The first attempt has not resolved. Distinct from [`Self::Disconnected`], which is an
+    /// answer; this is not having asked yet, and lasts milliseconds.
+    Connecting,
     /// The service is not reachable. Says nothing whatever about the mounts (#52).
     Disconnected,
     /// A mount failed, uploads errored, or the cache is full. The user has to act.
@@ -128,6 +131,7 @@ impl TrayState {
     /// this project installing artwork first. Bespoke symbolic icons are #29.
     pub(crate) fn icon_name(self) -> &'static str {
         match self {
+            TrayState::Connecting => "image-loading",
             TrayState::Disconnected => "network-error",
             TrayState::Attention => "dialog-warning",
             // The state is not wrong, it is unreadable — which is what a question mark says.
@@ -149,6 +153,7 @@ impl TrayState {
     /// The first line of the tooltip.
     pub(crate) fn label(self) -> &'static str {
         match self {
+            TrayState::Connecting => "Connecting…",
             TrayState::Disconnected => "Service unreachable",
             TrayState::Attention => "Needs attention",
             TrayState::Degraded => "State partly unknown",
@@ -268,8 +273,10 @@ impl TrayModel {
 
     /// What the icon should say.
     pub(crate) fn state(&self) -> TrayState {
-        if !matches!(self.link, Link::Up(_)) {
-            return TrayState::Disconnected;
+        match self.link {
+            Link::Connecting => return TrayState::Connecting,
+            Link::Down(_) => return TrayState::Disconnected,
+            Link::Up(_) => {}
         }
         let s = self.summary();
         if s.failed > 0 || s.errored > 0 || s.out_of_space {
@@ -346,7 +353,10 @@ impl TrayModel {
             }
         }
         s.rate = rate;
-        s.remaining = remaining;
+        // A mount nothing could be read from is not a mount with nothing to send. Poisoning
+        // here as well as per-mount above catches the two that never reach that branch: one
+        // with no reading at all, and a blind one whose count happens to be zero.
+        s.remaining = remaining.filter(|_| s.unobservable == 0);
         s
     }
 }
@@ -470,6 +480,25 @@ pub(crate) fn human_bytes(n: u64) -> String {
     )
 }
 
+/// `s` in pieces of at most `width` characters, or whole when it already fits.
+fn split_to_width(s: &str, width: usize) -> Vec<String> {
+    if s.chars().count() <= width {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut piece = String::new();
+    for c in s.chars() {
+        if piece.chars().count() == width {
+            out.push(std::mem::take(&mut piece));
+        }
+        piece.push(c);
+    }
+    if !piece.is_empty() {
+        out.push(piece);
+    }
+    out
+}
+
 /// How long is left, at the resolution someone waiting actually cares about.
 ///
 /// The hedging is part of the phrase rather than added by the caller: the estimate comes
@@ -500,15 +529,21 @@ pub(crate) fn eta_phrase(secs: u64) -> String {
 pub(crate) fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     // Characters, not bytes. A mount point with an accented letter in it would otherwise
     // wrap short of the width, and the service's own sentences carry em dashes.
+    let width = width.max(1);
     let fits = |line: &str, word: &str| line.chars().count() + 1 + word.chars().count() <= width;
     let mut lines: Vec<String> = Vec::new();
     for word in text.split_whitespace() {
-        match lines.last_mut() {
-            Some(line) if fits(line, word) => {
-                line.push(' ');
-                line.push_str(word);
+        // A word wider than the row still has to be broken. The sentence this exists for is
+        // the service's busy refusal, which carries the mount point twice — and a path is
+        // the one part of it with no spaces to break at.
+        for piece in split_to_width(word, width) {
+            match lines.last_mut() {
+                Some(line) if fits(line, &piece) => {
+                    line.push(' ');
+                    line.push_str(&piece);
+                }
+                _ => lines.push(piece),
             }
-            _ => lines.push(word.to_string()),
         }
     }
     if lines.len() > max_lines {
@@ -561,13 +596,12 @@ mod tests {
     }
 
     #[test]
-    fn without_a_link_the_state_is_disconnected_whatever_was_last_seen() {
+    fn the_state_is_never_up_without_a_link_and_says_which_kind_of_not() {
+        // Not having asked yet is not the same as having asked and been refused: a tray that
+        // says "Service unreachable" for the millisecond before it has looked is wrong every
+        // time it starts.
         let (mut m, _rx) = blank();
-        assert_eq!(
-            m.state(),
-            TrayState::Disconnected,
-            "before the first attempt"
-        );
+        assert_eq!(m.state(), TrayState::Connecting, "before the first attempt");
         m.go_up(service(), vec![mount("photos", "mounted")]);
         m.upsert_transfer(&idle_transfer("photos"));
         assert_eq!(m.state(), TrayState::Idle);
@@ -1006,5 +1040,72 @@ mod round_one {
             d.headline
         );
         assert!(d.headline.contains("connection reset"));
+    }
+}
+
+#[cfg(test)]
+mod round_two {
+    use super::*;
+    use crate::fixtures::{connected, idle_transfer, mount, pending};
+
+    #[test]
+    fn no_estimate_is_offered_while_any_mount_cannot_be_read() {
+        // A mount nothing could be read from is not a mount with nothing left to send, so
+        // timing the ones that answered says the whole job finishes when they do. The icon
+        // already says "State partly unknown" here; a countdown beside it contradicts it.
+        let mut busy = idle_transfer("photos");
+        pending(&mut busy, 1, 100 * 1024 * 1024, 0);
+        busy.rate_bytes_per_sec = Some(4 * 1024 * 1024);
+
+        let (m, _rx) = connected(
+            vec![mount("photos", "mounted"), mount("elsewhere", "foreign")],
+            vec![busy],
+        );
+        let s = m.summary();
+        assert_eq!(m.state(), TrayState::Degraded);
+        assert_eq!(s.remaining, None);
+        let line = s.rate_line().expect("the rate is still known");
+        assert!(!line.contains("left"), "{line}");
+    }
+
+    #[test]
+    fn a_blind_mount_with_nothing_counted_still_stops_the_estimate() {
+        // The other way in: this one answered, said zero, and said it could not vouch for
+        // the zero — so it never reaches the per-mount check, which only runs on a mount
+        // with something pending.
+        let mut busy = idle_transfer("photos");
+        pending(&mut busy, 1, 100 * 1024 * 1024, 0);
+        busy.rate_bytes_per_sec = Some(4 * 1024 * 1024);
+        let mut blind = idle_transfer("docs");
+        blind.outstanding_known = false;
+
+        let s = connected(
+            vec![mount("photos", "mounted"), mount("docs", "mounted")],
+            vec![busy, blind],
+        )
+        .0
+        .summary();
+        assert_eq!(s.remaining, None);
+    }
+
+    #[test]
+    fn a_word_with_no_spaces_is_broken_rather_than_left_to_overhang() {
+        // The sentence this exists for embeds a mount point, and a path is the one part of
+        // it with nowhere to break.
+        let path = "/home/someone/mnt/a-very-long-directory-name/photos";
+        let lines = wrap(&format!("busy: {path}"), 20, 8);
+        assert!(lines.iter().all(|l| l.chars().count() <= 20), "{lines:?}");
+        assert!(lines.len() > 1);
+        assert_eq!(
+            lines.join("").replace(' ', ""),
+            format!("busy:{path}").replace(' ', ""),
+            "breaking a word must not lose any of it"
+        );
+    }
+
+    #[test]
+    fn a_width_of_zero_does_not_spin() {
+        // Nothing passes this today; the loop that breaks a long word would not terminate.
+        assert!(!wrap("something", 0, 4).is_empty());
     }
 }

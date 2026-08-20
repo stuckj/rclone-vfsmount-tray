@@ -75,7 +75,15 @@ async fn link(
     let mut backoff = Backoff::new();
     loop {
         let conn = match zbus::Connection::session().await {
-            Ok(c) => c,
+            Ok(mut c) => {
+                // The signal streams and the method calls share this connection's reader. A
+                // reply cannot arrive while the queue behind a match rule is full, so the
+                // room for buffered signals has to exceed what one burst can produce: the
+                // service emits a state and a transfer change per mount, and the default 64
+                // is a handful of dozen mounts away from a stall rather than a lost signal.
+                c.set_max_queued(1024);
+                c
+            }
             Err(e) => {
                 if !down(&handle, &proxy_tx, &LinkError::NoSessionBus(e)).await {
                     return;
@@ -131,18 +139,19 @@ async fn follow(
     };
 
     loop {
-        match attach_and_serve(handle, conn, &dbus, proxy_tx, &mut owners, refresh).await {
+        match attach_and_serve(handle, conn, &dbus, proxy_tx, &mut owners, refresh, backoff).await {
             Step::Gone => return Step::Gone,
             Step::Bus => return Step::Bus,
-            Step::Now => {
-                backoff.reset();
-                continue;
-            }
+            // The name changed hands. Nothing waits here: the next attempt is against
+            // whoever holds it now, and `backoff` is reset by an attach that works.
+            Step::Now => continue,
             Step::Backoff => {
                 tokio::select! {
                     _ = tokio::time::sleep(backoff.take()) => {}
                     _ = refresh.notified() => backoff.reset(),
-                    ev = owners.next() => if ev.is_none() { return Step::Bus },
+                    ev = owners.next() => if ev.is_none() {
+                        return bus_lost(handle, proxy_tx).await
+                    },
                 }
             }
         }
@@ -157,27 +166,34 @@ async fn attach_and_serve(
     proxy_tx: &watch::Sender<Option<Proxy>>,
     owners: &mut zbus::fdo::NameOwnerChangedStream,
     refresh: &Notify,
+    backoff: &mut Backoff,
 ) -> Step {
     let name = zbus::names::BusName::try_from(ipc::BUS_NAME).expect("BUS_NAME is well formed");
-    match dbus.name_has_owner(name).await {
-        Ok(true) => {}
-        Ok(false) => {
+    // `GetNameOwner`, not a call to the service: it is answered by the bus daemon, so it can
+    // never activate anything, and it returns the unique name in the same breath.
+    let owner = match dbus.get_name_owner(name).await {
+        Ok(o) => o,
+        Err(zbus::fdo::Error::NameHasNoOwner(_)) => {
             if !down(handle, proxy_tx, &LinkError::NotRunning).await {
                 return Step::Gone;
             }
             // Nothing to retry: the name being taken is itself the signal.
             return tokio::select! {
-                ev = owners.next() => if ev.is_some() { Step::Now } else { Step::Bus },
+                ev = owners.next() => if ev.is_some() {
+                    Step::Now
+                } else {
+                    bus_lost(handle, proxy_tx).await
+                },
                 _ = refresh.notified() => Step::Now,
             };
         }
         Err(e) => {
             down(handle, proxy_tx, &link::from_zbus(e.into())).await;
-            return Step::Bus;
+            return bus_lost(handle, proxy_tx).await;
         }
-    }
+    };
 
-    let proxy = match link::open(conn).await {
+    let proxy = match link::open_owner(conn, owner).await {
         Ok(p) => p,
         Err(e) => {
             // The name is owned but the handshake failed: an incompatible service, or one
@@ -220,6 +236,9 @@ async fn attach_and_serve(
         mounts = mounts.len(),
         "attached to the service"
     );
+    // The link works, so the next outage starts its wait from the beginning rather than
+    // inheriting a ceiling reached hours ago.
+    backoff.reset();
     proxy_tx.send_replace(Some(proxy.clone()));
     let alive = handle
         .update(move |m| {
@@ -237,20 +256,20 @@ async fn attach_and_serve(
     loop {
         tokio::select! {
             sig = states.next() => {
-                let Some(sig) = sig else { return Step::Bus };
+                let Some(sig) = sig else { return bus_lost(handle, proxy_tx).await };
                 if let Ok(args) = sig.args() {
                     if !edit(handle, |m| m.upsert_mount(args.mount)).await { return Step::Gone }
                 }
             }
             sig = removals.next() => {
-                let Some(sig) = sig else { return Step::Bus };
+                let Some(sig) = sig else { return bus_lost(handle, proxy_tx).await };
                 if let Ok(args) = sig.args() {
                     let name = args.name.to_string();
                     if !edit(handle, |m| m.remove_mount(&name)).await { return Step::Gone }
                 }
             }
             sig = transfers.next() => {
-                let Some(sig) = sig else { return Step::Bus };
+                let Some(sig) = sig else { return bus_lost(handle, proxy_tx).await };
                 if let Ok(args) = sig.args() {
                     if !edit(handle, |m| m.upsert_transfer(&args.state)).await { return Step::Gone }
                 }
@@ -259,7 +278,11 @@ async fn attach_and_serve(
                 // Whether the name was dropped or handed to a new process, this session is
                 // over. Starting again decides which of the two it was.
                 proxy_tx.send_replace(None);
-                return if ev.is_some() { Step::Now } else { Step::Bus };
+                return if ev.is_some() {
+                    Step::Now
+                } else {
+                    bus_lost(handle, proxy_tx).await
+                };
             }
             _ = refresh.notified() => {
                 // Re-read through the proxy already open rather than starting the link
@@ -322,6 +345,20 @@ async fn retry_after(
 ) -> Step {
     if down(handle, proxy_tx, &link::from_zbus(e)).await {
         Step::Backoff
+    } else {
+        Step::Gone
+    }
+}
+
+/// The bus connection itself has ended, which every arm of the session loop can discover.
+///
+/// Routed through one function so that none of them can return leaving the model rendering
+/// the mounts this connection last reported. Nothing said over a connection that no longer
+/// exists is current, and a stale list drawn as current is what #52 forbids.
+async fn bus_lost(handle: &Handle<TrayModel>, proxy_tx: &watch::Sender<Option<Proxy>>) -> Step {
+    let ended = zbus::Error::Failure("the connection to the session bus ended".into());
+    if down(handle, proxy_tx, &LinkError::NoSessionBus(ended)).await {
+        Step::Bus
     } else {
         Step::Gone
     }

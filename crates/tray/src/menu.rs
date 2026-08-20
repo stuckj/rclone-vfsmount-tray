@@ -20,12 +20,14 @@ use crate::model::{
 /// item per file is one the panel cannot draw and nobody can read (#27).
 const FILE_CAP: usize = 10;
 
-/// Columns a notice is wrapped to, and the rows it may take.
+/// Columns a row is wrapped to, and the rows one piece of text may take.
 ///
-/// The service's refusals are whole paragraphs — the busy-mount one names the command that
-/// finds the process holding it — and a menu row does not wrap.
-const NOTICE_WIDTH: usize = 64;
-const NOTICE_LINES: usize = 5;
+/// A DBusMenu item is drawn on one line and does not wrap, and much of what reaches a label
+/// here is a whole paragraph: rclone's stderr as a mount's failure reason, or the service's
+/// busy refusal, which names the command that finds the process holding the mount. Both run
+/// to hundreds of characters, so every label goes through [`text`], which breaks it up.
+const ROW_WIDTH: usize = 64;
+const ROW_LINES: usize = 8;
 
 /// What the menu says Quit does, spelled out where the reflex click is: quitting the tray
 /// leaves every mount serving. See DESIGN.md, "The lifetime rule".
@@ -33,11 +35,12 @@ const QUIT_LABEL: &str = "Quit (mounts stay up)";
 
 pub(crate) fn build(m: &TrayModel) -> Vec<MenuItem<TrayModel>> {
     match m.link() {
-        Link::Connecting => vec![
-            text("Connecting to the service…"),
-            MenuItem::Separator,
-            quit(),
-        ],
+        Link::Connecting => {
+            let mut items = text("Connecting to the service…");
+            items.push(MenuItem::Separator);
+            items.push(quit());
+            items
+        }
         Link::Down(down) => unreachable_service(down, m.notice()),
         Link::Up(info) => connected(m, info),
     }
@@ -52,8 +55,8 @@ fn unreachable_service(down: &Down, notice: Option<&Notice>) -> Vec<MenuItem<Tra
     let mut items = Vec::new();
     // A "Start service" that failed reports here, where the button that failed is.
     items.extend(notice_lines(notice));
-    items.push(text(&down.headline));
-    items.push(text(
+    items.extend(text(&down.headline));
+    items.extend(text(
         "Mounts already up are unaffected — this is only the tray's link.",
     ));
     items.push(MenuItem::Separator);
@@ -70,11 +73,11 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
     let mut items = notice_lines(m.notice());
 
     let summary = m.summary();
-    items.push(text(summary.mounted_line()));
-    items.extend(summary.pending_line().map(text));
-    items.extend(summary.rate_line().map(text));
+    items.extend(text(summary.mounted_line()));
+    items.extend(summary.pending_line().into_iter().flat_map(text));
+    items.extend(summary.rate_line().into_iter().flat_map(text));
     if summary.dirty_on_disk_only {
-        items.push(text(
+        items.extend(text(
             "Some figures are unuploaded files on disk, not live upload progress.",
         ));
     }
@@ -87,7 +90,7 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
     }
     if !foreign.is_empty() {
         items.push(MenuItem::Separator);
-        items.push(text("Started outside this service"));
+        items.extend(text("Started outside this service"));
         items.extend(foreign.iter().map(|v| mount_item(m, v)));
     }
 
@@ -111,17 +114,18 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
 
 /// One mount: what it is, what can be done to it, and what it still has to upload.
 fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
-    let mut sub = vec![text(
+    let mut sub = text(
         v.mount_point
             .as_deref()
             .unwrap_or("no mount point recorded"),
-    )];
+    );
     if let Some(remote) = &v.remote {
-        sub.push(text(remote));
+        sub.extend(text(remote));
     }
-    // #26: a failed mount says why here rather than only that it failed.
+    // #26: a failed mount says why here rather than only that it failed. rclone's stderr
+    // reaches this, so it is several rows more often than one.
     if let Some(reason) = &v.reason {
-        sub.push(text(format!("Failed: {reason}")));
+        sub.extend(text(format!("Failed: {reason}")));
     }
 
     sub.push(MenuItem::Separator);
@@ -139,7 +143,7 @@ fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
     } else {
         // The service refuses to act on a mount it did not start, so offering the action
         // here would only produce a refusal the user cannot do anything about.
-        sub.push(text("Not managed by this service"));
+        sub.extend(text("Not managed by this service"));
     }
 
     sub.push(MenuItem::Separator);
@@ -151,16 +155,16 @@ fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
 /// What one mount still has to upload, rendered only as far as its tier allows.
 fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
     let Some(t) = t else {
-        return vec![text("No upload information yet")];
+        return text("No upload information yet");
     };
 
     let mut lines = Vec::new();
     if !t.outstanding_known {
-        lines.push(text("Pending: unknown"));
+        lines.extend(text("Pending: unknown"));
     } else if t.pending.files == 0 {
-        lines.push(text("All synced"));
+        lines.extend(text("All synced"));
     } else {
-        lines.push(text(pending_phrase(
+        lines.extend(text(pending_phrase(
             t.pending.files,
             t.pending.known_bytes,
             t.pending.unknown_size_files,
@@ -186,62 +190,54 @@ fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
                 }
             }
         }
-        lines.push(text(line));
+        lines.extend(text(line));
     }
     if t.files.len() > FILE_CAP {
-        lines.push(text(format!("and {} more…", t.files.len() - FILE_CAP)));
+        lines.extend(text(format!("and {} more…", t.files.len() - FILE_CAP)));
     }
 
     if t.errored_files.unwrap_or(0) > 0 {
-        lines.push(text(format!(
+        lines.extend(text(format!(
             "{} file(s) failed to upload",
             t.errored_files.unwrap_or(0)
         )));
     }
     if t.out_of_space == Some(true) {
-        lines.push(text("The cache is out of space"));
+        lines.extend(text("The cache is out of space"));
     }
     if t.fidelity == Some(Tier::T4) {
-        lines.push(text(
+        lines.extend(text(
             "Showing unuploaded files on disk, not live upload progress.",
         ));
     }
     if let Some(why) = &t.degraded_reason {
-        lines.push(text(why));
+        lines.extend(text(why));
     }
     lines
 }
 
 fn about(info: &ServiceInfo) -> MenuItem<TrayModel> {
-    submenu(
-        "About",
-        vec![
-            text(format!("Tray {}", env!("CARGO_PKG_VERSION"))),
-            text(format!("Service {}", info.service_version)),
-            text(format!(
-                "Interface {} (this client speaks {})",
-                info.interface_version,
-                rvt_core::ipc::INTERFACE_VERSION
-            )),
-            text(format!("rclone {}", info.rclone_version)),
-            text(format!("Capability tier {}", info.capability_tier)),
-        ],
-    )
+    let mut items = text(format!("Tray {}", env!("CARGO_PKG_VERSION")));
+    items.extend(text(format!("Service {}", info.service_version)));
+    items.extend(text(format!(
+        "Interface {} (this client speaks {})",
+        info.interface_version,
+        rvt_core::ipc::INTERFACE_VERSION
+    )));
+    items.extend(text(format!("rclone {}", info.rclone_version)));
+    items.extend(text(format!("Capability tier {}", info.capability_tier)));
+    submenu("About", items)
 }
 
 /// Stopping the service is a submenu rather than an item, so it cannot be hit by reflex on
 /// the way to Quit (#26).
 fn stop_service() -> MenuItem<TrayModel> {
-    submenu(
-        "Stop service",
-        vec![
-            text("Mounts stay up unless the service is configured"),
-            text("to unmount when it stops."),
-            text("The tray will show the service as unreachable."),
-            MenuItem::Separator,
-            action("Yes, stop the service", Action::StopService),
-        ],
-    )
+    let mut items =
+        text("Mounts stay up unless the service is configured to unmount when it stops.");
+    items.extend(text("The tray will show the service as unreachable."));
+    items.push(MenuItem::Separator);
+    items.push(action("Yes, stop the service", Action::StopService));
+    submenu("Stop service", items)
 }
 
 /// Mount or unmount every managed mount that is not already in that state, decided when the
@@ -275,24 +271,29 @@ fn quit() -> MenuItem<TrayModel> {
 /// The last thing that went wrong, broken across rows and followed by a separator.
 fn notice_lines(notice: Option<&Notice>) -> Vec<MenuItem<TrayModel>> {
     let Some(n) = notice else { return Vec::new() };
-    let mut items: Vec<MenuItem<TrayModel>> = wrap(&n.text, NOTICE_WIDTH, NOTICE_LINES)
-        .into_iter()
-        .map(text)
-        .collect();
+    let mut items = text(&n.text);
     if !items.is_empty() {
         items.push(MenuItem::Separator);
     }
     items
 }
 
-/// A line to read rather than click.
-fn text(label: impl Into<String>) -> MenuItem<TrayModel> {
-    StandardItem {
-        label: escape(&label.into()),
-        enabled: false,
-        ..Default::default()
-    }
-    .into()
+/// Text to read rather than click, as however many rows it takes to be readable.
+///
+/// Returns rows rather than one item so that no caller can hand a paragraph to a menu that
+/// draws it on a single line. Our own prose is short and comes back as one.
+fn text(label: impl Into<String>) -> Vec<MenuItem<TrayModel>> {
+    wrap(&label.into(), ROW_WIDTH, ROW_LINES)
+        .into_iter()
+        .map(|line| {
+            StandardItem {
+                label: escape(&line),
+                enabled: false,
+                ..Default::default()
+            }
+            .into()
+        })
+        .collect()
 }
 
 fn action(label: impl Into<String>, a: Action) -> MenuItem<TrayModel> {
@@ -315,13 +316,22 @@ fn disabled_action(label: &str) -> MenuItem<TrayModel> {
     .into()
 }
 
+/// A submenu's label is one row that cannot be broken up, so it is cut instead.
 fn submenu(label: impl Into<String>, items: Vec<MenuItem<TrayModel>>) -> MenuItem<TrayModel> {
     SubMenu {
-        label: escape(&label.into()),
+        label: escape(&clip(&label.into())),
         submenu: items,
         ..Default::default()
     }
     .into()
+}
+
+/// Cut a label that has to fit one row, marking that it was cut.
+fn clip(s: &str) -> String {
+    match s.char_indices().nth(ROW_WIDTH) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
 }
 
 /// Protect a label from being read as a mnemonic.
@@ -461,7 +471,9 @@ mod tests {
         let items = build(&m);
         assert!(says(&items, "could not be unmounted"));
         assert!(
-            labels(&items).iter().all(|l| l.len() <= NOTICE_WIDTH + 2),
+            labels(&items)
+                .iter()
+                .all(|l| l.chars().count() <= ROW_WIDTH + 2),
             "a row wider than the panel: {:?}",
             labels(&items)
         );
@@ -696,5 +708,72 @@ mod round_one {
         let items = build(&m);
         assert!(says(&items, "unknown"), "{:?}", labels(&items));
         assert!(!says(&items, "All synced"), "{:?}", labels(&items));
+    }
+}
+
+#[cfg(test)]
+mod round_two {
+    use super::tests::labels;
+    use super::*;
+    use crate::fixtures::{connected, idle_transfer, mount};
+    use crate::link::LinkError;
+
+    /// A paragraph of the shape the service actually produces: rclone's stderr, or its busy
+    /// refusal, which carries the mount point twice and so has a long unbreakable run in it.
+    fn a_paragraph() -> String {
+        format!(
+            "/home/someone/mnt/photos could not be unmounted: fusermount3: failed to unmount \
+             /home/someone/mnt/photos: Device or resource busy. Usually a process is still \
+             using the mount — a file open under it, or a shell whose working directory is \
+             inside it. `fuser -m /home/someone/mnt/photos` names them. {}",
+            "supplementary-detail-with-no-spaces-at-all-".repeat(12)
+        )
+    }
+
+    /// Every label the panel would draw, whatever the tray is showing.
+    fn every_label(m: &mut TrayModel) -> Vec<String> {
+        let mut all = labels(&build(m));
+        m.go_down(&LinkError::NotRunning);
+        all.extend(labels(&build(m)));
+        all
+    }
+
+    #[test]
+    fn no_row_is_wider_than_the_panel_can_draw() {
+        // A DBusMenu item is one line and does not wrap. A failure reason went out as a
+        // single 1728-character label before this held.
+        // A long name as well as a long reason: a submenu's label is one row that cannot be
+        // broken up, so it has to be cut instead.
+        let mut failed = mount(&"a-mount-with-a-very-long-name".repeat(4), "failed");
+        failed.reason = Some(a_paragraph());
+        failed.mount_point = Some(format!("/mnt/{}", "deep/".repeat(40)));
+
+        let mut t = idle_transfer("photos");
+        t.degraded_reason = Some(a_paragraph());
+
+        let (mut m, _rx) = connected(vec![failed], vec![t]);
+        m.set_notice(Some("photos".into()), a_paragraph());
+
+        let all = every_label(&mut m);
+        assert!(!all.is_empty());
+        for label in &all {
+            assert!(
+                label.chars().count() <= ROW_WIDTH + 2,
+                "{} characters: {label:?}",
+                label.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_reason_too_long_to_show_says_it_was_cut() {
+        let mut failed = mount("photos", "failed");
+        failed.reason = Some(a_paragraph());
+        let (m, _rx) = connected(vec![failed], vec![]);
+        let all = labels(&build(&m));
+        assert!(
+            all.iter().any(|l| l.ends_with('…')),
+            "a reason shown in part must say so: {all:?}"
+        );
     }
 }

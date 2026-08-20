@@ -163,7 +163,29 @@ pub(crate) fn from_ipc(e: IpcError) -> LinkError {
 pub(crate) async fn open(
     conn: &zbus::Connection,
 ) -> Result<RcloneVfsmountTrayProxy<'static>, LinkError> {
-    let proxy = RcloneVfsmountTrayProxy::builder(conn)
+    build(RcloneVfsmountTrayProxy::builder(conn)).await
+}
+
+/// As [`open`], but addressed to one connection rather than to the service's well-known name.
+///
+/// A unique name cannot be activated. Addressing the calls to it means that if the service
+/// exits while the tray holds this proxy, the next call fails instead of starting a new one —
+/// which is what #52 asks for and what the ownership check before this cannot guarantee on
+/// its own, since the service can go in the moment between the two.
+pub(crate) async fn open_owner(
+    conn: &zbus::Connection,
+    owner: zbus::names::OwnedUniqueName,
+) -> Result<RcloneVfsmountTrayProxy<'static>, LinkError> {
+    let builder = RcloneVfsmountTrayProxy::builder(conn)
+        .destination(zbus::names::BusName::from(owner))
+        .map_err(from_zbus)?;
+    build(builder).await
+}
+
+async fn build(
+    builder: zbus::proxy::Builder<'static, RcloneVfsmountTrayProxy<'static>>,
+) -> Result<RcloneVfsmountTrayProxy<'static>, LinkError> {
+    let proxy = builder
         .cache_properties(CacheProperties::No)
         .build()
         .await

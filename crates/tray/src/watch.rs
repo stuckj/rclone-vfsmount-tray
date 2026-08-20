@@ -491,17 +491,17 @@ async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Prox
     match a {
         Action::Mount(name) => {
             let Some(p) = current(&proxy) else {
-                return unreachable_now(&handle, &name).await;
+                return unreachable_now(&handle, &name, true).await;
             };
             let r = call_mount(&p, &name).await;
-            report(&handle, &name, r).await;
+            report(&handle, &name, true, r).await;
         }
         Action::Unmount(name) => {
             let Some(p) = current(&proxy) else {
-                return unreachable_now(&handle, &name).await;
+                return unreachable_now(&handle, &name, false).await;
             };
             let r = call_unmount(&p, &name).await;
-            report(&handle, &name, r).await;
+            report(&handle, &name, false, r).await;
         }
         Action::Open(path) => open_in_file_manager(&handle, &path).await,
         Action::StartService => unit(&handle, "start").await,
@@ -530,13 +530,26 @@ fn current(proxy: &watch::Receiver<Option<Proxy>>) -> Option<Proxy> {
     proxy.borrow().clone()
 }
 
-async fn unreachable_now(handle: &Handle<TrayModel>, name: &str) {
+async fn unreachable_now(handle: &Handle<TrayModel>, name: &str, wanted_live: bool) {
     let _ = handle
-        .update(|m| m.set_notice(Some(name.to_string()), "The service is not reachable"))
+        .update(|m| {
+            m.set_notice(
+                Some(name.to_string()),
+                "The service is not reachable",
+                Some(wanted_live),
+            )
+        })
         .await;
 }
 
-async fn report(handle: &Handle<TrayModel>, name: &str, r: Result<(), IpcError>) {
+/// Say what became of one action. `wanted_live` is the state the mount would be in had it
+/// worked, which is what tells the notice when it has stopped being news.
+async fn report(
+    handle: &Handle<TrayModel>,
+    name: &str,
+    wanted_live: bool,
+    r: Result<(), IpcError>,
+) {
     match r {
         Ok(()) => {
             let mount = name.to_string();
@@ -553,7 +566,9 @@ async fn report(handle: &Handle<TrayModel>, name: &str, r: Result<(), IpcError>)
             tracing::warn!(mount = name, %text, "the service refused");
             let notice = format!("{name}: {text}");
             let mount = name.to_string();
-            let _ = handle.update(|m| m.set_notice(Some(mount), notice)).await;
+            let _ = handle
+                .update(|m| m.set_notice(Some(mount), notice, Some(wanted_live)))
+                .await;
         }
     }
 }
@@ -613,7 +628,7 @@ fn complaint(stderr: &[u8]) -> Option<String> {
 
 async fn say(handle: &Handle<TrayModel>, text: String) {
     tracing::warn!(%text, "an action did not complete");
-    let _ = handle.update(|m| m.set_notice(None, text)).await;
+    let _ = handle.update(|m| m.set_notice(None, text, None)).await;
 }
 
 #[cfg(test)]

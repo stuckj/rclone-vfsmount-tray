@@ -71,7 +71,7 @@ impl Tray for TrayModel {
         ToolTip {
             icon_name: state.icon_name().to_string(),
             icon_pixmap: Vec::new(),
-            title: format!("{TRAY_TITLE} — {}", state.label()),
+            title: format!("{TRAY_TITLE} — {}", self.headline()),
             description,
         }
     }

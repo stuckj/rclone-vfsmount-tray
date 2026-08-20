@@ -34,9 +34,13 @@ const ROW_LINES: usize = 8;
 /// A block that grew and shrank with what it had to say would change the menu's shape, and
 /// `ksni` answers a shape change by invalidating every menu id. Each is padded to its size
 /// instead, so the text arriving or going is a property change the panel absorbs.
-const REASON_ROWS: usize = 4;
+/// A failure reason is the unit's recent journal, so systemd's own narration is mixed into
+/// it; the line that says what went wrong is near the top, and eight rows is what it takes to
+/// reach the end of it. A refusal from the service runs to about the same, and its last
+/// sentence — the command that names the process holding a mount — is the actionable one.
+const REASON_ROWS: usize = 8;
 const DEGRADED_ROWS: usize = 3;
-const NOTICE_ROWS: usize = 5;
+const NOTICE_ROWS: usize = 8;
 
 /// What the menu says Quit does, spelled out where the reflex click is: quitting the tray
 /// leaves every mount serving. See DESIGN.md, "The lifetime rule".
@@ -45,7 +49,12 @@ const QUIT_LABEL: &str = "Quit (mounts stay up)";
 pub(crate) fn build(m: &TrayModel) -> Vec<MenuItem<TrayModel>> {
     match m.link() {
         Link::Connecting => {
+            // The same denial the disconnected menu carries: this shows the rows cleared,
+            // and can stand for as long as a new service instance takes to answer.
             let mut items = text("Connecting to the service…");
+            items.extend(text(
+                "Mounts already up are unaffected — this is only the tray's link.",
+            ));
             items.push(MenuItem::Separator);
             items.push(quit());
             items
@@ -325,6 +334,12 @@ fn verb(name: String, verb: Verb, enabled: bool) -> MenuItem<TrayModel> {
 /// `mounting` and `unmounting` are both `live == false`, and acting on either means asking
 /// for something already under way: a second `mount` that queues behind the first, or — after
 /// "Unmount all" — a "Mount all" that brings straight back up what was just taken down.
+///
+/// A state name this build does not know counts as settled, where the rest of the tray treats
+/// an unknown name as no answer. That is deliberate: `Live` and `Managed` travel beside the
+/// name so a client one release behind can still act (`rvt_core::ipc`), and refusing here
+/// would leave such a mount with no working item at all. The cost of being wrong is a request
+/// for something already under way, which the service serialises and answers.
 fn settled(v: &MountView) -> bool {
     !matches!(v.state.as_str(), "mounting" | "unmounting")
 }
@@ -585,7 +600,11 @@ mod tests {
     fn a_failed_start_reports_where_the_button_that_failed_is() {
         let (mut m, _rx) = blank();
         m.go_down(&LinkError::NotRunning);
-        m.set_notice(None, "could not run systemctl: No such file or directory");
+        m.set_notice(
+            None,
+            "could not run systemctl: No such file or directory",
+            None,
+        );
         assert!(says(&build(&m), "could not run systemctl"));
     }
 
@@ -597,6 +616,7 @@ mod tests {
             "photos: /mnt/photos could not be unmounted: Device or resource busy. \
              Usually a process is still using the mount — a file open under it, or a \
              shell whose working directory is inside it.",
+            Some(false),
         );
         let items = build(&m);
         assert!(says(&items, "could not be unmounted"));
@@ -801,7 +821,11 @@ mod tests {
         }];
 
         let (mut m, _rx) = connected(vec![failed], vec![t]);
-        m.set_notice(Some("my_photos".into()), "my_photos: still_in_use");
+        m.set_notice(
+            Some("my_photos".into()),
+            "my_photos: still_in_use",
+            Some(false),
+        );
 
         for label in labels(&build(&m)) {
             assert!(escaped(&label), "a lone underscore survives in {label:?}");
@@ -811,7 +835,7 @@ mod tests {
         m.go_down(&LinkError::Transport(zbus::Error::Failure(
             "peer_disconnected".into(),
         )));
-        m.set_notice(None, "could not run systemctl: no_such_unit");
+        m.set_notice(None, "could not run systemctl: no_such_unit", None);
         for label in labels(&build(&m)) {
             assert!(escaped(&label), "a lone underscore survives in {label:?}");
         }
@@ -877,7 +901,7 @@ mod tests {
         t.degraded_reason = Some(a_paragraph().replace('-', "_"));
 
         let (mut m, _rx) = connected(vec![failed], vec![t]);
-        m.set_notice(Some(name), a_paragraph().replace('-', "_"));
+        m.set_notice(Some(name), a_paragraph().replace('-', "_"), Some(false));
 
         let all = every_label(&mut m);
         assert!(all.len() > 10, "{all:?}");
@@ -1212,5 +1236,62 @@ mod tests {
             seen.len(),
             &odd[..odd.len().min(6)]
         );
+    }
+
+    #[test]
+    fn a_failed_mount_shows_the_line_that_says_what_went_wrong() {
+        // Captured from a real failure — a mount point that is not empty, the commonest way a
+        // mount fails on a fresh setup. Kept at full length, paths included: shortening them
+        // is what makes this fit in four rows, and four rows was the defect.
+        let mut failed = mount("photos", "failed");
+        failed.reason = Some(
+            "Started rvt-mount-bad.service - rclone mount r6src: at \
+             /home/claude/.claude/jobs/f70669bc/tmp/r6/mnt.\n\
+             ERROR+4: Fatal error: failed to mount FUSE fs: \
+             \"/home/claude/.claude/jobs/f70669bc/tmp/r6/mnt\" is not empty, use \
+             --allow-non-empty to mount anyway\n\
+             rvt-mount-bad.service: Main process exited, code=exited, status=1/FAILURE\n\
+             rvt-mount-bad.service: Failed with result 'exit-code'.\n\
+             rvt-mount-bad.service: Scheduled restart job, restart counter is at 1."
+                .to_string(),
+        );
+        let (m, _rx) = connected(vec![failed], vec![]);
+        let drawn = labels(&build(&m)).join(" ");
+        assert!(
+            drawn.contains("use --allow-non-empty"),
+            "the cause was cut off: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_busy_unmount_keeps_the_sentence_that_says_what_to_do() {
+        // The service's refusal ends with the command that names the process holding the
+        // mount; cutting the message short drops exactly that.
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        // The service's own sentence, with a mount point of the length people really have.
+        m.set_notice(
+            Some("photos".into()),
+            "photos: /home/claude/media/backups/photos could not be unmounted: fusermount3: \
+             failed to unmount /home/claude/media/backups/photos: Device or resource busy. \
+             Usually a process is still using the mount — a file open under it, or a shell \
+             whose working directory is inside it. \
+             `fuser -m /home/claude/media/backups/photos` names them. Unmounting anyway cuts \
+             anything mid-write off, and rclone then uploads the partial file as if it were \
+             complete.",
+            Some(false),
+        );
+        let drawn = labels(&build(&m)).join(" ");
+        assert!(drawn.contains("names them"), "the advice was cut: {drawn}");
+    }
+
+    #[test]
+    fn the_connecting_menu_denies_the_no_mounts_reading_too() {
+        // It shows the rows cleared, and stands for as long as a new instance takes to
+        // answer the handshake — up to the attach timeout.
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.go_connecting();
+        let items = build(&m);
+        assert!(says(&items, "unaffected"), "{:?}", labels(&items));
+        assert!(!says(&items, "mounted"), "{:?}", labels(&items));
     }
 }

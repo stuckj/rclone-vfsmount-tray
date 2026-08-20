@@ -96,10 +96,15 @@ pub(crate) struct ServiceInfo {
 /// The outcome of an action, kept until it stops being true.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Notice {
-    /// The mount it was about, if it was about one. Cleared when that mount's state next
-    /// changes, because by then the sentence describes a moment that has passed.
+    /// The mount it was about, if it was about one.
     pub mount: Option<String>,
     pub text: String,
+    /// The `live` the mount would reach if the request behind this notice had worked.
+    ///
+    /// The notice goes when the mount gets there, rather than the first time its state moves
+    /// at all: a mount that fails to mount publishes a state change of its own a moment
+    /// later, which would otherwise delete the explanation just as the user looked for it.
+    pub answered_by: Option<bool>,
 }
 
 /// What the icon says.
@@ -209,10 +214,16 @@ impl TrayModel {
         self.notice.as_ref()
     }
 
-    pub(crate) fn set_notice(&mut self, mount: Option<String>, text: impl Into<String>) {
+    pub(crate) fn set_notice(
+        &mut self,
+        mount: Option<String>,
+        text: impl Into<String>,
+        answered_by: Option<bool>,
+    ) {
         self.notice = Some(Notice {
             mount,
             text: text.into(),
+            answered_by,
         });
     }
 
@@ -270,8 +281,9 @@ impl TrayModel {
     }
 
     pub(crate) fn upsert_mount(&mut self, view: MountView) {
-        // The notice described this mount as it was before this change.
-        if self.notice.as_ref().and_then(|n| n.mount.as_deref()) == Some(view.name.as_str()) {
+        if self.notice.as_ref().is_some_and(|n| {
+            n.mount.as_deref() == Some(view.name.as_str()) && n.answered_by == Some(view.live)
+        }) {
             self.notice = None;
         }
         self.mounts.insert(view.name.clone(), view);
@@ -295,6 +307,22 @@ impl TrayModel {
         self.transfers.get(name)
     }
 
+    /// The tooltip's first line, naming its scope when there is something outside it.
+    ///
+    /// [`TrayState::label`] reads as being about everything mounted, and with a mount the
+    /// service did not start there is something mounted it is not about.
+    pub(crate) fn headline(&self) -> String {
+        let state = self.state();
+        if self.summary().unmanaged == 0 {
+            return state.label().to_string();
+        }
+        match state {
+            TrayState::Idle => "Managed mounts up to date".to_string(),
+            TrayState::Offline => "No managed mounts up".to_string(),
+            other => other.label().to_string(),
+        }
+    }
+
     /// What the icon should say.
     pub(crate) fn state(&self) -> TrayState {
         match self.link {
@@ -312,7 +340,9 @@ impl TrayModel {
         if s.files > 0 {
             return TrayState::Syncing;
         }
-        if s.live == 0 {
+        // Mounts started elsewhere are not counted: nothing is read for them, so "up to date"
+        // would be said on the strength of a mount the tray has never had a figure for.
+        if s.live == s.unmanaged {
             return TrayState::Offline;
         }
         TrayState::Idle
@@ -457,7 +487,8 @@ impl Summary {
                 // would be a claim the reading does not support.
                 format!(
                     "Pending: unknown on {} of {} mounts",
-                    self.unobservable, self.live
+                    self.unobservable,
+                    self.live - self.unmanaged
                 )
             } else {
                 "All synced".to_string()
@@ -580,17 +611,24 @@ pub(crate) fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     let width = width.max(1);
     let fits = |line: &str, word: &str| line.chars().count() + 1 + word.chars().count() <= width;
     let mut lines: Vec<String> = Vec::new();
-    for word in text.split_whitespace() {
-        // A word wider than the row still has to be broken. The sentence this exists for is
-        // the service's busy refusal, which carries the mount point twice — and a path is
-        // the one part of it with no spaces to break at.
-        for piece in split_to_width(word, width) {
-            match lines.last_mut() {
-                Some(line) if fits(line, &piece) => {
+    // Break where the text already breaks. A mount's failure reason is its unit's journal,
+    // and running those lines together loses the shape that makes it readable at all.
+    for source in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut continuing = false;
+        for word in source.split_whitespace() {
+            // A word wider than the row still has to be broken. The sentence this exists for
+            // is the service's busy refusal, which carries the mount point twice — and a path
+            // is the one part of it with no spaces to break at.
+            for piece in split_to_width(word, width) {
+                let room = continuing && lines.last().is_some_and(|l| fits(l, &piece));
+                if room {
+                    let line = lines.last_mut().expect("checked just above");
                     line.push(' ');
                     line.push_str(&piece);
+                } else {
+                    lines.push(piece);
                 }
-                _ => lines.push(piece),
+                continuing = true;
             }
         }
     }
@@ -893,7 +931,7 @@ mod tests {
     #[test]
     fn a_notice_lasts_until_the_mount_it_names_moves_on() {
         let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
-        m.set_notice(Some("photos".into()), "photos: still in use");
+        m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
         assert!(m.notice().is_some());
 
         m.upsert_mount(mount("docs", "mounted"));
@@ -1048,7 +1086,7 @@ mod tests {
     #[test]
     fn a_refresh_keeps_the_notice_and_a_new_service_does_not() {
         let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
-        m.set_notice(Some("photos".into()), "photos: still in use");
+        m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
 
         m.resync(service(), vec![mount("photos", "mounted")]);
         assert!(
@@ -1164,12 +1202,73 @@ mod tests {
     }
 
     #[test]
-    fn nothing_of_ours_serving_gives_no_pending_line() {
-        // One foreign mount and nothing else: there is no reading to report, and "All synced"
-        // would be claiming one.
+    fn nothing_of_ours_serving_is_not_up_to_date() {
+        // One foreign mount and nothing else. There is no reading to report, and neither
+        // "All synced" nor "Up to date" is something the tray has ever had a figure for.
         let (m, _rx) = connected(vec![mount("elsewhere", "foreign")], vec![]);
         assert_eq!(m.summary().pending_line(), None);
-        assert_eq!(m.state(), TrayState::Idle);
+        assert_eq!(m.state(), TrayState::Offline);
+        assert_eq!(m.headline(), "No managed mounts up");
+    }
+
+    #[test]
+    fn the_headline_names_its_scope_only_when_there_is_something_outside_it() {
+        let (ours, _a) = connected(
+            vec![mount("photos", "mounted")],
+            vec![idle_transfer("photos")],
+        );
+        assert_eq!(ours.headline(), "Up to date");
+
+        let (mixed, _b) = connected(
+            vec![mount("photos", "mounted"), mount("elsewhere", "foreign")],
+            vec![idle_transfer("photos")],
+        );
+        assert_eq!(mixed.headline(), "Managed mounts up to date");
+    }
+
+    #[test]
+    fn the_unknown_count_is_out_of_the_mounts_that_could_have_answered() {
+        let mut blind = idle_transfer("photos");
+        blind.outstanding_known = false;
+        let (m, _rx) = connected(
+            vec![
+                mount("photos", "mounted"),
+                mount("one", "foreign"),
+                mount("two", "foreign"),
+            ],
+            vec![blind],
+        );
+        assert_eq!(
+            m.summary().pending_line().as_deref(),
+            Some("Pending: unknown on 1 of 1 mounts")
+        );
+    }
+
+    #[test]
+    fn a_refusal_outlives_the_state_change_it_causes() {
+        // A mount that fails to mount publishes `failed` a moment later. Clearing on any
+        // state change deleted the only explanation the user was going to get.
+        let (mut m, _rx) = connected(vec![mount("photos", "unmounted")], vec![]);
+        m.set_notice(Some("photos".into()), "photos: rclone exited", Some(true));
+
+        m.upsert_mount(mount("photos", "failed"));
+        assert!(m.notice().is_some(), "the failure is still the news");
+
+        m.upsert_mount(mount("photos", "mounted"));
+        assert!(
+            m.notice().is_none(),
+            "it stops being news when the mount gets where it was asked to go"
+        );
+    }
+
+    #[test]
+    fn a_refused_unmount_clears_once_the_mount_goes() {
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
+        m.upsert_mount(mount("photos", "mounted"));
+        assert!(m.notice().is_some(), "still mounted, still true");
+        m.upsert_mount(mount("photos", "unmounted"));
+        assert!(m.notice().is_none());
     }
 
     #[test]
@@ -1180,7 +1279,7 @@ mod tests {
             vec![mount("photos", "mounted")],
             vec![idle_transfer("photos")],
         );
-        m.set_notice(Some("photos".into()), "photos: still in use");
+        m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
 
         m.restate(ServiceInfo {
             capability_tier: "T2".into(),
@@ -1203,5 +1302,21 @@ mod tests {
         m.restate(service());
         assert!(matches!(m.link(), Link::Down(_)));
         assert_eq!(m.mounts().count(), 0);
+    }
+
+    #[test]
+    fn wrapping_breaks_where_the_text_already_breaks() {
+        // A failure reason is a unit's journal. Running its lines together makes systemd's
+        // narration and rclone's error one paragraph, and puts them in the same row.
+        let journal = "Started rvt-mount-bad.service\nERROR: it went wrong\n\nExited 1";
+        assert_eq!(
+            wrap(journal, 64, 8),
+            [
+                "Started rvt-mount-bad.service",
+                "ERROR: it went wrong",
+                "Exited 1"
+            ],
+            "each line of the source starts its own row, and a blank one is dropped"
+        );
     }
 }

@@ -46,6 +46,11 @@ waits to be asked. If a service is already running it exits saying the name is t
 stop that one first. `--foreground` is accepted but does nothing yet: there is no background
 mode for it to opt out of.
 
+To ask it something, use the client subcommands in another terminal — `cargo run -p
+rclone-vfsmount-tray -- list`, `… mount <name>`, `… status --json`. They drive it over the
+same D-Bus interface a front end will (see [docs/CLI.md](docs/CLI.md)), and work with no tray
+running.
+
 ## Before opening a pull request
 
 ```sh

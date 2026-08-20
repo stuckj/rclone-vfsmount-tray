@@ -157,7 +157,7 @@ The icon says what is happening, and its tooltip spells it out:
 | Up to date | Everything that is mounted has finished uploading |
 | Uploading | Files are still on their way to the remote |
 | Needs attention | A mount failed, an upload errored, or the cache is full. The only state that asks the panel to emphasise the icon — uploads in progress do not |
-| State partly unknown | Something is mounted whose outstanding uploads cannot be read: rclone is unreachable, or the mount has no write-back cache to look in |
+| State partly unknown | A mount this service manages is up, and what it has left to upload cannot be read: rclone is unreachable, or the mount has no write-back cache to look in. Mounts you started yourself are never counted here — the tray simply says nothing about those |
 | Nothing mounted | No mount is serving |
 | Service unreachable | The tray cannot reach the service. **This says nothing about your mounts** — any that were up are still up |
 

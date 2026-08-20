@@ -35,6 +35,13 @@ pub(crate) async fn run(handle: Handle<TrayModel>, mut actions: UnboundedReceive
     let mut linker = tokio::spawn(link(handle.clone(), proxy_tx, refresh.clone()));
 
     loop {
+        // Checked rather than selected on: a `JoinHandle` panics if it is polled after it has
+        // completed, and `select!` chooses at random among ready branches — so the action arm
+        // can win the race in which the linker also finished, and the next round would poll a
+        // finished handle.
+        if linker.is_finished() {
+            break;
+        }
         let action = tokio::select! {
             a = actions.recv() => a,
             // The linker returns only when the tray itself has gone.
@@ -227,7 +234,7 @@ async fn attach_and_serve(
         Ok(p) => p,
         Err(e) => return give_up(handle, proxy_tx, e).await,
     };
-    let proxy = match attaching(link::open_owner(calls, owner)).await {
+    let proxy = match attaching(link::open_owner(calls, owner.clone())).await {
         Ok(p) => p,
         // The name is owned but the handshake failed: an incompatible service, or one that is
         // up and not yet answering. Neither is fixed by asking again at once.
@@ -245,6 +252,15 @@ async fn attach_and_serve(
     let mut transfers = match subscriptions.receive_transfer_state_changed().await {
         Ok(s) => s,
         Err(e) => return give_up(handle, proxy_tx, link::from_zbus(e)).await,
+    };
+    // The service resolves its capability tier on the first poll, which lands after the tray
+    // has attached, and announces it. Subscribed through the `Properties` interface, which is
+    // the one `PropertiesChanged` is emitted on — a match rule naming the service's own
+    // interface would never match it. Not `receive_capability_tier_changed` either: that is
+    // fed by the property cache, which is off here, so it would never yield.
+    let mut properties = match watch_properties(conn, owner.clone()).await {
+        Ok(s) => s,
+        Err(e) => return give_up(handle, proxy_tx, e).await,
     };
 
     let snapshot = match attaching(gather(&proxy)).await {
@@ -309,6 +325,25 @@ async fn attach_and_serve(
                     Step::Gone
                 };
             }
+            sig = properties.next() => {
+                let Some(sig) = sig else { return bus_lost(handle, proxy_tx).await };
+                // One object, but `Properties` carries every interface exported on it.
+                if sig
+                    .args()
+                    .map(|a| a.interface_name != ipc::INTERFACE_NAME)
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                // Which property changed does not matter: there are four, all cheap, and
+                // re-reading them all keeps this from having to parse the signal body.
+                match attaching(describe(&proxy)).await {
+                    Ok(info) => {
+                        if !edit(handle, move |m| m.restate(info)).await { return Step::Gone }
+                    }
+                    Err(e) => return give_up(handle, proxy_tx, e).await,
+                }
+            }
             _ = refresh.notified() => {
                 // Re-read through the proxy already open rather than starting the link
                 // over. Reattaching would re-resolve the name, re-add three match rules and
@@ -334,6 +369,25 @@ async fn attach_and_serve(
     }
 }
 
+/// Follow what the service says about itself.
+async fn watch_properties(
+    conn: &zbus::Connection,
+    owner: zbus::names::OwnedUniqueName,
+) -> Result<zbus::fdo::PropertiesChangedStream, LinkError> {
+    let proxy = zbus::fdo::PropertiesProxy::builder(conn)
+        .destination(zbus::names::BusName::from(owner))
+        .map_err(link::from_zbus)?
+        .path(ipc::OBJECT_PATH)
+        .map_err(link::from_zbus)?
+        .build()
+        .await
+        .map_err(link::from_zbus)?;
+    proxy
+        .receive_properties_changed()
+        .await
+        .map_err(link::from_zbus)
+}
+
 /// Bound an attach step, so a name owner that never replies cannot hold the tray.
 ///
 /// zbus imposes no reply timeout, and the bus daemon's is five minutes. Everything wrapped
@@ -355,13 +409,18 @@ async fn attaching<T>(
 /// Everything a fresh attachment publishes.
 type Snapshot = (ServiceInfo, Vec<ipc::MountView>, Vec<ipc::TransferView>);
 
-async fn gather(proxy: &Proxy) -> Result<Snapshot, LinkError> {
-    let info = ServiceInfo {
+/// What the service says about itself.
+async fn describe(proxy: &Proxy) -> Result<ServiceInfo, LinkError> {
+    Ok(ServiceInfo {
         interface_version: proxy.interface_version().await.map_err(link::from_ipc)?,
         service_version: proxy.service_version().await.map_err(link::from_ipc)?,
         rclone_version: proxy.rclone_version().await.map_err(link::from_ipc)?,
         capability_tier: proxy.capability_tier().await.map_err(link::from_ipc)?,
-    };
+    })
+}
+
+async fn gather(proxy: &Proxy) -> Result<Snapshot, LinkError> {
+    let info = describe(proxy).await?;
     let mounts = proxy.list_mounts().await.map_err(link::from_ipc)?;
     let mut transfers = Vec::with_capacity(mounts.len());
     for m in &mounts {

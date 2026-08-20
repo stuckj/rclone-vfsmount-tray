@@ -68,10 +68,12 @@ dbus-send --session --print-reply --dest="$N" /MenuBar \
     com.canonical.dbusmenu.Event int32:<id> string:clicked variant:string:"" uint32:0
 ```
 
-Menu item ids are reassigned whenever the menu's *shape* changes — a mount appearing, a
-pending-file list growing — so read them again immediately before clicking one. `ksni` answers
-a click on an id from before the last shape change with `InvalidArgs`, so a stale click fails
-rather than landing on whatever now holds that id.
+Menu item ids are reassigned whenever the menu's *shape* changes, so read them again
+immediately before clicking one. `ksni` answers a click on an id from before the last shape
+change with `InvalidArgs`, so a stale click fails rather than landing on whatever now holds
+that id. The tray keeps its shape fixed against everything that changes often — a queue
+draining, a rate coming and going, an upload erroring — so in practice only a mount appearing
+or going away, or the link to the service coming up or down, moves the ids.
 
 ## Before opening a pull request
 

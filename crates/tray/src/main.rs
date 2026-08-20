@@ -115,20 +115,19 @@ async fn main() -> ExitCode {
 /// The link to the service is not waited for: the icon appears whether or not the service is
 /// running, and says which (#52).
 async fn run_tray() -> ExitCode {
-    use ksni::TrayMethods as _;
-
     let (actions, queue) = tokio::sync::mpsc::unbounded_channel();
     let model = model::TrayModel::new(actions);
 
-    // `assume_sni_available`: at login the panel often starts after the programs it will
-    // show, and a shell restart takes the watcher away and brings it back. Either must leave
-    // the icon waiting rather than a process that gave up (#25).
-    let handle = match model.assume_sni_available(true).spawn().await {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("Could not raise the tray icon: {e}");
-            return ExitCode::from(5);
-        }
+    let handle = tokio::select! {
+        h = raise(model) => match h {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Could not raise the tray icon: {e}");
+                return ExitCode::from(5);
+            }
+        },
+        // Still interruptible while it is waiting for a panel.
+        _ = terminated() => return ExitCode::SUCCESS,
     };
 
     tokio::select! {
@@ -136,6 +135,38 @@ async fn run_tray() -> ExitCode {
         _ = terminated() => { handle.shutdown().await; }
     }
     ExitCode::SUCCESS
+}
+
+/// Put the icon up, waiting for a panel that can take it.
+///
+/// `ksni` routes only a `StatusNotifierWatcher` that is absent altogether to
+/// [`ksni::Tray::watcher_offline`]; a watcher that owns the name but is not yet serving the
+/// object, or is answering slowly, or is being replaced, comes back as an error from `spawn`.
+/// At login that is the ordinary shape of a desktop still starting up, and there is nothing
+/// yet to restart the tray if it gives up — so only a session bus that cannot be reached at
+/// all is fatal.
+async fn raise(model: model::TrayModel) -> Result<ksni::Handle<model::TrayModel>, ksni::Error> {
+    use ksni::TrayMethods as _;
+
+    let mut backoff = link::Backoff::new();
+    // `spawn` takes the tray, so each attempt needs its own — built on the one queue, which
+    // the menu's callbacks send to whichever attempt eventually succeeds.
+    let queue = model.actions();
+    let mut attempt = model;
+    loop {
+        // `assume_sni_available`: a panel that starts after us, or a shell restarting, must
+        // leave the icon waiting rather than a process that gave up (#25).
+        match attempt.assume_sni_available(true).spawn().await {
+            Ok(handle) => return Ok(handle),
+            Err(e @ ksni::Error::Dbus(_)) => return Err(e),
+            Err(e) => {
+                let wait = backoff.take();
+                tracing::warn!(error = %e, ?wait, "could not register the icon yet; retrying");
+                tokio::time::sleep(wait).await;
+                attempt = model::TrayModel::new(queue.clone());
+            }
+        }
+    }
 }
 
 /// Resolves on `SIGTERM` or `SIGINT`.

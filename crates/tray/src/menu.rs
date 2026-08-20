@@ -29,6 +29,15 @@ const FILE_CAP: usize = 10;
 const ROW_WIDTH: usize = 64;
 const ROW_LINES: usize = 8;
 
+/// Rows kept for each block of text that varies in length.
+///
+/// A block that grew and shrank with what it had to say would change the menu's shape, and
+/// `ksni` answers a shape change by invalidating every menu id. Each is padded to its size
+/// instead, so the text arriving or going is a property change the panel absorbs.
+const REASON_ROWS: usize = 4;
+const DEGRADED_ROWS: usize = 3;
+const NOTICE_ROWS: usize = 5;
+
 /// What the menu says Quit does, spelled out where the reflex click is: quitting the tray
 /// leaves every mount serving. See DESIGN.md, "The lifetime rule".
 const QUIT_LABEL: &str = "Quit (mounts stay up)";
@@ -120,19 +129,18 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
 
 /// One mount: what it is, what can be done to it, and what it still has to upload.
 fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
-    let mut sub = text(
+    let mut sub = vec![one_row(
         v.mount_point
             .as_deref()
             .unwrap_or("no mount point recorded"),
-    );
-    if let Some(remote) = &v.remote {
-        sub.extend(text(remote));
-    }
+    )];
+    sub.push(row_or_gap(v.remote.clone()));
     // #26: a failed mount says why here rather than only that it failed. rclone's stderr
     // reaches this, so it is several rows more often than one.
-    if let Some(reason) = &v.reason {
-        sub.extend(text(format!("Failed: {reason}")));
-    }
+    sub.extend(block(
+        v.reason.as_ref().map(|r| format!("Failed: {r}")),
+        REASON_ROWS,
+    ));
 
     sub.push(MenuItem::Separator);
     match v.mount_point.as_deref() {
@@ -144,9 +152,11 @@ fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
         sub.push(verb(v.name.clone(), Verb::Mount, settled(v) && !v.live));
         sub.push(verb(v.name.clone(), Verb::Unmount, settled(v) && v.live));
     } else {
-        // The service refuses to act on a mount it did not start, so offering the action
-        // here would only produce a refusal the user cannot do anything about.
-        sub.extend(text("Not managed by this service"));
+        // The service refuses to act on a mount it did not start, so offering the action here
+        // would only produce a refusal the user cannot do anything about. Two rows either
+        // way, so the group a mount is in does not change the menu's shape.
+        sub.push(one_row("Not managed by this service"));
+        sub.push(hidden());
     }
 
     sub.push(MenuItem::Separator);
@@ -156,92 +166,84 @@ fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
 }
 
 /// What one mount still has to upload, rendered only as far as its tier allows.
+///
+/// Always the same number of rows: one headline, [`FILE_CAP`] file slots, the overflow line,
+/// three flags, and the reason it cannot see more. Anything with nothing to say is a hidden
+/// row holding its place.
 fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
-    let Some(t) = t else {
-        return text("No upload information yet");
-    };
+    let mut rows = vec![one_row(match t {
+        None => "No upload information yet".to_string(),
+        Some(t) => pending_headline(t),
+    })];
 
-    let mut lines = Vec::new();
-    if !t.outstanding_known {
-        // Whatever was seen is real; what is missing is any assurance it is all of it. A bare
-        // "unknown" throws away entries the menu goes on to list underneath.
-        lines.extend(text(if t.pending.files == 0 {
-            "Pending: unknown".to_string()
-        } else {
-            format!(
-                "{}, and possibly more",
-                pending_phrase(
-                    t.pending.files,
-                    t.pending.known_bytes,
-                    t.pending.unknown_size_files
-                )
-            )
-        }));
-    } else if t.pending.files == 0 {
-        lines.extend(text("All synced"));
-    } else {
-        lines.extend(text(pending_phrase(
-            t.pending.files,
-            t.pending.known_bytes,
-            t.pending.unknown_size_files,
-        )));
-    }
-
-    // A fixed number of rows, hidden where there is no file for them. `ksni` treats any
-    // change in a node's child count as a layout change, which invalidates every menu id and
-    // makes the panel refetch; the queue drains a file at a time while an upload runs, so a
-    // list that shrank with it would do that about once a second and swallow any click the
-    // panel had already sent. Hiding a row is a property change, which does neither.
     for slot in 0..FILE_CAP {
-        let Some(f) = t.files.get(slot) else {
-            lines.push(hidden());
-            continue;
-        };
-        let mut line = f.name.clone();
-        if let Some(size) = f.size {
-            line.push_str(&format!(" — {}", human_bytes(size)));
-        }
-        // `in_flight` is `None` at the tiers that cannot tell a queued file from a sending
-        // one, and an absent flag must not be rendered as "queued".
-        if f.in_flight == Some(true) {
-            line.push_str(" (uploading)");
-        }
-        // Per-file progress exists only where the queue was joined to rclone's accounting;
-        // `has_progress` is what says the join found anything.
-        if t.has_progress {
-            if let (Some(sent), Some(size)) = (f.bytes_sent, f.size) {
-                if size > 0 {
-                    line.push_str(&format!(" — {} sent", human_bytes(sent)));
-                }
+        rows.push(row_or_gap(t.and_then(|t| {
+            t.files.get(slot).map(|f| file_line(f, t.has_progress))
+        })));
+    }
+    rows.push(row_or_gap(t.and_then(|t| {
+        t.files
+            .len()
+            .checked_sub(FILE_CAP)
+            .filter(|rest| *rest > 0)
+            .map(|rest| format!("and {rest} more…"))
+    })));
+    rows.push(row_or_gap(t.and_then(|t| {
+        t.errored_files
+            .filter(|n| *n > 0)
+            .map(|n| format!("{n} file(s) failed to upload"))
+    })));
+    rows.push(row_or_gap(
+        t.filter(|t| t.out_of_space == Some(true))
+            .map(|_| "The cache is out of space".to_string()),
+    ));
+    rows.push(row_or_gap(t.filter(|t| t.fidelity == Some(Tier::T4)).map(
+        |_| "Showing files on disk, not live upload progress.".to_string(),
+    )));
+    rows.extend(block(
+        t.and_then(|t| t.degraded_reason.clone()),
+        DEGRADED_ROWS,
+    ));
+    rows
+}
+
+/// What is outstanding for one mount, in one line.
+fn pending_headline(t: &TransferState) -> String {
+    let phrase = pending_phrase(
+        t.pending.files,
+        t.pending.known_bytes,
+        t.pending.unknown_size_files,
+    );
+    match (t.outstanding_known, t.pending.files) {
+        (true, 0) => "All synced".to_string(),
+        (true, _) => phrase,
+        // Whatever was seen is real; what is missing is any assurance it is all of it. A bare
+        // "unknown" throws away entries the rows below go on to list.
+        (false, 0) => "Pending: unknown".to_string(),
+        (false, _) => format!("{phrase}, and possibly more"),
+    }
+}
+
+fn file_line(f: &rvt_core::transfer::TransferFile, has_progress: bool) -> String {
+    let mut line = f.name.clone();
+    if let Some(size) = f.size {
+        line.push_str(&format!(" — {}", human_bytes(size)));
+    }
+    // `in_flight` is `None` at the tiers that cannot tell a queued file from a sending one,
+    // and an absent flag must not be rendered as "queued".
+    if f.in_flight == Some(true) {
+        line.push_str(" (uploading)");
+    }
+    // Per-file progress exists only where the queue was joined to rclone's accounting;
+    // `has_progress` is what says the join found anything.
+    if has_progress {
+        if let (Some(sent), Some(size)) = (f.bytes_sent, f.size) {
+            if size > 0 {
+                line.push_str(&format!(" — {} sent", human_bytes(sent)));
             }
         }
-        // One row per file, whatever its name: a name long enough to wrap would change the
-        // count and reshape the menu, which is what the fixed number of slots avoids.
-        lines.push(one_row(clip(&line)));
     }
-    lines.push(match t.files.len().checked_sub(FILE_CAP) {
-        Some(rest) if rest > 0 => one_row(format!("and {rest} more…")),
-        _ => hidden(),
-    });
-
-    if t.errored_files.unwrap_or(0) > 0 {
-        lines.extend(text(format!(
-            "{} file(s) failed to upload",
-            t.errored_files.unwrap_or(0)
-        )));
-    }
-    if t.out_of_space == Some(true) {
-        lines.extend(text("The cache is out of space"));
-    }
-    if t.fidelity == Some(Tier::T4) {
-        lines.extend(text(
-            "Showing unuploaded files on disk, not live upload progress.",
-        ));
-    }
-    if let Some(why) = &t.degraded_reason {
-        lines.extend(text(why));
-    }
-    lines
+    line
 }
 
 fn about(info: &ServiceInfo) -> MenuItem<TrayModel> {
@@ -358,11 +360,15 @@ fn quit() -> MenuItem<TrayModel> {
 
 /// The last thing that went wrong, broken across rows and followed by a separator.
 fn notice_lines(notice: Option<&Notice>) -> Vec<MenuItem<TrayModel>> {
-    let Some(n) = notice else { return Vec::new() };
-    let mut items = text(&n.text);
-    if !items.is_empty() {
-        items.push(MenuItem::Separator);
-    }
+    let mut items = block(notice.map(|n| n.text.clone()), NOTICE_ROWS);
+    // A separator only when there is something above it to separate. `ksni` diffs an item's
+    // type along with its other properties, so swapping the two is a property change and the
+    // menu keeps its shape either way.
+    items.push(if notice.is_some() {
+        MenuItem::Separator
+    } else {
+        hidden()
+    });
     items
 }
 
@@ -414,6 +420,15 @@ fn one_row(label: impl Into<String>) -> MenuItem<TrayModel> {
     .into()
 }
 
+/// Exactly `rows` rows: what there is to say, wrapped, and hidden rows for the rest.
+fn block(label: Option<String>, rows: usize) -> Vec<MenuItem<TrayModel>> {
+    let mut out: Vec<MenuItem<TrayModel>> = label
+        .map(|l| wrap(&l, ROW_WIDTH, rows).into_iter().map(one_row).collect())
+        .unwrap_or_default();
+    out.resize_with(rows, hidden);
+    out
+}
+
 /// One row if there is something to say, and a placeholder if not.
 fn row_or_gap(label: Option<String>) -> MenuItem<TrayModel> {
     match label {
@@ -453,9 +468,9 @@ fn clip(s: &str) -> String {
 ///
 /// DBusMenu strips a single underscore and turns a doubled one back into a single, so a
 /// mount called `my_files` reaches the panel as "myfiles" unless it is doubled here. Applied
-/// in the four constructors above rather than at each call site: most of what reaches a label
-/// is a mount name, a path, or a sentence from rclone, and the ones that are not are our own
-/// prose, which has no underscores to double.
+/// wherever a label is built rather than at each call site: most of what reaches one is a
+/// mount name, a path, or a sentence from rclone, and the rest is our own prose, which has no
+/// underscores to double.
 fn escape(s: &str) -> String {
     s.replace('_', "__")
 }
@@ -813,7 +828,7 @@ mod tests {
 
     #[test]
     fn a_serving_mount_with_no_reading_says_so_in_the_summary_too() {
-        let (m, _rx) = connected(vec![mount("elsewhere", "foreign")], vec![]);
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
         let items = build(&m);
         assert!(says(&items, "unknown"), "{:?}", labels(&items));
         assert!(!says(&items, "All synced"), "{:?}", labels(&items));
@@ -1123,6 +1138,79 @@ mod tests {
         assert!(
             shapes.windows(2).all(|w| w[0] == w[1]),
             "the menu reshapes as an upload progresses: {shapes:?}"
+        );
+    }
+
+    /// Every value the menu branches on, crossed. Building this by hand is what let two
+    /// defects through before: the assertions were sound and the inputs never reached them.
+    fn every_shape() -> Vec<(
+        String,
+        TrayModel,
+        tokio::sync::mpsc::UnboundedReceiver<Action>,
+    )> {
+        let mut out = Vec::new();
+        for state in EVERY_STATE {
+            for files in [0usize, 1, FILE_CAP, FILE_CAP + 3] {
+                for (tier, known, progress) in [
+                    ("T2", true, false),
+                    ("T2", true, true),
+                    ("T3", true, false),
+                    ("T4", false, false),
+                ] {
+                    for (errored, full, why) in [
+                        (0u64, false, None),
+                        (
+                            3,
+                            true,
+                            Some("rclone_unreachable: no rc socket at /run/x_y".to_string()),
+                        ),
+                    ] {
+                        let mut r = idle_transfer("my_pics");
+                        r.fidelity = Some(tier.into());
+                        r.outstanding_known = known;
+                        r.has_progress = progress;
+                        r.errored_files = Some(errored);
+                        r.out_of_space = Some(full);
+                        r.degraded_reason = why.clone();
+                        pending(&mut r, files as u64, 1024 * files as u64, 0);
+                        r.files = (0..files)
+                            .map(|i| rvt_core::ipc::TransferFileView {
+                                name: format!("holiday_{i}_of_{files}.mp4"),
+                                size: Some(1024),
+                                in_flight: [Some(true), Some(false), None][i % 3],
+                                tries: Some(1),
+                                bytes_sent: progress.then_some(512),
+                            })
+                            .collect();
+                        let (m, rx) = connected(vec![mount("my_pics", state)], vec![r]);
+                        out.push((
+                            format!("{state}/{files} files/{tier}/errored={errored}"),
+                            m,
+                            rx,
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn one_mount_draws_the_same_number_of_rows_whatever_it_is_doing() {
+        // `ksni` throws away every menu id when a node's child count changes, so the only
+        // thing that may reshape the menu is a mount appearing or going away.
+        let mut seen: Vec<(String, usize)> = Vec::new();
+        for (what, m, _rx) in every_shape() {
+            seen.push((what, submenu_rows(&build(&m), "my__pics")));
+        }
+        let first = seen[0].1;
+        let odd: Vec<&(String, usize)> = seen.iter().filter(|(_, n)| *n != first).collect();
+        assert!(
+            odd.is_empty(),
+            "{} of {} combinations reshape the row (expected {first}): {:?}",
+            odd.len(),
+            seen.len(),
+            &odd[..odd.len().min(6)]
         );
     }
 }

@@ -196,6 +196,11 @@ impl TrayModel {
         }
     }
 
+    /// The queue this tray sends to, so a replacement can be built on the same one.
+    pub(crate) fn actions(&self) -> UnboundedSender<Action> {
+        self.actions.clone()
+    }
+
     pub(crate) fn link(&self) -> &Link {
         &self.link
     }
@@ -246,6 +251,13 @@ impl TrayModel {
         self.mounts.clear();
         self.transfers.clear();
         self.notice = None;
+    }
+
+    /// The service has said something new about itself. Leaves the mounts alone.
+    pub(crate) fn restate(&mut self, info: ServiceInfo) {
+        if matches!(self.link, Link::Up(_)) {
+            self.link = Link::Up(info);
+        }
     }
 
     /// Re-read everything from the *same* service. Unlike [`Self::go_up`] this keeps the
@@ -329,6 +341,16 @@ impl TrayModel {
                 continue;
             }
             s.live += 1;
+            if !m.managed {
+                // Nothing will ever be read for this one: the service refuses to read a
+                // mount it did not start, and never polls it. Counting it as unreadable
+                // would pin the tray to "state partly unknown" for as long as the mount
+                // exists, which is indistinguishable from rclone actually going away on a
+                // mount that matters. It is listed in its own group, and the tray claims
+                // nothing about it.
+                s.unmanaged += 1;
+                continue;
+            }
             let Some(t) = self.transfers.get(&m.name) else {
                 // A mount that is serving and has told us nothing. Permanent for a mount
                 // this service did not start — it refuses to read one, and never polls it —
@@ -348,6 +370,10 @@ impl TrayModel {
             s.unknown_size_files = s
                 .unknown_size_files
                 .saturating_add(t.pending.unknown_size_files);
+            // `unwrap_or` reads "this tier could not ask" as "nothing wrong", which is only
+            // safe because the poller pairs a missing `vfs/stats` with `partially_observed`,
+            // and that clears `outstanding_known` — so such a mount is already counted
+            // unreadable above. Nothing outside this crate enforces that pairing.
             s.errored = s.errored.saturating_add(t.errored_files.unwrap_or(0));
             s.out_of_space |= t.out_of_space.unwrap_or(false);
             if let Some(r) = t.rate_bytes_per_sec {
@@ -386,8 +412,10 @@ pub(crate) struct Summary {
     pub live: usize,
     /// Mounts that failed and gave up.
     pub failed: usize,
-    /// Live mounts whose outstanding work cannot be vouched for.
+    /// Live mounts *this service owns* whose outstanding work cannot be vouched for.
     pub unobservable: usize,
+    /// Live mounts started outside the service, which it will never have a reading for.
+    pub unmanaged: usize,
     pub files: u64,
     pub bytes: u64,
     pub unknown_size_files: u64,
@@ -405,18 +433,22 @@ impl Summary {
     /// How many mounts are serving, which is the line everything else qualifies.
     pub(crate) fn mounted_line(&self) -> String {
         if self.total == 0 {
-            "No mounts configured".to_string()
-        } else {
-            format!("{} of {} mounted", self.live, self.total)
+            return "No mounts configured".to_string();
         }
+        let mut line = format!("{} of {} mounted", self.live, self.total);
+        if self.unmanaged > 0 {
+            // Named, because everything below this line is about the rest of them.
+            line.push_str(&format!(" · {} not managed", self.unmanaged));
+        }
+        line
     }
 
     /// The one line that answers "is my stuff uploaded?".
     ///
-    /// `None` when nothing is serving: outstanding work is only counted for live mounts, so
-    /// there is no reading to report rather than a reading of zero.
+    /// `None` when nothing this service owns is serving: outstanding work is only counted
+    /// for those, so there is no reading to report rather than a reading of zero.
     pub(crate) fn pending_line(&self) -> Option<String> {
-        if self.live == 0 {
+        if self.live == self.unmanaged {
             return None;
         }
         if self.files == 0 {
@@ -968,10 +1000,10 @@ mod tests {
 
     #[test]
     fn a_serving_mount_that_has_said_nothing_is_not_called_synced() {
-        // The durable case is a mount this service did not start: it refuses to read one and
-        // never polls it, so no reading ever arrives and the row is live and blank forever.
-        // Counting it as clean would answer "is my work uploaded?" with a yes nothing backs.
-        let (m, _rx) = connected(vec![mount("elsewhere", "foreign")], vec![]);
+        // A managed mount is live from the moment its state signal lands, which is before its
+        // first reading arrives — and stays that way if the reading fails. Counting the gap
+        // as clean answers "is my work uploaded?" with a yes nothing backs.
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
         assert_eq!(m.state(), TrayState::Degraded);
         let line = m.summary().pending_line().expect("something is mounted");
         assert!(line.contains("unknown"), "{line}");
@@ -983,7 +1015,7 @@ mod tests {
         let mut busy = idle_transfer("photos");
         pending(&mut busy, 2, 2048, 0);
         let (m, _rx) = connected(
-            vec![mount("photos", "mounted"), mount("elsewhere", "foreign")],
+            vec![mount("photos", "mounted"), mount("docs", "mounted")],
             vec![busy],
         );
         let s = m.summary();
@@ -1063,7 +1095,7 @@ mod tests {
         busy.rate_bytes_per_sec = Some(4 * 1024 * 1024);
 
         let (m, _rx) = connected(
-            vec![mount("photos", "mounted"), mount("elsewhere", "foreign")],
+            vec![mount("photos", "mounted"), mount("docs", "mounted")],
             vec![busy],
         );
         let s = m.summary();
@@ -1112,5 +1144,64 @@ mod tests {
     fn a_width_of_zero_does_not_spin() {
         // Nothing passes this today; the loop that breaks a long word would not terminate.
         assert!(!wrap("something", 0, 4).is_empty());
+    }
+
+    #[test]
+    fn a_mount_started_elsewhere_does_not_hold_the_tray_in_the_dark() {
+        // The service will not read a mount it did not start, and never polls one, so there
+        // is no reading coming — ever. Counting that as "cannot be read" would leave anyone
+        // with one hand-started rclone mount on "state partly unknown" for good, which is the
+        // same thing the tray says when rclone really has gone away on a mount that matters.
+        let (m, _rx) = connected(
+            vec![mount("photos", "mounted"), mount("elsewhere", "foreign")],
+            vec![idle_transfer("photos")],
+        );
+        let s = m.summary();
+        assert_eq!(m.state(), TrayState::Idle);
+        assert_eq!((s.unmanaged, s.unobservable), (1, 0));
+        assert_eq!(s.pending_line().as_deref(), Some("All synced"));
+        assert_eq!(s.mounted_line(), "2 of 2 mounted · 1 not managed");
+    }
+
+    #[test]
+    fn nothing_of_ours_serving_gives_no_pending_line() {
+        // One foreign mount and nothing else: there is no reading to report, and "All synced"
+        // would be claiming one.
+        let (m, _rx) = connected(vec![mount("elsewhere", "foreign")], vec![]);
+        assert_eq!(m.summary().pending_line(), None);
+        assert_eq!(m.state(), TrayState::Idle);
+    }
+
+    #[test]
+    fn the_service_saying_something_new_about_itself_does_not_disturb_the_mounts() {
+        // The capability tier resolves on the service's first poll, which lands after the
+        // tray has attached; without this the About line reads "unknown" for the session.
+        let (mut m, _rx) = connected(
+            vec![mount("photos", "mounted")],
+            vec![idle_transfer("photos")],
+        );
+        m.set_notice(Some("photos".into()), "photos: still in use");
+
+        m.restate(ServiceInfo {
+            capability_tier: "T2".into(),
+            ..service()
+        });
+
+        match m.link() {
+            Link::Up(info) => assert_eq!(info.capability_tier, "T2"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(m.mounts().count(), 1, "the rows are not the subject");
+        assert!(m.transfer("photos").is_some());
+        assert!(m.notice().is_some());
+    }
+
+    #[test]
+    fn a_description_arriving_after_the_link_went_does_not_revive_it() {
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.go_down(&LinkError::NotRunning);
+        m.restate(service());
+        assert!(matches!(m.link(), Link::Down(_)));
+        assert_eq!(m.mounts().count(), 0);
     }
 }

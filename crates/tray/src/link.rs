@@ -159,9 +159,10 @@ pub(crate) fn from_ipc(e: IpcError) -> LinkError {
 ///
 /// Reading `InterfaceVersion` first is the handshake: it is the cheapest call, and it is
 /// where an absent or incompatible interface surfaces as one clear failure instead of each
-/// later method failing on its own. Property caching is off: the four properties are read
-/// once per attachment, and the service does not announce a change to any of them, so a cache
-/// would be a `GetAll` and a subscription bought for nothing.
+/// later method failing on its own. Property caching is off: `CapabilityTier` is the one of
+/// the four that changes, the service announces it, and a caller that wants to follow it
+/// subscribes to `PropertiesChanged` directly — which works either way, where the cache-fed
+/// property streams do not exist at all without the cache.
 pub(crate) async fn open(
     conn: &zbus::Connection,
 ) -> Result<RcloneVfsmountTrayProxy<'static>, LinkError> {

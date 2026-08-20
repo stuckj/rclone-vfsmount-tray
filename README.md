@@ -2,13 +2,13 @@
 
 A native Linux system-tray applet for **rclone VFS mounts**, in the spirit of Mountain Duck.
 
-> **Status: early development — no graphical front end yet.** There is no tray icon and no
-> window. The service works: it finds rclone, reads your configuration, stays running, keeps
-> track of every mount it can see — and of what each one it started still has to upload — and
-> mounts or unmounts on request. And there is now a command-line client to ask it, so from a
-> terminal or a script it is usable today; over SSH it is the whole interface. Two things are
-> still missing before it is comfortable on a desktop — the tray icon and window, and bringing
-> your mounts up by itself when it starts. Follow the
+> **Status: early development.** The service works: it finds rclone, reads your
+> configuration, stays running, keeps track of every mount it can see — and of what each one
+> it started still has to upload — and mounts or unmounts on request. There is now a tray
+> icon for it, and a command-line client for terminals, scripts and over SSH. Two things are
+> still missing before it is comfortable on a desktop: the settings window, so mounts are
+> described by hand-editing a file; and bringing your mounts up by itself when it starts. The
+> tray draws its icons from your desktop's theme until it has a set of its own. Follow the
 > [roadmap](https://github.com/stuckj/rclone-vfsmount-tray/issues/1) for progress.
 
 ## What it will do
@@ -116,8 +116,8 @@ including any rclone mount already running that this project did not start — a
 and unmount on request. It does **not** bring anything up on its own yet, so a fresh setup
 starts with all of your mounts unmounted.
 
-There is no tray icon or window yet, but the `rclone-vfsmount-tray` binary is also a
-command-line client for the service — the way to drive it from a terminal, a script, or over
+The `rclone-vfsmount-tray` binary is both the tray icon and a command-line client. With a
+subcommand it is the client — the way to drive the service from a terminal, a script, or over
 SSH:
 
 ```sh
@@ -136,6 +136,46 @@ schema.
 
 The service takes `--config <path>` to point it at a different file, and `--log-level debug`
 for more detail. Stopping it leaves every mount exactly as it is.
+
+## The tray icon
+
+Run the same binary with no subcommand and it puts an icon in your panel:
+
+```sh
+rclone-vfsmount-tray
+```
+
+It needs a panel that speaks **StatusNotifierItem**: KDE Plasma does natively, and GNOME needs
+the AppIndicator extension. The old XEmbed system tray is not supported — it does not exist on
+Wayland. If nothing is listening the tray waits for a panel to appear rather than exiting, so
+starting it before your desktop has finished coming up is fine.
+
+The icon says what is happening, and its tooltip spells it out:
+
+| It says | Meaning |
+| --- | --- |
+| Up to date | Everything that is mounted has finished uploading |
+| Uploading | Files are still on their way to the remote |
+| Needs attention | A mount failed, an upload errored, or the cache is full. The only state that asks the panel to emphasise the icon — uploads in progress do not |
+| State partly unknown | Something is mounted whose outstanding uploads cannot be read: rclone is unreachable, or the mount has no write-back cache to look in |
+| Nothing mounted | No mount is serving |
+| Service unreachable | The tray cannot reach the service. **This says nothing about your mounts** — any that were up are still up |
+
+The menu lists every mount with its state. Each opens onto where it is mounted, an **Open**
+item that hands the mount point to your file manager, and **Mount** or **Unmount**. Mounts this
+service did not start are listed apart and cannot be acted on, because the service will not act
+on them. What is still to upload is summarised at the top — "3 files, 1.2 GiB pending", a rate,
+and an estimate where one can be derived honestly — and again per mount, listing up to ten
+files. When a figure comes from reading the cache directory rather than from rclone, the menu
+says so instead of passing it off as live progress.
+
+**Quit closes the icon and nothing else.** Your mounts keep serving and so does the service.
+Stopping the service is a separate item behind a second click, which says what will happen to
+your mounts first.
+
+The tray starts whether or not the service is running, and never starts it for you. If the
+service is not there the menu says so and offers to start it; if the service is restarted
+underneath it, the tray notices and reconnects on its own.
 
 ## Documentation
 

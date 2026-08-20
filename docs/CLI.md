@@ -1,9 +1,9 @@
 # Command-line interface
 
 The `rclone-vfsmount-tray` binary is two things in one. Run with a subcommand it is a
-scriptable D-Bus client that drives the service; run with none it will (once built) raise the
-tray icon. The subcommands need no graphical session — they work over SSH, and they are how
-the integration tests drive the system.
+scriptable D-Bus client that drives the service; run with none it raises the tray icon, which
+the [README](../README.md#the-tray-icon) describes. The subcommands need no graphical session —
+they work over SSH, and they are how the integration tests drive the system.
 
 They talk to the service and to nothing else. They hold no mount, and they do not start the
 service: if it is not running they say so and tell you how to start it, rather than starting
@@ -28,8 +28,10 @@ for pipes.
 | `unmount <name> [--force]` | Tear a mount down. `--force` detaches the mount point from whatever still holds it, severing a write in progress; it is never implied. |
 | `status [--json]` | Print the service's versions and every mount's state and outstanding uploads. |
 
-With no subcommand the binary is the tray, which is not built yet (#25, #26); today it logs
-that and exits 0.
+With no subcommand the binary raises the tray icon and stays up until it is asked to stop —
+from its own Quit item, or by `SIGTERM` or `SIGINT`. It exits `0` then, and `5` if it could not
+reach the session bus to raise an icon at all. A panel that is not yet running is not a
+failure: the tray waits for one.
 
 ### Exit codes
 

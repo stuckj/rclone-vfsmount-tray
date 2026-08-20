@@ -58,6 +58,10 @@ clap = { version = "4", features = ["derive"] }
 # in by the two binaries' test builds, not by `cargo build`.
 clap_mangen = "0.2"
 clap_complete = "4"
+# `StreamExt::next`, to drive the D-Bus signal streams from a `select!`. zbus re-exports
+# `futures_core` only, which has the trait but not the combinators. Already in the tree via
+# `ksni`; declared here because the tray drives the streams itself.
+futures-util = { version = "0.3", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

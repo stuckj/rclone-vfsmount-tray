@@ -51,6 +51,27 @@ rclone-vfsmount-tray -- list`, `… mount <name>`, `… status --json`. They dri
 same D-Bus interface a front end will (see [docs/CLI.md](docs/CLI.md)), and work with no tray
 running.
 
+The tray is that same binary with no subcommand: `cargo run -p rclone-vfsmount-tray`. It needs
+a StatusNotifierItem host to be *seen*, but not to run — with no panel it says the icon is not
+being shown and waits for one, which is what makes it inspectable on a headless machine. It
+serves the icon and the menu on its own bus connection either way, so
+`busctl --user list | grep StatusNotifierItem` finds it and these read what a panel would draw,
+and click an item:
+
+```sh
+N=org.kde.StatusNotifierItem-<pid>-1
+busctl --user get-property "$N" /StatusNotifierItem \
+    org.kde.StatusNotifierItem IconName Status ToolTip
+dbus-send --session --print-reply --dest="$N" /MenuBar \
+    com.canonical.dbusmenu.GetLayout int32:0 int32:-1 array:string:label
+dbus-send --session --print-reply --dest="$N" /MenuBar \
+    com.canonical.dbusmenu.Event int32:<id> string:clicked variant:string:"" uint32:0
+```
+
+Menu item ids are reassigned whenever the menu's *shape* changes — a mount appearing, a
+pending-file list growing — so read them again immediately before clicking one. A click on a
+stale id is accepted and does nothing.
+
 ## Before opening a pull request
 
 ```sh

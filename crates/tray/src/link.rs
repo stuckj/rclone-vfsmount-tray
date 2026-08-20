@@ -163,15 +163,37 @@ pub(crate) fn from_ipc(e: IpcError) -> LinkError {
 pub(crate) async fn open(
     conn: &zbus::Connection,
 ) -> Result<RcloneVfsmountTrayProxy<'static>, LinkError> {
-    build(RcloneVfsmountTrayProxy::builder(conn)).await
+    match owner_on(conn).await? {
+        Some(owner) => open_owner(conn, owner).await,
+        None => build(RcloneVfsmountTrayProxy::builder(conn)).await,
+    }
 }
 
-/// As [`open`], but addressed to one connection rather than to the service's well-known name.
+/// Who holds the service's name, asked of the bus daemon rather than of the service.
+///
+/// `None` for a connection with no bus behind it — a socket pair in a test — where there is
+/// no daemon to ask, no well-known name in play, and nothing that could be activated.
+pub(crate) async fn owner_on(
+    conn: &zbus::Connection,
+) -> Result<Option<zbus::names::OwnedUniqueName>, LinkError> {
+    if conn.unique_name().is_none() {
+        return Ok(None);
+    }
+    let name = zbus::names::BusName::try_from(ipc::BUS_NAME).expect("BUS_NAME is well formed");
+    let dbus = zbus::fdo::DBusProxy::new(conn).await.map_err(from_zbus)?;
+    match dbus.get_name_owner(name).await {
+        Ok(owner) => Ok(Some(owner)),
+        Err(zbus::fdo::Error::NameHasNoOwner(_)) => Err(LinkError::NotRunning),
+        Err(e) => Err(from_zbus(e.into())),
+    }
+}
+
+/// Addressed to one connection rather than to the service's well-known name.
 ///
 /// A unique name cannot be activated. Addressing the calls to it means that if the service
-/// exits while the tray holds this proxy, the next call fails instead of starting a new one —
-/// which is what #52 asks for and what the ownership check before this cannot guarantee on
-/// its own, since the service can go in the moment between the two.
+/// exits while the proxy is held, the next call fails instead of starting a new one — which
+/// is what #52 asks for, and what asking who owns the name cannot guarantee on its own, since
+/// the service can go in the moment between the two.
 pub(crate) async fn open_owner(
     conn: &zbus::Connection,
     owner: zbus::names::OwnedUniqueName,

@@ -74,16 +74,14 @@ async fn link(
 ) {
     let mut backoff = Backoff::new();
     loop {
+        // Two connections, because each has one reader and zbus gives a match rule a queue
+        // of 64 with no overflow: a burst larger than that blocks the reader until something
+        // drains it. On one connection the thing that would drain it is the loop below, and
+        // the loop is at that moment waiting on a method reply that has to come through the
+        // same reader — so it never arrives, and the tray freezes rendering the state it had.
+        // Split, a burst only delays the signals until the loop is polling them again.
         let conn = match zbus::Connection::session().await {
-            Ok(mut c) => {
-                // The signal streams and the method calls share this connection's reader. A
-                // reply cannot arrive while the queue behind a match rule is full, so the
-                // room for buffered signals has to exceed what one burst can produce: the
-                // service emits a state and a transfer change per mount, and the default 64
-                // is a handful of dozen mounts away from a stall rather than a lost signal.
-                c.set_max_queued(1024);
-                c
-            }
+            Ok(c) => c,
             Err(e) => {
                 if !down(&handle, &proxy_tx, &LinkError::NoSessionBus(e)).await {
                     return;
@@ -98,7 +96,21 @@ async fn link(
             }
         };
 
-        match follow(&handle, &conn, &proxy_tx, &refresh, &mut backoff).await {
+        let calls = match zbus::Connection::session().await {
+            Ok(c) => c,
+            Err(e) => {
+                if !down(&handle, &proxy_tx, &LinkError::NoSessionBus(e)).await {
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff.take()) => {}
+                    _ = refresh.notified() => backoff.reset(),
+                }
+                continue;
+            }
+        };
+
+        match follow(&handle, &conn, &calls, &proxy_tx, &refresh, &mut backoff).await {
             Step::Gone => return,
             _ => {
                 tokio::select! {
@@ -114,6 +126,7 @@ async fn link(
 async fn follow(
     handle: &Handle<TrayModel>,
     conn: &zbus::Connection,
+    calls: &zbus::Connection,
     proxy_tx: &watch::Sender<Option<Proxy>>,
     refresh: &Notify,
     backoff: &mut Backoff,
@@ -139,7 +152,18 @@ async fn follow(
     };
 
     loop {
-        match attach_and_serve(handle, conn, &dbus, proxy_tx, &mut owners, refresh, backoff).await {
+        match attach_and_serve(
+            handle,
+            conn,
+            calls,
+            &dbus,
+            proxy_tx,
+            &mut owners,
+            refresh,
+            backoff,
+        )
+        .await
+        {
             Step::Gone => return Step::Gone,
             Step::Bus => return Step::Bus,
             // The name changed hands. Nothing waits here: the next attempt is against
@@ -159,9 +183,11 @@ async fn follow(
 }
 
 /// One attempt: is anyone there, can we talk to them, and then follow them until they go.
+#[allow(clippy::too_many_arguments)]
 async fn attach_and_serve(
     handle: &Handle<TrayModel>,
     conn: &zbus::Connection,
+    calls: &zbus::Connection,
     dbus: &zbus::fdo::DBusProxy<'_>,
     proxy_tx: &watch::Sender<Option<Proxy>>,
     owners: &mut zbus::fdo::NameOwnerChangedStream,
@@ -193,7 +219,17 @@ async fn attach_and_serve(
         }
     };
 
-    let proxy = match link::open_owner(conn, owner).await {
+    let subscriptions = match link::open_owner(conn, owner.clone()).await {
+        Ok(p) => p,
+        Err(e) => {
+            return if down(handle, proxy_tx, &e).await {
+                Step::Backoff
+            } else {
+                Step::Gone
+            };
+        }
+    };
+    let proxy = match link::open_owner(calls, owner).await {
         Ok(p) => p,
         Err(e) => {
             // The name is owned but the handshake failed: an incompatible service, or one
@@ -206,15 +242,15 @@ async fn attach_and_serve(
         }
     };
 
-    let mut states = match proxy.receive_mount_state_changed().await {
+    let mut states = match subscriptions.receive_mount_state_changed().await {
         Ok(s) => s,
         Err(e) => return retry_after(handle, proxy_tx, e).await,
     };
-    let mut removals = match proxy.receive_mount_removed().await {
+    let mut removals = match subscriptions.receive_mount_removed().await {
         Ok(s) => s,
         Err(e) => return retry_after(handle, proxy_tx, e).await,
     };
-    let mut transfers = match proxy.receive_transfer_state_changed().await {
+    let mut transfers = match subscriptions.receive_transfer_state_changed().await {
         Ok(s) => s,
         Err(e) => return retry_after(handle, proxy_tx, e).await,
     };
@@ -276,12 +312,14 @@ async fn attach_and_serve(
             }
             ev = owners.next() => {
                 // Whether the name was dropped or handed to a new process, this session is
-                // over. Starting again decides which of the two it was.
-                proxy_tx.send_replace(None);
-                return if ev.is_some() {
+                // over and the rows go with it. A new instance can be slow to answer the
+                // handshake — mid-reconcile, say — and until it does, the previous one's
+                // mount table is not something the tray knows to be true.
+                let Some(_) = ev else { return bus_lost(handle, proxy_tx).await };
+                return if down(handle, proxy_tx, &LinkError::NotRunning).await {
                     Step::Now
                 } else {
-                    bus_lost(handle, proxy_tx).await
+                    Step::Gone
                 };
             }
             _ = refresh.notified() => {
@@ -387,16 +425,14 @@ async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Prox
             let Some(p) = current(&proxy) else {
                 return unreachable_now(&handle, &name).await;
             };
-            let r = p.mount(&name).await;
+            let r = call_mount(&p, &name).await;
             report(&handle, &name, r).await;
         }
         Action::Unmount(name) => {
             let Some(p) = current(&proxy) else {
                 return unreachable_now(&handle, &name).await;
             };
-            // Never forced from the menu: `--force` severs a write in flight, and that is a
-            // decision to make deliberately at the command line.
-            let r = p.unmount(&name, false).await;
+            let r = call_unmount(&p, &name).await;
             report(&handle, &name, r).await;
         }
         Action::Open(path) => open_in_file_manager(&handle, &path).await,
@@ -405,6 +441,20 @@ async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Prox
         // Both are the linker's or the dispatcher's, not an action to carry out here.
         Action::Refresh | Action::Quit => {}
     }
+}
+
+async fn call_mount(p: &Proxy, name: &str) -> Result<(), IpcError> {
+    p.mount(name).await
+}
+
+/// Take a mount down, never forcing it.
+///
+/// Forcing detaches the mount point from whatever still holds it, severing a write in flight;
+/// rclone then uploads the partial file as though it were complete. That is a decision to make
+/// deliberately, at the command line, so the menu has no way to express it — which is why this
+/// takes no flag rather than passing `false`. See DESIGN.md, "The unmount order".
+async fn call_unmount(p: &Proxy, name: &str) -> Result<(), IpcError> {
+    p.unmount(name, false).await
 }
 
 /// The proxy as it stands, cloned so nothing holds the watch lock across an await.
@@ -501,6 +551,26 @@ async fn say(handle: &Handle<TrayModel>, text: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{recorder, serve};
+
+    /// The one destructive thing this crate can ask for, and the one argument that makes it
+    /// destructive. Driven over a real socket so the value on the wire is what is asserted.
+    #[tokio::test]
+    async fn taking_a_mount_down_from_the_menu_never_forces_it() {
+        let (iface, calls) = recorder();
+        let (_server, client) = serve(iface).await;
+        let proxy = link::open(&client)
+            .await
+            .expect("the handshake is answered");
+
+        call_unmount(&proxy, "photos").await.expect("accepted");
+        call_mount(&proxy, "photos").await.expect("accepted");
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["unmount photos force=false", "mount photos"]
+        );
+    }
 
     #[test]
     fn a_failing_program_is_quoted_rather_than_reduced_to_its_exit_status() {

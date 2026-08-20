@@ -296,6 +296,7 @@ fn pending_summary(e: &MountEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::serve;
     use rvt_core::ipc::IpcError;
     use std::sync::{Arc, Mutex};
 
@@ -392,29 +393,6 @@ mod tests {
             files: vec![],
             degraded_reason: None,
         }
-    }
-
-    /// Serve one interface over a socket pair and hand back the client's end.
-    async fn serve<I>(iface: I) -> (zbus::Connection, zbus::Connection)
-    where
-        I: zbus::object_server::Interface,
-    {
-        let (server_sock, client_sock) = tokio::net::UnixStream::pair().unwrap();
-        let guid = zbus::Guid::generate();
-        let server = zbus::connection::Builder::socket(server_sock)
-            .server(guid)
-            .unwrap()
-            .p2p()
-            .auth_mechanism(zbus::AuthMechanism::Anonymous)
-            .serve_at(ipc::OBJECT_PATH, iface)
-            .unwrap()
-            .build();
-        let client = zbus::connection::Builder::socket(client_sock)
-            .p2p()
-            .auth_mechanism(zbus::AuthMechanism::Anonymous)
-            .build();
-        let (server, client) = tokio::join!(server, client);
-        (server.unwrap(), client.unwrap())
     }
 
     fn fake(mounts: Vec<MountView>) -> (Fake, Arc<Mutex<Vec<String>>>) {

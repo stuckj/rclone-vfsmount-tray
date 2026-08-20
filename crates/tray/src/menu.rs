@@ -134,12 +134,7 @@ fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
         _ => sub.push(disabled_action("Open")),
     }
     if v.managed {
-        let name = v.name.clone();
-        sub.push(if v.live {
-            action("Unmount", Action::Unmount(name))
-        } else {
-            action("Mount", Action::Mount(name))
-        });
+        sub.push(toggle(v.name.clone(), !v.live));
     } else {
         // The service refuses to act on a mount it did not start, so offering the action
         // here would only produce a refusal the user cannot do anything about.
@@ -160,7 +155,20 @@ fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
 
     let mut lines = Vec::new();
     if !t.outstanding_known {
-        lines.extend(text("Pending: unknown"));
+        // Whatever was seen is real; what is missing is any assurance it is all of it. A bare
+        // "unknown" throws away entries the menu goes on to list underneath.
+        lines.extend(text(if t.pending.files == 0 {
+            "Pending: unknown".to_string()
+        } else {
+            format!(
+                "{}, and possibly more",
+                pending_phrase(
+                    t.pending.files,
+                    t.pending.known_bytes,
+                    t.pending.unknown_size_files
+                )
+            )
+        }));
     } else if t.pending.files == 0 {
         lines.extend(text("All synced"));
     } else {
@@ -238,6 +246,33 @@ fn stop_service() -> MenuItem<TrayModel> {
     items.push(MenuItem::Separator);
     items.push(action("Yes, stop the service", Action::StopService));
     submenu("Stop service", items)
+}
+
+/// Ask for a mount to be up, or to be down — whichever its label offered.
+///
+/// The panel can hold a click for an item drawn before the mount last changed state, and
+/// `ksni` keeps an item's id as long as the menu's *shape* is unchanged, which two states of
+/// one mount can share. So the label is read as the request it made, and a request the mount
+/// already satisfies does nothing: a click on "Mount" must never take a mount down.
+fn toggle(name: String, want_live: bool) -> MenuItem<TrayModel> {
+    StandardItem {
+        label: escape(if want_live { "Mount" } else { "Unmount" }),
+        activate: Box::new(move |m: &mut TrayModel| {
+            let Some(live) = m.mounts().find(|v| v.name == name).map(|v| v.live) else {
+                return;
+            };
+            if live == want_live {
+                return;
+            }
+            m.act(if want_live {
+                Action::Mount(name.clone())
+            } else {
+                Action::Unmount(name.clone())
+            });
+        }),
+        ..Default::default()
+    }
+    .into()
 }
 
 /// Mount or unmount every managed mount that is not already in that state, decided when the
@@ -364,7 +399,7 @@ mod tests {
         out
     }
 
-    fn walk(items: &[MenuItem<TrayModel>], f: &mut impl FnMut(&MenuItem<TrayModel>)) {
+    pub(super) fn walk(items: &[MenuItem<TrayModel>], f: &mut impl FnMut(&MenuItem<TrayModel>)) {
         for item in items {
             f(item);
             if let MenuItem::SubMenu(s) = item {
@@ -393,7 +428,11 @@ mod tests {
     }
 
     /// Click the item with this label, and return what the tray was asked to do.
-    fn click(m: &mut TrayModel, rx: &mut UnboundedReceiver<Action>, label: &str) -> Vec<Action> {
+    pub(super) fn click(
+        m: &mut TrayModel,
+        rx: &mut UnboundedReceiver<Action>,
+        label: &str,
+    ) -> Vec<Action> {
         let items = build(m);
         let mut fired = false;
         walk(&items, &mut |i| {
@@ -738,29 +777,39 @@ mod round_two {
         all
     }
 
+    /// A label as drawn: DBusMenu turns each doubled underscore back into one. The escaped
+    /// string is longer than the row it produces, so the width has to be measured here and
+    /// not on what crosses the wire.
+    fn drawn(label: &str) -> String {
+        label.replace("__", "_")
+    }
+
     #[test]
     fn no_row_is_wider_than_the_panel_can_draw() {
         // A DBusMenu item is one line and does not wrap. A failure reason went out as a
         // single 1728-character label before this held.
         // A long name as well as a long reason: a submenu's label is one row that cannot be
-        // broken up, so it has to be cut instead.
-        let mut failed = mount(&"a-mount-with-a-very-long-name".repeat(4), "failed");
-        failed.reason = Some(a_paragraph());
-        failed.mount_point = Some(format!("/mnt/{}", "deep/".repeat(40)));
+        // broken up, so it has to be cut instead. Underscores throughout, because escaping
+        // happens after the measurement and a fixture without them cannot show that.
+        let name = "a_mount_with_a_very_long_name".repeat(4);
+        let mut failed = mount(&name, "failed");
+        failed.reason = Some(a_paragraph().replace('-', "_"));
+        failed.mount_point = Some(format!("/mnt/{}", "deep_dir/".repeat(40)));
 
-        let mut t = idle_transfer("photos");
-        t.degraded_reason = Some(a_paragraph());
+        let mut t = idle_transfer(&name);
+        t.degraded_reason = Some(a_paragraph().replace('-', "_"));
 
         let (mut m, _rx) = connected(vec![failed], vec![t]);
-        m.set_notice(Some("photos".into()), a_paragraph());
+        m.set_notice(Some(name), a_paragraph().replace('-', "_"));
 
         let all = every_label(&mut m);
-        assert!(!all.is_empty());
+        assert!(all.len() > 10, "{all:?}");
         for label in &all {
+            let row = drawn(label);
             assert!(
-                label.chars().count() <= ROW_WIDTH + 2,
-                "{} characters: {label:?}",
-                label.chars().count()
+                row.chars().count() <= ROW_WIDTH + 2,
+                "{} columns: {row:?}",
+                row.chars().count()
             );
         }
     }
@@ -774,6 +823,97 @@ mod round_two {
         assert!(
             all.iter().any(|l| l.ends_with('…')),
             "a reason shown in part must say so: {all:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod round_three {
+    use super::tests::{click, labels, walk};
+    use super::*;
+    use crate::fixtures::{connected, idle_transfer, mount, pending};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// Click an item in a menu drawn earlier, which is what a panel holding a click does.
+    fn click_stale(
+        items: &[MenuItem<TrayModel>],
+        label: &str,
+        m: &mut TrayModel,
+        rx: &mut UnboundedReceiver<Action>,
+    ) -> Vec<Action> {
+        let mut fired = false;
+        walk(items, &mut |i| {
+            if let MenuItem::Standard(s) = i {
+                if s.label == label && !fired {
+                    fired = true;
+                    (s.activate)(m);
+                }
+            }
+        });
+        assert!(fired, "no item labelled {label:?}");
+        let mut out = Vec::new();
+        while let Ok(a) = rx.try_recv() {
+            out.push(a);
+        }
+        out
+    }
+
+    #[test]
+    fn a_click_on_mount_never_takes_a_mount_down() {
+        // The panel can hold a click for an item drawn before the mount last changed state,
+        // and `ksni` keeps an item's id while the menu's shape is unchanged — which the
+        // unmounted and mounted-but-unreadable states of one mount can share. Reading the
+        // click as a toggle would unmount a mount that had just come back.
+        let (mut m, mut rx) = connected(vec![mount("photos", "unmounted")], vec![]);
+        let drawn = build(&m);
+        assert!(labels(&drawn).contains(&"Mount".to_string()));
+
+        m.upsert_mount(mount("photos", "mounted"));
+        assert_eq!(
+            click_stale(&drawn, "Mount", &mut m, &mut rx),
+            [],
+            "a request the mount already satisfies does nothing"
+        );
+    }
+
+    #[test]
+    fn a_click_on_mount_still_mounts_when_the_mount_is_down() {
+        let (mut m, mut rx) = connected(vec![mount("photos", "unmounted")], vec![]);
+        assert_eq!(
+            click(&mut m, &mut rx, "Mount"),
+            [Action::Mount("photos".into())]
+        );
+    }
+
+    #[test]
+    fn a_click_on_unmount_still_unmounts_when_the_mount_is_up() {
+        let (mut m, mut rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        assert_eq!(
+            click(&mut m, &mut rx, "Unmount"),
+            [Action::Unmount("photos".into())]
+        );
+    }
+
+    #[test]
+    fn a_click_for_a_mount_that_has_gone_does_nothing() {
+        let (mut m, mut rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        let drawn = build(&m);
+        m.remove_mount("photos");
+        assert_eq!(click_stale(&drawn, "Unmount", &mut m, &mut rx), []);
+    }
+
+    #[test]
+    fn a_count_that_cannot_be_vouched_for_is_shown_as_a_floor_not_dropped() {
+        // "Pending: unknown" above a list of the files it says nothing about reads as though
+        // the list were something else.
+        let mut t = idle_transfer("photos");
+        t.outstanding_known = false;
+        pending(&mut t, 2, 2048, 0);
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let all = labels(&build(&m));
+        assert!(
+            all.iter().any(|l| l.contains("and possibly more")),
+            "{all:?}"
         );
     }
 }

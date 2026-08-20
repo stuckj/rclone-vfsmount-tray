@@ -329,13 +329,17 @@ impl TrayModel {
             if t.degraded_reason.is_some() || !t.outstanding_known {
                 s.unobservable += 1;
             }
-            s.files += t.pending.files;
-            s.bytes += t.pending.known_bytes;
-            s.unknown_size_files += t.pending.unknown_size_files;
-            s.errored += t.errored_files.unwrap_or(0);
+            // Saturating throughout: these come off the bus, and a total that overflows is
+            // a panic in a debug build and a wrapped figure in a release one.
+            s.files = s.files.saturating_add(t.pending.files);
+            s.bytes = s.bytes.saturating_add(t.pending.known_bytes);
+            s.unknown_size_files = s
+                .unknown_size_files
+                .saturating_add(t.pending.unknown_size_files);
+            s.errored = s.errored.saturating_add(t.errored_files.unwrap_or(0));
             s.out_of_space |= t.out_of_space.unwrap_or(false);
             if let Some(r) = t.rate_bytes_per_sec {
-                rate = Some(rate.unwrap_or(0) + r);
+                rate = Some(rate.unwrap_or(0).saturating_add(r));
             }
             if t.pending.files > 0 {
                 // `remaining_bytes` sums only the files that contributed a size, so a queue
@@ -344,7 +348,7 @@ impl TrayModel {
                 let vouched =
                     t.has_byte_total() && t.outstanding_known && t.pending.unknown_size_files == 0;
                 remaining = match (remaining, vouched) {
-                    (Some(acc), true) => Some(acc + t.remaining_bytes()),
+                    (Some(acc), true) => Some(acc.saturating_add(t.remaining_bytes())),
                     _ => None,
                 };
             }
@@ -567,6 +571,7 @@ mod tests {
     fn every_state_shows_a_different_icon() {
         // A state that shares an icon with another is a state the user cannot tell apart.
         let states = [
+            TrayState::Connecting,
             TrayState::Disconnected,
             TrayState::Attention,
             TrayState::Degraded,

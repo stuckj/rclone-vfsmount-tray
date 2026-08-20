@@ -69,8 +69,9 @@ dbus-send --session --print-reply --dest="$N" /MenuBar \
 ```
 
 Menu item ids are reassigned whenever the menu's *shape* changes — a mount appearing, a
-pending-file list growing — so read them again immediately before clicking one. A click on a
-stale id is accepted and does nothing.
+pending-file list growing — so read them again immediately before clicking one. `ksni` answers
+a click on an id from before the last shape change with `InvalidArgs`, so a stale click fails
+rather than landing on whatever now holds that id.
 
 ## Before opening a pull request
 

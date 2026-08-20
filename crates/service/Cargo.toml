@@ -34,6 +34,10 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 rvt-testutil = { path = "../testutil" }
+# Generate this binary's man page and completions in-test, to check the committed copies
+# under `docs/` and `completions/` still match what the current `clap` command produces.
+clap_mangen = { workspace = true }
+clap_complete = { workspace = true }
 # `StreamExt`, to take one signal off a proxy's stream. zbus re-exports only what its own
 # macros need, and that does not include this.
 futures-util = { version = "0.3", default-features = false }

@@ -66,6 +66,15 @@ the last one matters for the same reason — a broken intra-doc link in the serv
 invisible to a `-p rvt-core` run and fails CI. Read clippy's output rather than trusting its
 exit status.
 
+The man pages under `docs/` and the completions under `completions/` are generated from the
+binaries' `clap` definitions, and a test diffs the committed copies against a fresh render, so
+changing a subcommand, flag, help string, or the crate version without regenerating fails the
+test suite. Regenerate and commit the result:
+
+```sh
+REGENERATE_CLI_DOCS=1 cargo test --workspace committed_man_and_completions_match_the_cli
+```
+
 ## Testing
 
 Tests live next to what they test — `#[cfg(test)] mod tests` in the same file for unit tests,

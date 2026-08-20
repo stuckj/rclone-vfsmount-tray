@@ -190,3 +190,70 @@ fn report(change: &Change) {
         ),
     }
 }
+
+/// The man page and shell completions under `docs/` and `completions/` are generated from
+/// [`Args`]; this proves the committed copies still match it, so a CLI change that forgets to
+/// regenerate fails here rather than shipping stale docs. Regenerate with
+/// `REGENERATE_CLI_DOCS=1 cargo test -p rclone-vfsmount-trayd --bin rclone-vfsmount-trayd`.
+#[cfg(test)]
+mod cli_docs {
+    use clap::CommandFactory;
+    use clap_complete::Shell;
+
+    const BIN: &str = "rclone-vfsmount-trayd";
+
+    /// Every generated file, as (path relative to the workspace root, its bytes).
+    fn artifacts() -> Vec<(String, Vec<u8>)> {
+        let cmd = crate::Args::command();
+
+        let mut man = Vec::new();
+        clap_mangen::Man::new(cmd.clone())
+            .render(&mut man)
+            .expect("render man page");
+        let mut out = vec![(format!("docs/{BIN}.1"), man)];
+
+        for (shell, path) in [
+            (Shell::Bash, format!("completions/bash/{BIN}")),
+            (Shell::Zsh, format!("completions/zsh/_{BIN}")),
+            (Shell::Fish, format!("completions/fish/{BIN}.fish")),
+        ] {
+            let mut buf = Vec::new();
+            clap_complete::generate(shell, &mut cmd.clone(), BIN, &mut buf);
+            out.push((path, buf));
+        }
+        out
+    }
+
+    /// `crates/<crate>/` sits two levels below the workspace root, where the committed
+    /// artifacts live.
+    fn workspace_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root above crates/<crate>")
+            .to_path_buf()
+    }
+
+    #[test]
+    fn committed_man_and_completions_match_the_cli() {
+        let root = workspace_root();
+        let regenerate = std::env::var_os("REGENERATE_CLI_DOCS").is_some();
+        let mut stale = Vec::new();
+
+        for (rel, bytes) in artifacts() {
+            let path = root.join(&rel);
+            if regenerate {
+                std::fs::create_dir_all(path.parent().unwrap()).expect("create output dir");
+                std::fs::write(&path, &bytes).expect("write artifact");
+            } else if std::fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
+                stale.push(rel);
+            }
+        }
+
+        assert!(
+            regenerate || stale.is_empty(),
+            "committed CLI docs are stale ({stale:?}). Regenerate with \
+             `REGENERATE_CLI_DOCS=1 cargo test -p {BIN} --bin {BIN}`."
+        );
+    }
+}

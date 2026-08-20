@@ -136,3 +136,19 @@ rclone-vfsmount-trayd [--config PATH] [--log-level LEVEL] [--foreground]
 `$XDG_CONFIG_HOME/rclone-vfsmount-tray/config.toml`). `--foreground` is accepted for running
 outside systemd while debugging. The service takes the well-known name on the session bus and
 serves until stopped; stopping it leaves every mount exactly as it is.
+
+## Man pages and shell completions
+
+Both binaries ship a man page and bash/zsh/fish completions, generated from the same `clap`
+definitions the binaries parse with, so they cannot describe options the binary does not have:
+
+- Man pages: [`docs/rclone-vfsmount-tray.1`](rclone-vfsmount-tray.1) and
+  [`docs/rclone-vfsmount-trayd.1`](rclone-vfsmount-trayd.1). Read one without installing with
+  `man ./docs/rclone-vfsmount-tray.1`.
+- Completions: `completions/{bash,zsh,fish}/`. For a quick try in the current shell, e.g.
+  `source completions/bash/rclone-vfsmount-tray`; packaging installs them to each shell's
+  completion directory.
+
+They are committed, and a test regenerates and diffs them, so a CLI change that does not
+update them fails CI rather than shipping stale docs (see CONTRIBUTING.md for the regenerate
+command).

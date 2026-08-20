@@ -113,7 +113,10 @@ mod tests {
 
     #[test]
     fn the_icon_follows_the_state_and_the_attention_icon_does_not() {
-        let (up, _a) = connected(vec![mount("photos", "mounted")], vec![]);
+        let (up, _a) = connected(
+            vec![mount("photos", "mounted")],
+            vec![idle_transfer("photos")],
+        );
         assert_eq!(up.icon_name(), TrayState::Idle.icon_name());
         // Shown in place of the normal icon while the status is NeedsAttention, so it has to
         // be the attention icon even while the tray is idle.
@@ -126,7 +129,10 @@ mod tests {
 
     #[test]
     fn the_panel_is_only_asked_to_emphasise_what_needs_acting_on() {
-        let (idle, _a) = connected(vec![mount("photos", "mounted")], vec![]);
+        let (idle, _a) = connected(
+            vec![mount("photos", "mounted")],
+            vec![idle_transfer("photos")],
+        );
         assert!(matches!(idle.status(), Status::Active));
 
         let mut busy = idle_transfer("photos");

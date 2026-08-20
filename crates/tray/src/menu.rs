@@ -11,7 +11,7 @@ use rvt_core::ipc::MountView;
 use rvt_core::transfer::TransferState;
 
 use crate::model::{
-    files_and_bytes, human_bytes, wrap, Action, Down, Link, Notice, ServiceInfo, TrayModel,
+    human_bytes, pending_phrase, wrap, Action, Down, Link, Notice, ServiceInfo, TrayModel,
 };
 
 /// Files listed per mount before the rest are counted instead.
@@ -91,7 +91,7 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
         items.extend(foreign.iter().map(|v| mount_item(m, v)));
     }
 
-    if managed.iter().any(|v| !v.live) || managed.iter().any(|v| v.live) {
+    if !managed.is_empty() {
         items.push(MenuItem::Separator);
     }
     if managed.iter().any(|v| !v.live) {
@@ -111,16 +111,17 @@ fn connected(m: &TrayModel, info: &ServiceInfo) -> Vec<MenuItem<TrayModel>> {
 
 /// One mount: what it is, what can be done to it, and what it still has to upload.
 fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
-    let mut sub = vec![text(match v.mount_point.as_deref() {
-        Some(p) => escape(p),
-        None => "no mount point recorded".to_string(),
-    })];
+    let mut sub = vec![text(
+        v.mount_point
+            .as_deref()
+            .unwrap_or("no mount point recorded"),
+    )];
     if let Some(remote) = &v.remote {
-        sub.push(text(escape(remote)));
+        sub.push(text(remote));
     }
     // #26: a failed mount says why here rather than only that it failed.
     if let Some(reason) = &v.reason {
-        sub.push(text(format!("Failed: {}", escape(reason))));
+        sub.push(text(format!("Failed: {reason}")));
     }
 
     sub.push(MenuItem::Separator);
@@ -144,12 +145,7 @@ fn mount_item(m: &TrayModel, v: &MountView) -> MenuItem<TrayModel> {
     sub.push(MenuItem::Separator);
     sub.extend(transfer_lines(m.transfer(&v.name)));
 
-    SubMenu {
-        label: format!("{} — {}", escape(&v.name), v.state),
-        submenu: sub,
-        ..Default::default()
-    }
-    .into()
+    submenu(format!("{} — {}", v.name, v.state), sub)
 }
 
 /// What one mount still has to upload, rendered only as far as its tier allows.
@@ -164,14 +160,15 @@ fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
     } else if t.pending.files == 0 {
         lines.push(text("All synced"));
     } else {
-        lines.push(text(format!(
-            "{} pending",
-            files_and_bytes(t.pending.files, t.pending.known_bytes)
+        lines.push(text(pending_phrase(
+            t.pending.files,
+            t.pending.known_bytes,
+            t.pending.unknown_size_files,
         )));
     }
 
     for f in t.files.iter().take(FILE_CAP) {
-        let mut line = escape(&f.name);
+        let mut line = f.name.clone();
         if let Some(size) = f.size {
             line.push_str(&format!(" — {}", human_bytes(size)));
         }
@@ -210,52 +207,48 @@ fn transfer_lines(t: Option<&TransferState>) -> Vec<MenuItem<TrayModel>> {
         ));
     }
     if let Some(why) = &t.degraded_reason {
-        lines.push(text(escape(why)));
+        lines.push(text(why));
     }
     lines
 }
 
 fn about(info: &ServiceInfo) -> MenuItem<TrayModel> {
-    SubMenu {
-        label: "About".into(),
-        submenu: vec![
+    submenu(
+        "About",
+        vec![
             text(format!("Tray {}", env!("CARGO_PKG_VERSION"))),
-            text(format!("Service {}", escape(&info.service_version))),
+            text(format!("Service {}", info.service_version)),
             text(format!(
                 "Interface {} (this client speaks {})",
                 info.interface_version,
                 rvt_core::ipc::INTERFACE_VERSION
             )),
-            text(format!("rclone {}", escape(&info.rclone_version))),
-            text(format!("Capability tier {}", escape(&info.capability_tier))),
+            text(format!("rclone {}", info.rclone_version)),
+            text(format!("Capability tier {}", info.capability_tier)),
         ],
-        ..Default::default()
-    }
-    .into()
+    )
 }
 
 /// Stopping the service is a submenu rather than an item, so it cannot be hit by reflex on
 /// the way to Quit (#26).
 fn stop_service() -> MenuItem<TrayModel> {
-    SubMenu {
-        label: "Stop service".into(),
-        submenu: vec![
+    submenu(
+        "Stop service",
+        vec![
             text("Mounts stay up unless the service is configured"),
             text("to unmount when it stops."),
             text("The tray will show the service as unreachable."),
             MenuItem::Separator,
             action("Yes, stop the service", Action::StopService),
         ],
-        ..Default::default()
-    }
-    .into()
+    )
 }
 
 /// Mount or unmount every managed mount that is not already in that state, decided when the
 /// item is clicked rather than when the menu was drawn.
 fn bulk(label: &str, mount: bool) -> MenuItem<TrayModel> {
     StandardItem {
-        label: label.to_string(),
+        label: escape(label),
         activate: Box::new(move |m: &mut TrayModel| {
             let names: Vec<String> = m
                 .mounts()
@@ -295,7 +288,7 @@ fn notice_lines(notice: Option<&Notice>) -> Vec<MenuItem<TrayModel>> {
 /// A line to read rather than click.
 fn text(label: impl Into<String>) -> MenuItem<TrayModel> {
     StandardItem {
-        label: label.into(),
+        label: escape(&label.into()),
         enabled: false,
         ..Default::default()
     }
@@ -304,7 +297,7 @@ fn text(label: impl Into<String>) -> MenuItem<TrayModel> {
 
 fn action(label: impl Into<String>, a: Action) -> MenuItem<TrayModel> {
     StandardItem {
-        label: label.into(),
+        label: escape(&label.into()),
         activate: Box::new(move |m: &mut TrayModel| m.act(a.clone())),
         ..Default::default()
     }
@@ -315,17 +308,29 @@ fn action(label: impl Into<String>, a: Action) -> MenuItem<TrayModel> {
 /// under the cursor as mounts come and go.
 fn disabled_action(label: &str) -> MenuItem<TrayModel> {
     StandardItem {
-        label: label.to_string(),
+        label: escape(label),
         enabled: false,
         ..Default::default()
     }
     .into()
 }
 
-/// Protect text that came from a mount name, a path or rclone from being read as a mnemonic.
+fn submenu(label: impl Into<String>, items: Vec<MenuItem<TrayModel>>) -> MenuItem<TrayModel> {
+    SubMenu {
+        label: escape(&label.into()),
+        submenu: items,
+        ..Default::default()
+    }
+    .into()
+}
+
+/// Protect a label from being read as a mnemonic.
 ///
 /// DBusMenu strips a single underscore and turns a doubled one back into a single, so a
-/// mount called `my_files` reaches the panel as "myfiles" unless it is doubled here.
+/// mount called `my_files` reaches the panel as "myfiles" unless it is doubled here. Applied
+/// in the four constructors above rather than at each call site: most of what reaches a label
+/// is a mount name, a path, or a sentence from rclone, and the ones that are not are our own
+/// prose, which has no underscores to double.
 fn escape(s: &str) -> String {
     s.replace('_', "__")
 }
@@ -339,7 +344,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedReceiver;
 
     /// Every label in the tree, submenus included. Separators have none and are skipped.
-    fn labels(items: &[MenuItem<TrayModel>]) -> Vec<String> {
+    pub(super) fn labels(items: &[MenuItem<TrayModel>]) -> Vec<String> {
         let mut out = Vec::new();
         walk(items, &mut |item| match item {
             MenuItem::Standard(s) => out.push(s.label.clone()),
@@ -398,7 +403,7 @@ mod tests {
         actions
     }
 
-    fn says(items: &[MenuItem<TrayModel>], needle: &str) -> bool {
+    pub(super) fn says(items: &[MenuItem<TrayModel>], needle: &str) -> bool {
         labels(items).iter().any(|l| l.contains(needle))
     }
 
@@ -603,5 +608,93 @@ mod tests {
         let l = labels(&build(&all_up));
         assert!(l.contains(&"Unmount all".to_string()));
         assert!(!l.contains(&"Mount all".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod round_one {
+    use super::tests::{labels, says};
+    use super::*;
+    use crate::fixtures::{connected, idle_transfer, mount, pending};
+    use crate::link::LinkError;
+
+    #[test]
+    fn the_per_mount_line_carries_the_same_qualifier_as_the_summary() {
+        // Two renderings of one figure. Without the qualifier the submenu's copy reads as a
+        // total, and it sits a click away from the one that says otherwise.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 5, 100 * 1024 * 1024, 1);
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+
+        let lines = labels(&build(&m));
+        let pending_lines: Vec<&String> = lines.iter().filter(|l| l.contains("pending")).collect();
+        assert_eq!(pending_lines.len(), 2, "{lines:?}");
+        assert!(
+            pending_lines
+                .iter()
+                .all(|l| l.contains("1 of unknown size")),
+            "{pending_lines:?}"
+        );
+    }
+
+    /// Whether every underscore in a label survives DBusMenu's mnemonic stripping, which
+    /// keeps one of each pair and drops a lone one.
+    fn escaped(label: &str) -> bool {
+        label
+            .split(|c| c != '_')
+            .filter(|run| !run.is_empty())
+            .all(|run| run.len() % 2 == 0)
+    }
+
+    #[test]
+    fn every_label_reaches_the_panel_with_its_underscores() {
+        let mut failed = mount("my_photos", "failed");
+        failed.reason = Some("rclone_mount exited with code 1".into());
+        failed.mount_point = Some("/mnt/my_photos".into());
+        failed.remote = Some("my_remote:some_path".into());
+
+        let mut t = idle_transfer("my_photos");
+        pending(&mut t, 1, 1024, 0);
+        t.degraded_reason = Some("no write_back queue on this mount".into());
+        t.files = vec![rvt_core::ipc::TransferFileView {
+            name: "holiday_2026.mp4".into(),
+            size: Some(1024),
+            in_flight: Some(true),
+            tries: Some(1),
+            bytes_sent: None,
+        }];
+
+        let (mut m, _rx) = connected(vec![failed], vec![t]);
+        m.set_notice(Some("my_photos".into()), "my_photos: still_in_use");
+
+        for label in labels(&build(&m)) {
+            assert!(escaped(&label), "a lone underscore survives in {label:?}");
+        }
+
+        // And the same on the other menu, whose headline can carry an error from zbus.
+        m.go_down(&LinkError::Transport(zbus::Error::Failure(
+            "peer_disconnected".into(),
+        )));
+        m.set_notice(None, "could not run systemctl: no_such_unit");
+        for label in labels(&build(&m)) {
+            assert!(escaped(&label), "a lone underscore survives in {label:?}");
+        }
+    }
+
+    #[test]
+    fn the_guard_on_escaping_can_tell_the_difference() {
+        // The control: an unescaped name has to fail the check the test above applies.
+        assert!(escaped("my__files"));
+        assert!(!escaped("my_files"));
+        assert!(!escaped("a___b"));
+        assert!(escaped("no underscores here"));
+    }
+
+    #[test]
+    fn a_serving_mount_with_no_reading_says_so_in_the_summary_too() {
+        let (m, _rx) = connected(vec![mount("elsewhere", "foreign")], vec![]);
+        let items = build(&m);
+        assert!(says(&items, "unknown"), "{:?}", labels(&items));
+        assert!(!says(&items, "All synced"), "{:?}", labels(&items));
     }
 }

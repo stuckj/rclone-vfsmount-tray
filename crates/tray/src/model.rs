@@ -73,10 +73,9 @@ impl Down {
                 format!("The service is too old: it offers interface {found}, this needs {needed}"),
                 false,
             ),
-            LinkError::Refused(_) | LinkError::Transport(_) => (
-                format!("The service could not be reached: {}", e.message()),
-                false,
-            ),
+            // `message` already opens with the clause a headline would otherwise repeat,
+            // and for a refusal it is the service's own sentence, which stands alone.
+            LinkError::Refused(_) | LinkError::Transport(_) => (e.message(), false),
         };
         Self {
             headline,
@@ -232,6 +231,15 @@ impl TrayModel {
         self.notice = None;
     }
 
+    /// Re-read everything from the *same* service. Unlike [`Self::go_up`] this keeps the
+    /// notice: it describes something that happened during this service's lifetime, and the
+    /// user asking for a refresh is not asking to be told less.
+    pub(crate) fn resync(&mut self, info: ServiceInfo, mounts: Vec<MountView>) {
+        self.link = Link::Up(info);
+        self.mounts = mounts.into_iter().map(|m| (m.name.clone(), m)).collect();
+        self.transfers.clear();
+    }
+
     pub(crate) fn upsert_mount(&mut self, view: MountView) {
         // The notice described this mount as it was before this change.
         if self.notice.as_ref().and_then(|n| n.mount.as_deref()) == Some(view.name.as_str()) {
@@ -303,6 +311,12 @@ impl TrayModel {
             }
             s.live += 1;
             let Some(t) = self.transfers.get(&m.name) else {
+                // A mount that is serving and has told us nothing. Permanent for a mount
+                // this service did not start — it refuses to read one, and never polls it —
+                // and momentary for one whose state arrived before its first reading.
+                // Passing over it would leave the total describing the other mounts and the
+                // headline calling the lot of them synced.
+                s.unobservable += 1;
                 continue;
             };
             if t.degraded_reason.is_some() || !t.outstanding_known {
@@ -317,7 +331,12 @@ impl TrayModel {
                 rate = Some(rate.unwrap_or(0) + r);
             }
             if t.pending.files > 0 {
-                remaining = match (remaining, t.has_byte_total() && t.outstanding_known) {
+                // `remaining_bytes` sums only the files that contributed a size, so a queue
+                // holding one file of unknown size is as unusable for an estimate as a tier
+                // with no byte total at all — it would time the others and ignore that one.
+                let vouched =
+                    t.has_byte_total() && t.outstanding_known && t.pending.unknown_size_files == 0;
+                remaining = match (remaining, vouched) {
                     (Some(acc), true) => Some(acc + t.remaining_bytes()),
                     _ => None,
                 };
@@ -386,10 +405,7 @@ impl Summary {
                 "All synced".to_string()
             });
         }
-        let mut line = format!("{} pending", files_and_bytes(self.files, self.bytes));
-        if self.unknown_size_files > 0 {
-            line.push_str(&format!(" ({} of unknown size)", self.unknown_size_files));
-        }
+        let mut line = pending_phrase(self.files, self.bytes, self.unknown_size_files);
         if self.unobservable > 0 {
             line.push_str(&format!(", plus {} mount(s) unreadable", self.unobservable));
         }
@@ -410,8 +426,20 @@ impl Summary {
     }
 }
 
+/// What is outstanding, in one phrase, wherever it is shown.
+///
+/// The qualifier is part of it rather than something a caller adds: a count printed without
+/// it reads as a total, and the summary and the per-mount line have to agree.
+pub(crate) fn pending_phrase(files: u64, bytes: u64, unknown_size_files: u64) -> String {
+    let mut line = format!("{} pending", files_and_bytes(files, bytes));
+    if unknown_size_files > 0 {
+        line.push_str(&format!(" ({unknown_size_files} of unknown size)"));
+    }
+    line
+}
+
 /// "3 files, 1.2 GiB", or just the count when no total is known.
-pub(crate) fn files_and_bytes(files: u64, bytes: u64) -> String {
+fn files_and_bytes(files: u64, bytes: u64) -> String {
     let plural = if files == 1 { "file" } else { "files" };
     if bytes == 0 {
         format!("{files} {plural}")
@@ -470,10 +498,13 @@ pub(crate) fn eta_phrase(secs: u64) -> String {
 /// the command that names the process holding the mount — arrives as a row wider than the
 /// screen unless it is broken up here.
 pub(crate) fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    // Characters, not bytes. A mount point with an accented letter in it would otherwise
+    // wrap short of the width, and the service's own sentences carry em dashes.
+    let fits = |line: &str, word: &str| line.chars().count() + 1 + word.chars().count() <= width;
     let mut lines: Vec<String> = Vec::new();
     for word in text.split_whitespace() {
         match lines.last_mut() {
-            Some(line) if line.len() + 1 + word.len() <= width => {
+            Some(line) if fits(line, word) => {
                 line.push(' ');
                 line.push_str(word);
             }
@@ -484,10 +515,9 @@ pub(crate) fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
         lines.truncate(max_lines);
         // The truncation has to be visible: a sentence that stops mid-clause reads as the
         // whole message, and the part cut off is usually the part that says what to do.
-        lines
-            .last_mut()
-            .expect("max_lines is not zero")
-            .push_str(" …");
+        if let Some(last) = lines.last_mut() {
+            last.push_str(" …");
+        }
     }
     lines
 }
@@ -539,6 +569,7 @@ mod tests {
             "before the first attempt"
         );
         m.go_up(service(), vec![mount("photos", "mounted")]);
+        m.upsert_transfer(&idle_transfer("photos"));
         assert_eq!(m.state(), TrayState::Idle);
         m.go_down(&LinkError::NotRunning);
         assert_eq!(m.state(), TrayState::Disconnected);
@@ -882,5 +913,98 @@ mod tests {
         let (m, mut rx) = blank();
         m.act(Action::Mount("photos".into()));
         assert_eq!(rx.try_recv(), Ok(Action::Mount("photos".into())));
+    }
+}
+
+#[cfg(test)]
+mod round_one {
+    use super::*;
+    use crate::fixtures::{connected, idle_transfer, mount, pending, service};
+
+    #[test]
+    fn a_serving_mount_that_has_said_nothing_is_not_called_synced() {
+        // The durable case is a mount this service did not start: it refuses to read one and
+        // never polls it, so no reading ever arrives and the row is live and blank forever.
+        // Counting it as clean would answer "is my work uploaded?" with a yes nothing backs.
+        let (m, _rx) = connected(vec![mount("elsewhere", "foreign")], vec![]);
+        assert_eq!(m.state(), TrayState::Degraded);
+        let line = m.summary().pending_line().expect("something is mounted");
+        assert!(line.contains("unknown"), "{line}");
+        assert_ne!(line, "All synced");
+    }
+
+    #[test]
+    fn one_blank_mount_does_not_hide_behind_another_that_answered() {
+        let mut busy = idle_transfer("photos");
+        pending(&mut busy, 2, 2048, 0);
+        let (m, _rx) = connected(
+            vec![mount("photos", "mounted"), mount("elsewhere", "foreign")],
+            vec![busy],
+        );
+        let s = m.summary();
+        assert_eq!(s.unobservable, 1);
+        assert!(
+            s.pending_line().unwrap().contains("1 mount(s) unreadable"),
+            "{:?}",
+            s.pending_line()
+        );
+    }
+
+    #[test]
+    fn an_estimate_needs_every_pending_file_to_have_a_size() {
+        // `remaining_bytes` sums only files that reported one, so timing the queue by it
+        // while a file has no size counts down to zero with that file still to send. A cache
+        // walk produces exactly this: a dirty descriptor whose data file cannot be measured
+        // leaves the walk complete and the size absent.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 5, 100 * 1024 * 1024, 1);
+        t.rate_bytes_per_sec = Some(10 * 1024 * 1024);
+
+        let s = connected(vec![mount("photos", "mounted")], vec![t])
+            .0
+            .summary();
+        assert_eq!(s.remaining, None);
+        let line = s.rate_line().expect("the rate itself is still known");
+        assert!(!line.contains("left"), "{line}");
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_notice_and_a_new_service_does_not() {
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.set_notice(Some("photos".into()), "photos: still in use");
+
+        m.resync(service(), vec![mount("photos", "mounted")]);
+        assert!(
+            m.notice().is_some(),
+            "re-reading the same service does not make the refusal untrue"
+        );
+
+        m.go_up(service(), vec![mount("photos", "mounted")]);
+        assert!(
+            m.notice().is_none(),
+            "a new service lifetime knows nothing of it"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_line_is_measured_in_characters_not_bytes() {
+        // Every sentence the tray shows may carry an em dash, and the service's failure text
+        // does. Counting its three bytes as three columns wraps the row short.
+        let text = "él él él él";
+        assert_eq!(wrap(text, 11, 5), ["él él él él"]);
+    }
+
+    #[test]
+    fn an_unreachable_service_says_so_once() {
+        let d = Down::from_error(&LinkError::Transport(zbus::Error::Failure(
+            "connection reset".into(),
+        )));
+        assert_eq!(
+            d.headline.matches("could not be reached").count(),
+            1,
+            "{}",
+            d.headline
+        );
+        assert!(d.headline.contains("connection reset"));
     }
 }

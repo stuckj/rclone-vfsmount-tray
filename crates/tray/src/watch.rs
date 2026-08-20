@@ -262,8 +262,31 @@ async fn attach_and_serve(
                 return if ev.is_some() { Step::Now } else { Step::Bus };
             }
             _ = refresh.notified() => {
-                proxy_tx.send_replace(None);
-                return Step::Now;
+                // Re-read through the proxy already open rather than starting the link
+                // over. Reattaching would re-resolve the name, re-add three match rules and
+                // drop the notice explaining why the last action was refused — all to learn
+                // the same thing this asks for directly.
+                match gather(&proxy).await {
+                    Ok((info, mounts, readings)) => {
+                        let applied = handle
+                            .update(move |m| {
+                                m.resync(info, mounts);
+                                for t in &readings {
+                                    m.upsert_transfer(t);
+                                }
+                            })
+                            .await
+                            .is_some();
+                        if !applied { return Step::Gone }
+                    }
+                    Err(e) => {
+                        return if down(handle, proxy_tx, &e).await {
+                            Step::Backoff
+                        } else {
+                            Step::Gone
+                        }
+                    }
+                }
             }
         }
     }
@@ -282,8 +305,9 @@ async fn gather(proxy: &Proxy) -> Result<Snapshot, LinkError> {
     let mounts = proxy.list_mounts().await.map_err(link::from_ipc)?;
     let mut transfers = Vec::with_capacity(mounts.len());
     for m in &mounts {
-        // A mount whose transfer read fails is still a mount. The menu says "no upload
-        // information yet" for it, which is true, rather than losing the row.
+        // A mount whose transfer read fails is still a mount, and keeping the row loses
+        // nothing: a live mount with no reading counts as unreadable in the summary, so the
+        // tray says it cannot see that one rather than leaving it out of the total.
         if let Ok(t) = proxy.get_transfer_state(&m.name).await {
             transfers.push(t);
         }
@@ -338,23 +362,9 @@ async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Prox
             let r = p.unmount(&name, false).await;
             report(&handle, &name, r).await;
         }
-        Action::Open(path) => spawn_and_report(&handle, "xdg-open", &["xdg-open", &path]).await,
-        Action::StartService => {
-            spawn_and_report(
-                &handle,
-                "systemctl",
-                &["systemctl", "--user", "start", link::UNIT],
-            )
-            .await
-        }
-        Action::StopService => {
-            spawn_and_report(
-                &handle,
-                "systemctl",
-                &["systemctl", "--user", "stop", link::UNIT],
-            )
-            .await
-        }
+        Action::Open(path) => open_in_file_manager(&handle, &path).await,
+        Action::StartService => unit(&handle, "start").await,
+        Action::StopService => unit(&handle, "stop").await,
         // Both are the linker's or the dispatcher's, not an action to carry out here.
         Action::Refresh | Action::Quit => {}
     }
@@ -393,17 +403,99 @@ async fn report(handle: &Handle<TrayModel>, name: &str, r: Result<(), IpcError>)
     }
 }
 
-/// Run a program and say so in the menu if it did not work.
-async fn spawn_and_report(handle: &Handle<TrayModel>, what: &str, argv: &[&str]) {
-    let status = tokio::process::Command::new(argv[0])
-        .args(&argv[1..])
+/// Hand a mount point to whatever the desktop opens directories with.
+async fn open_in_file_manager(handle: &Handle<TrayModel>, path: &str) {
+    // `status`, not `output`: xdg-open hands the path to a file manager that inherits its
+    // standard error, and a captured pipe would stay open until that program exited.
+    let text = match tokio::process::Command::new("xdg-open")
+        .arg(path)
         .status()
-        .await;
-    let text = match status {
+        .await
+    {
         Ok(s) if s.success() => return,
-        Ok(s) => format!("{what} exited with {s}"),
-        Err(e) => format!("could not run {what}: {e}"),
+        Ok(s) => format!("xdg-open could not open {path}: {s}"),
+        Err(e) => format!("could not run xdg-open: {e}"),
     };
+    say(handle, text).await;
+}
+
+/// Start or stop the service's unit.
+async fn unit(handle: &Handle<TrayModel>, verb: &str) {
+    // `output` here, because systemd's refusals are only in its standard error — an exit
+    // status of 5 says nothing, "Unit ... not found" says what to fix. systemctl writes a
+    // line or two and exits, so nothing is waiting on a pipe a grandchild holds open.
+    let text = match tokio::process::Command::new("systemctl")
+        .args(["--user", verb, link::UNIT])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => return,
+        Ok(o) => match complaint(&o.stderr) {
+            Some(line) => format!("Could not {verb} the service: {line}"),
+            None => format!(
+                "Could not {verb} the service: systemctl exited with {}",
+                o.status
+            ),
+        },
+        Err(e) => format!("could not run systemctl: {e}"),
+    };
+    say(handle, text).await;
+}
+
+/// The last thing a program said before failing, if it said anything.
+///
+/// Capped, because this becomes a menu row: systemd is terse, but nothing here guarantees
+/// that of whatever else may end up being run.
+fn complaint(stderr: &[u8]) -> Option<String> {
+    const CAP: usize = 200;
+    let text = String::from_utf8_lossy(stderr);
+    let line = text.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    Some(match line.char_indices().nth(CAP) {
+        Some((cut, _)) => format!("{} …", &line[..cut]),
+        None => line.to_string(),
+    })
+}
+
+async fn say(handle: &Handle<TrayModel>, text: String) {
     tracing::warn!(%text, "an action did not complete");
     let _ = handle.update(|m| m.set_notice(None, text)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_program_is_quoted_rather_than_reduced_to_its_exit_status() {
+        // What systemd writes when the unit is not installed. "exited with 5" sends the
+        // reader to the journal; this sentence says what to fix.
+        let said = "Failed to start rclone-vfsmount-trayd.service: Unit rclone-vfsmount-trayd.service not found.";
+        assert_eq!(
+            complaint(format!("{said}\n").as_bytes()).as_deref(),
+            Some(said)
+        );
+    }
+
+    #[test]
+    fn the_last_thing_said_is_the_one_shown() {
+        assert_eq!(
+            complaint(b"warming up\nthe real problem\n\n").as_deref(),
+            Some("the real problem")
+        );
+        assert_eq!(complaint(b"").as_deref(), None);
+        assert_eq!(complaint(b"   \n \n").as_deref(), None);
+    }
+
+    #[test]
+    fn a_program_that_will_not_stop_talking_does_not_become_the_whole_menu() {
+        let long = "x".repeat(500);
+        let got = complaint(long.as_bytes()).expect("something was said");
+        assert!(got.chars().count() < 210, "{} chars", got.chars().count());
+        assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn invalid_utf8_is_still_readable_rather_than_dropped() {
+        assert!(complaint(&[0xff, b'h', b'i']).is_some());
+    }
 }

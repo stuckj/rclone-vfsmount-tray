@@ -34,12 +34,10 @@ const ROW_LINES: usize = 8;
 /// A block that grew and shrank with what it had to say would change the menu's shape, and
 /// `ksni` answers a shape change by invalidating every menu id. Each is padded to its size
 /// instead, so the text arriving or going is a property change the panel absorbs.
-/// A failure reason is the unit's recent journal, and systemd narrates a whole restart cycle
-/// around the one line rclone contributes — so how far in that line sits depends on how much
-/// systemd had to say first, and no budget is the right one. Sixteen rows covers a full cycle
-/// with slack; #110 is the fix, which is for the service to hand over rclone's output rather
-/// than the whole window.
-const REASON_ROWS: usize = 16;
+/// A failure reason is what rclone said before it gave up, which the service takes out of
+/// the unit's journal for exactly this. Eight rows is a few times what that runs to, and the
+/// block says so when it has to cut.
+const REASON_ROWS: usize = 8;
 const DEGRADED_ROWS: usize = 3;
 const NOTICE_ROWS: usize = 8;
 
@@ -862,22 +860,26 @@ mod tests {
         assert!(!says(&items, "All synced"), "{:?}", labels(&items));
     }
 
-    /// One restart cycle of a failing mount, as captured from the journal, repeated the way
-    /// `Restart=on-failure` repeats it before systemd gives up. This is what a reason really
-    /// looks like, and it is what makes it longer than any row budget.
-    fn a_real_failure(cycles: usize) -> String {
-        let cycle = "Starting rvt-mount-bad.service - rclone mount r6src: at \
-                     /home/claude/.claude/jobs/f70669bc/tmp/r6/mnt...\n\
-                     Started rvt-mount-bad.service - rclone mount r6src: at \
-                     /home/claude/.claude/jobs/f70669bc/tmp/r6/mnt.\n\
-                     ERROR+4: Fatal error: failed to mount FUSE fs: \
-                     \"/home/claude/.claude/jobs/f70669bc/tmp/r6/mnt\" is not empty, use \
-                     --allow-non-empty to mount anyway\n\
-                     rvt-mount-bad.service: Main process exited, code=exited, \
-                     status=1/FAILURE\n\
-                     rvt-mount-bad.service: Failed with result 'exit-code'.\n\
-                     rvt-mount-bad.service: Scheduled restart job, restart counter is at 1.\n";
-        cycle.repeat(cycles)
+    /// What the service sends as a reason: rclone's own output, with systemd's narration
+    /// about the unit already taken out of it. `lines` distinct complaints, which is how a
+    /// reason gets long now that a restart loop's repeats are collapsed.
+    fn a_real_failure(lines: usize) -> String {
+        let said = [
+            "NOTICE: rvtlive: --vfs-cache-mode writes with --transfers 4",
+            "ERROR : rvtlive: failed to open cache file: mkdir \
+             /home/john/.cache/rclone/vfs/rvtlive: permission denied",
+            "ERROR+4: Fatal error: failed to mount FUSE fs: \"/home/john/mnt/photos\" is not \
+             empty, use --allow-non-empty to mount anyway",
+            "ERROR : rvtlive: vfs cache: failed to clean cache: unlinkat: permission denied",
+            "NOTICE: rvtlive: cleaning cache directory before giving up",
+        ];
+        said.iter()
+            .cycle()
+            .take(lines)
+            .enumerate()
+            .map(|(n, l)| format!("{l} (attempt {n})"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// Every label the panel would draw, whatever the tray is showing.
@@ -904,14 +906,14 @@ mod tests {
         // happens after the measurement and a fixture without them cannot show that.
         let name = "a_mount_with_a_very_long_name".repeat(4);
         let mut failed = mount(&name, "failed");
-        failed.reason = Some(a_real_failure(3).replace('-', "_"));
+        failed.reason = Some(a_real_failure(20).replace('-', "_"));
         failed.mount_point = Some(format!("/mnt/{}", "deep_dir/".repeat(40)));
 
         let mut t = idle_transfer(&name);
-        t.degraded_reason = Some(a_real_failure(1).replace('-', "_"));
+        t.degraded_reason = Some(a_real_failure(4).replace('-', "_"));
 
         let (mut m, _rx) = connected(vec![failed], vec![t]);
-        m.set_notice(Some(name), a_real_failure(1).replace('-', "_"), Some(false));
+        m.set_notice(Some(name), a_real_failure(4).replace('-', "_"), Some(false));
 
         let all = every_label(&mut m);
         assert!(all.len() > 10, "{all:?}");
@@ -927,10 +929,10 @@ mod tests {
 
     #[test]
     fn a_reason_too_long_to_show_says_it_was_cut() {
-        // Three restart cycles is what systemd allows before it stops trying, and no fixed
-        // budget shows all of it — so the row that ends the block has to say it was cut.
+        // rclone can say more than any fixed budget shows, so the row that ends the block
+        // has to say it was cut.
         let mut failed = mount("photos", "failed");
-        failed.reason = Some(a_real_failure(3));
+        failed.reason = Some(a_real_failure(20));
         let (m, _rx) = connected(vec![failed], vec![]);
         let all = labels(&build(&m));
         assert!(
@@ -1356,27 +1358,14 @@ mod tests {
 
     #[test]
     fn a_reason_says_why_even_when_rclone_was_not_the_first_to_speak() {
-        // The `journalctl -n 20` window opens wherever it opens. With two lines of rclone
-        // output the cycle is longer, so the window starts mid-restart and seven rows go on
-        // systemd before rclone gets a word in. Eight rows reached the start of the error
-        // and stopped; this is the case that showed the budget was the wrong lever (#110).
+        // rclone has its own preamble before the line that matters — a cache-mode notice, a
+        // first error about the cache directory — so the cause is still several rows in.
         let mut failed = mount("photos", "failed");
-        failed.reason = Some(
-            "rvt-mount-photos.service: Scheduled restart job, restart counter is at 1.\n\
-             Starting rvt-mount-photos.service - rclone mount gdrive:photos at \
-             /home/john/mnt/photos...\n\
-             Started rvt-mount-photos.service - rclone mount gdrive:photos at \
-             /home/john/mnt/photos.\n\
-             NOTICE: rvtlive: --vfs-cache-mode writes with --transfers 4\n\
-             ERROR : rvtlive: failed to open cache file: mkdir \
-             /home/john/.cache/rclone/vfs/rvtlive: permission denied\n\
-             Fatal error: failed to start VFS: permission denied"
-                .to_string(),
-        );
+        failed.reason = Some(a_real_failure(3));
         let (m, _rx) = connected(vec![failed], vec![]);
         let drawn = labels(&build(&m)).join(" ");
         assert!(
-            drawn.contains("permission denied"),
+            drawn.contains("use --allow-non-empty"),
             "the cause was cut: {drawn}"
         );
     }

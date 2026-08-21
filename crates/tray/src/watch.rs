@@ -512,26 +512,52 @@ async fn edit(handle: &Handle<TrayModel>, f: impl FnOnce(&mut TrayModel)) -> boo
 
 /// Carry out one menu action.
 async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Proxy>>, a: Action) {
-    match &a {
-        Action::Mount(name) => {
-            let Some(p) = current(&proxy) else {
-                return unreachable_now(&handle, &a).await;
-            };
-            let r = call_mount(&p, name).await;
-            report(&handle, &a, r).await;
-        }
-        Action::Unmount(name) => {
-            let Some(p) = current(&proxy) else {
-                return unreachable_now(&handle, &a).await;
-            };
-            let r = call_unmount(&p, name).await;
-            report(&handle, &a, r).await;
-        }
-        Action::Open(path) => open_in_file_manager(&handle, path).await,
-        Action::StartService => unit(&handle, "start").await,
-        Action::StopService => unit(&handle, "stop").await,
+    dispatch(&handle, &proxy, &a).await;
+}
+
+/// Carry out one action against anywhere the outcome can be written down.
+///
+/// Split from [`carry_out`] over [`Records`] so it can be driven in a test: a
+/// `ksni::Handle` cannot be made without a StatusNotifierItem on a session bus, and tier-1
+/// CI has neither. See #111.
+async fn dispatch(to: &impl Records, proxy: &watch::Receiver<Option<Proxy>>, a: &Action) {
+    match a {
+        Action::Mount(name) => match current(proxy) {
+            Some(p) => {
+                let r = call_mount(&p, name).await;
+                say_outcome(to, a, r).await;
+            }
+            None => unreachable_now(to, a).await,
+        },
+        Action::Unmount(name) => match current(proxy) {
+            Some(p) => {
+                let r = call_unmount(&p, name).await;
+                say_outcome(to, a, r).await;
+            }
+            None => unreachable_now(to, a).await,
+        },
+        Action::Open(path) => open_in_file_manager(to, path).await,
+        Action::StartService => unit(to, "start").await,
+        Action::StopService => unit(to, "stop").await,
         // Both are the linker's or the dispatcher's, not an action to carry out here.
         Action::Refresh | Action::Quit => {}
+    }
+}
+
+/// Somewhere an outcome can be recorded.
+///
+/// One method, over the one thing the action path does to the tray. The program passes
+/// `ksni`'s handle; a test passes a bare model.
+trait Records {
+    fn write_down(
+        &self,
+        f: impl FnOnce(&mut TrayModel) + Send,
+    ) -> impl std::future::Future<Output = ()> + Send;
+}
+
+impl Records for Handle<TrayModel> {
+    async fn write_down(&self, f: impl FnOnce(&mut TrayModel) + Send) {
+        let _ = self.update(f).await;
     }
 }
 
@@ -554,10 +580,9 @@ fn current(proxy: &watch::Receiver<Option<Proxy>>) -> Option<Proxy> {
     proxy.borrow().clone()
 }
 
-async fn unreachable_now(handle: &Handle<TrayModel>, a: &Action) {
+async fn unreachable_now(to: &impl Records, a: &Action) {
     let (mount, wanted) = target_of(a);
-    let _ = handle
-        .update(|m| m.set_notice(mount, "The service is not reachable", wanted))
+    to.write_down(|m| m.set_notice(mount, "The service is not reachable", wanted))
         .await;
 }
 
@@ -568,12 +593,12 @@ fn target_of(a: &Action) -> (Option<String>, Option<bool>) {
 }
 
 /// Say what became of one action.
-async fn report(handle: &Handle<TrayModel>, a: &Action, r: Result<(), LinkError>) {
+async fn say_outcome(to: &impl Records, a: &Action, r: Result<(), LinkError>) {
     let Some((mount, text, wanted)) = outcome(a, r) else {
         return;
     };
     tracing::warn!(mount = ?mount, %text, "the service refused");
-    let _ = handle.update(|m| m.set_notice(mount, text, wanted)).await;
+    to.write_down(|m| m.set_notice(mount, text, wanted)).await;
 }
 
 /// What to record about an outcome, or `None` when there is nothing to say.
@@ -590,7 +615,7 @@ fn outcome(a: &Action, r: Result<(), LinkError>) -> Option<(Option<String>, Stri
 }
 
 /// Hand a mount point to whatever the desktop opens directories with.
-async fn open_in_file_manager(handle: &Handle<TrayModel>, path: &str) {
+async fn open_in_file_manager(to: &impl Records, path: &str) {
     // `status`, not `output`: xdg-open hands the path to a file manager that inherits its
     // standard error, and a captured pipe would stay open until that program exited.
     let ran = tokio::process::Command::new("xdg-open")
@@ -602,12 +627,12 @@ async fn open_in_file_manager(handle: &Handle<TrayModel>, path: &str) {
         Err(e) => Some(format!("could not run xdg-open: {e}")),
     };
     if let Some(text) = told {
-        say(handle, text).await;
+        say(to, text).await;
     }
 }
 
 /// Start or stop the service's unit.
-async fn unit(handle: &Handle<TrayModel>, verb: &str) {
+async fn unit(to: &impl Records, verb: &str) {
     // `output` here, because systemd's refusals are only in its standard error — an exit
     // status of 5 says nothing, "Unit ... not found" says what to fix. systemctl writes a
     // line or two and exits, so nothing is waiting on a pipe a grandchild holds open.
@@ -629,7 +654,7 @@ async fn unit(handle: &Handle<TrayModel>, verb: &str) {
         Err(e) => Some(format!("could not run systemctl: {e}")),
     };
     if let Some(text) = told {
-        say(handle, text).await;
+        say(to, text).await;
     }
 }
 
@@ -655,9 +680,9 @@ fn complaint(stderr: &[u8]) -> Option<String> {
     })
 }
 
-async fn say(handle: &Handle<TrayModel>, text: String) {
+async fn say(to: &impl Records, text: String) {
     tracing::warn!(%text, "an action did not complete");
-    let _ = handle.update(|m| m.set_notice(None, text, None)).await;
+    to.write_down(|m| m.set_notice(None, text, None)).await;
 }
 
 #[cfg(test)]
@@ -878,5 +903,113 @@ mod tests {
             ran_well(false, "unit not found").as_deref(),
             Some("unit not found")
         );
+    }
+
+    /// A tray with no panel behind it. The action path only ever writes to the model, so
+    /// this is the whole of what it needs (#111).
+    struct Bare(std::sync::Mutex<TrayModel>);
+
+    impl Records for Bare {
+        async fn write_down(&self, f: impl FnOnce(&mut TrayModel) + Send) {
+            f(&mut self.0.lock().unwrap());
+        }
+    }
+
+    impl Bare {
+        fn new() -> (Self, tokio::sync::mpsc::UnboundedReceiver<Action>) {
+            let (model, rx) = crate::fixtures::blank();
+            (Bare(std::sync::Mutex::new(model)), rx)
+        }
+
+        fn notice(&self) -> Option<crate::model::Notice> {
+            self.0.lock().unwrap().notice().cloned()
+        }
+    }
+
+    /// A connection to a service that refuses, and the channel a proxy is published on.
+    async fn refusing() -> (zbus::Connection, watch::Receiver<Option<Proxy>>) {
+        struct Refuse;
+
+        #[zbus::interface(name = "io.github.stuckj.RcloneVfsmountTray1")]
+        impl Refuse {
+            async fn mount(&self, name: &str) -> Result<(), IpcError> {
+                Err(IpcError::BadMountPoint(format!("{name}: not a directory")))
+            }
+            async fn unmount(&self, name: &str, _force: bool) -> Result<(), IpcError> {
+                Err(IpcError::Busy(format!("{name}: still in use")))
+            }
+            #[zbus(property)]
+            async fn interface_version(&self) -> u32 {
+                rvt_core::ipc::INTERFACE_VERSION
+            }
+        }
+
+        let (server, client) = crate::fixtures::serve(Refuse).await;
+        let proxy = link::open(&client)
+            .await
+            .expect("the handshake is answered");
+        let (tx, rx) = watch::channel(Some(proxy));
+        // The sender has to outlive the receiver, and so does the serving end.
+        std::mem::forget(tx);
+        (server, rx)
+    }
+
+    #[tokio::test]
+    async fn a_refused_action_is_written_down_against_its_own_mount() {
+        let (_server, proxy) = refusing().await;
+        let (to, _rx) = Bare::new();
+
+        dispatch(&to, &proxy, &Action::Unmount("photos".into())).await;
+        let n = to.notice().expect("a refusal is worth saying");
+        assert_eq!(n.mount.as_deref(), Some("photos"));
+        assert_eq!(n.answered_by, Some(false));
+        assert!(n.text.contains("still in use"), "{}", n.text);
+
+        dispatch(&to, &proxy, &Action::Mount("docs".into())).await;
+        let n = to.notice().expect("and so is this one");
+        assert_eq!(n.mount.as_deref(), Some("docs"));
+        assert_eq!(n.answered_by, Some(true));
+        assert!(n.text.contains("not a directory"), "{}", n.text);
+    }
+
+    #[tokio::test]
+    async fn a_click_with_no_link_says_so_rather_than_going_quiet() {
+        // `current` returning nothing is the whole difference between a click that acts and
+        // a click that does nothing at all.
+        let (_tx, rx) = watch::channel(None);
+        let (to, _actions) = Bare::new();
+
+        dispatch(&to, &rx, &Action::Mount("photos".into())).await;
+        let n = to.notice().expect("the click has to report something");
+        assert_eq!(n.mount.as_deref(), Some("photos"));
+        assert!(n.text.contains("not reachable"), "{}", n.text);
+    }
+
+    #[tokio::test]
+    async fn asking_for_nothing_of_the_service_writes_nothing_down() {
+        let (_server, proxy) = refusing().await;
+        let (to, _rx) = Bare::new();
+        for quiet in [Action::Refresh, Action::Quit] {
+            dispatch(&to, &proxy, &quiet).await;
+            assert!(to.notice().is_none(), "{quiet:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_program_that_is_not_there_is_reported() {
+        // `xdg-open` is absent on a headless machine, which is exactly where someone reaches
+        // for the menu over SSH and wonders why nothing happened.
+        let (to, _rx) = Bare::new();
+        dispatch(
+            &to,
+            &watch::channel(None).1,
+            &Action::Open("/mnt/photos".into()),
+        )
+        .await;
+        let n = to
+            .notice()
+            .expect("a click that did nothing has to say why");
+        assert_eq!(n.mount, None);
+        assert!(n.answered_by.is_none(), "nothing will ever answer this one");
     }
 }

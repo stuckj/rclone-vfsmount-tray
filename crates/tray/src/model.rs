@@ -545,7 +545,10 @@ impl Summary {
         }
         let mut line = pending_phrase(self.files, self.bytes, self.unknown_size_files);
         if self.unobservable > 0 {
-            line.push_str(&format!(", plus {} mount(s) unreadable", self.unobservable));
+            // Not a count of mounts: the one that cannot be read is often the very one these
+            // figures came from, and "plus 1 mount(s) unreadable" then reads as a second
+            // mount the user does not have.
+            line.push_str(", and possibly more");
         }
         Some(line)
     }
@@ -1114,7 +1117,7 @@ mod tests {
         let s = m.summary();
         assert_eq!(s.unobservable, 1);
         assert!(
-            s.pending_line().unwrap().contains("1 mount(s) unreadable"),
+            s.pending_line().unwrap().ends_with(", and possibly more"),
             "{:?}",
             s.pending_line()
         );

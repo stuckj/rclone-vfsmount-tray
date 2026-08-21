@@ -366,4 +366,34 @@ mod tests {
         b.reset();
         assert_eq!(b.take(), Backoff::FIRST);
     }
+
+    /// A service whose method replies with a well-known bus error name.
+    struct Stonewall;
+
+    #[zbus::interface(name = "io.github.stuckj.RcloneVfsmountTray1")]
+    impl Stonewall {
+        async fn mount(&self, _name: &str) -> zbus::fdo::Result<()> {
+            Err(zbus::fdo::Error::NoReply("took too long".into()))
+        }
+        #[zbus(property)]
+        async fn interface_version(&self) -> u32 {
+            ipc::INTERFACE_VERSION
+        }
+    }
+
+    #[tokio::test]
+    async fn an_error_reply_to_a_method_call_is_read_from_where_it_arrives() {
+        // A bus error answering a *method* arrives as `MethodError`; the same name answering
+        // a property read is lifted into `FDO`. Only the second is exercised elsewhere, and
+        // every menu-driven action takes the first — so without this arm a silent service
+        // reaches the user as an unreachable one.
+        let (_server, client) = crate::fixtures::serve(Stonewall).await;
+        let proxy = open(&client).await.expect("the handshake is answered");
+
+        let e = proxy.mount("photos").await.expect_err("the fake refuses");
+        assert!(
+            matches!(from_ipc(e), LinkError::Silent),
+            "the name did not survive the trip"
+        );
+    }
 }

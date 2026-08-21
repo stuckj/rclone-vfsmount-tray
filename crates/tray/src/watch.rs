@@ -420,9 +420,13 @@ async fn attaching<T>(
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
     match tokio::time::timeout(PATIENCE, step).await {
         Ok(done) => done,
-        Err(_) => Err(LinkError::Transport(zbus::Error::Failure(
-            "the service holds its name but is not answering".into(),
-        ))),
+        // `Silent`, not a transport failure: everything wrapped here is addressed to an owner
+        // the bus has just confirmed, so a silence is that owner not answering rather than a
+        // link that has gone. It also decides how much is rebuilt — `give_up` tears down both
+        // connections for a transport failure, which is the wrong answer for a service that
+        // is merely busy. A socket that has really died surfaces as a transport failure on
+        // the next attempt anyway.
+        Err(_) => Err(LinkError::Silent),
     }
 }
 

@@ -44,7 +44,7 @@ A distinct code per outcome, so a script can branch without parsing prose:
 | `2` | Usage error: an unknown flag, or a `--log-level` that is not a level. |
 | `3` | The service is not running. |
 | `4` | The service speaks an interface this build cannot use — a different major version, or one too old for the command. |
-| `5` | No session bus, or the call failed to reach the service for some other reason. |
+| `5` | No session bus; the service took the call and did not answer; or the call failed for some other reason. |
 
 Codes `3`, `4` and `5` all mean the client never got an answer. None of them says anything
 about your mounts: a mount that was up before is up still. This is why `status` reports them

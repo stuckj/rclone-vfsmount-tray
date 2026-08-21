@@ -1584,4 +1584,68 @@ mod tests {
         let (m, _rx) = connected(vec![mount("photos", "unmounted")], vec![]);
         assert!(!item(&build(&m), "Unmount all").enabled);
     }
+
+    #[test]
+    fn a_file_shows_how_far_along_it_is_where_the_tier_says_that_much() {
+        // The one place rclone's own byte accounting reaches the menu. Nothing rendered it in
+        // either direction before, so both the figure and the gate went unchecked.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 1, 4096, 0);
+        t.has_progress = true;
+        t.files = vec![rvt_core::ipc::TransferFileView {
+            name: "clip.mp4".into(),
+            size: Some(4096),
+            in_flight: Some(true),
+            tries: Some(1),
+            bytes_sent: Some(1024),
+        }];
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m));
+        assert!(
+            drawn
+                .iter()
+                .any(|l| l == "clip.mp4 — 4 KiB (uploading) — 1 KiB sent"),
+            "{drawn:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_not_given_a_progress_figure() {
+        // Nothing to send, so "0 B sent" is a measurement of nothing. rclone queues a
+        // zero-byte file like any other.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 1, 0, 0);
+        t.has_progress = true;
+        t.files = vec![rvt_core::ipc::TransferFileView {
+            name: "empty.txt".into(),
+            size: Some(0),
+            in_flight: Some(true),
+            tries: Some(1),
+            bytes_sent: Some(0),
+        }];
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m)).join(" ");
+        assert!(drawn.contains("empty.txt"), "{drawn}");
+        assert!(!drawn.contains("sent"), "{drawn}");
+    }
+
+    #[test]
+    fn a_file_of_no_known_size_is_not_given_a_progress_figure() {
+        // `bytes_sent` without a size is progress through an unknown total, which is not a
+        // figure at all.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 1, 0, 1);
+        t.has_progress = true;
+        t.files = vec![rvt_core::ipc::TransferFileView {
+            name: "clip.mp4".into(),
+            size: None,
+            in_flight: Some(true),
+            tries: Some(1),
+            bytes_sent: Some(1024),
+        }];
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m)).join(" ");
+        assert!(drawn.contains("clip.mp4"), "{drawn}");
+        assert!(!drawn.contains("sent"), "{drawn}");
+    }
 }

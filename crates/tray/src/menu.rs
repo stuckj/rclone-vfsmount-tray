@@ -34,11 +34,12 @@ const ROW_LINES: usize = 8;
 /// A block that grew and shrank with what it had to say would change the menu's shape, and
 /// `ksni` answers a shape change by invalidating every menu id. Each is padded to its size
 /// instead, so the text arriving or going is a property change the panel absorbs.
-/// A failure reason is the unit's recent journal, so systemd's own narration is mixed into
-/// it; the line that says what went wrong is near the top, and eight rows is what it takes to
-/// reach the end of it. A refusal from the service runs to about the same, and its last
-/// sentence — the command that names the process holding a mount — is the actionable one.
-const REASON_ROWS: usize = 8;
+/// A failure reason is the unit's recent journal, and systemd narrates a whole restart cycle
+/// around the one line rclone contributes — so how far in that line sits depends on how much
+/// systemd had to say first, and no budget is the right one. Sixteen rows covers a full cycle
+/// with slack; #110 is the fix, which is for the service to hand over rclone's output rather
+/// than the whole window.
+const REASON_ROWS: usize = 16;
 const DEGRADED_ROWS: usize = 3;
 const NOTICE_ROWS: usize = 8;
 
@@ -51,7 +52,8 @@ pub(crate) fn build(m: &TrayModel) -> Vec<MenuItem<TrayModel>> {
         Link::Connecting => {
             // The same denial the disconnected menu carries: this shows the rows cleared,
             // and can stand for as long as a new service instance takes to answer.
-            let mut items = text("Connecting to the service…");
+            let mut items = notice_lines(m.notice());
+            items.extend(text("Connecting to the service…"));
             items.extend(text(
                 "Mounts already up are unaffected — this is only the tray's link.",
             ));
@@ -858,16 +860,22 @@ mod tests {
         assert!(!says(&items, "All synced"), "{:?}", labels(&items));
     }
 
-    /// A paragraph of the shape the service actually produces: rclone's stderr, or its busy
-    /// refusal, which carries the mount point twice and so has a long unbreakable run in it.
-    fn a_paragraph() -> String {
-        format!(
-            "/home/someone/mnt/photos could not be unmounted: fusermount3: failed to unmount \
-             /home/someone/mnt/photos: Device or resource busy. Usually a process is still \
-             using the mount — a file open under it, or a shell whose working directory is \
-             inside it. `fuser -m /home/someone/mnt/photos` names them. {}",
-            "supplementary-detail-with-no-spaces-at-all-".repeat(12)
-        )
+    /// One restart cycle of a failing mount, as captured from the journal, repeated the way
+    /// `Restart=on-failure` repeats it before systemd gives up. This is what a reason really
+    /// looks like, and it is what makes it longer than any row budget.
+    fn a_real_failure(cycles: usize) -> String {
+        let cycle = "Starting rvt-mount-bad.service - rclone mount r6src: at \
+                     /home/claude/.claude/jobs/f70669bc/tmp/r6/mnt...\n\
+                     Started rvt-mount-bad.service - rclone mount r6src: at \
+                     /home/claude/.claude/jobs/f70669bc/tmp/r6/mnt.\n\
+                     ERROR+4: Fatal error: failed to mount FUSE fs: \
+                     \"/home/claude/.claude/jobs/f70669bc/tmp/r6/mnt\" is not empty, use \
+                     --allow-non-empty to mount anyway\n\
+                     rvt-mount-bad.service: Main process exited, code=exited, \
+                     status=1/FAILURE\n\
+                     rvt-mount-bad.service: Failed with result 'exit-code'.\n\
+                     rvt-mount-bad.service: Scheduled restart job, restart counter is at 1.\n";
+        cycle.repeat(cycles)
     }
 
     /// Every label the panel would draw, whatever the tray is showing.
@@ -894,14 +902,14 @@ mod tests {
         // happens after the measurement and a fixture without them cannot show that.
         let name = "a_mount_with_a_very_long_name".repeat(4);
         let mut failed = mount(&name, "failed");
-        failed.reason = Some(a_paragraph().replace('-', "_"));
+        failed.reason = Some(a_real_failure(3).replace('-', "_"));
         failed.mount_point = Some(format!("/mnt/{}", "deep_dir/".repeat(40)));
 
         let mut t = idle_transfer(&name);
-        t.degraded_reason = Some(a_paragraph().replace('-', "_"));
+        t.degraded_reason = Some(a_real_failure(1).replace('-', "_"));
 
         let (mut m, _rx) = connected(vec![failed], vec![t]);
-        m.set_notice(Some(name), a_paragraph().replace('-', "_"), Some(false));
+        m.set_notice(Some(name), a_real_failure(1).replace('-', "_"), Some(false));
 
         let all = every_label(&mut m);
         assert!(all.len() > 10, "{all:?}");
@@ -917,8 +925,10 @@ mod tests {
 
     #[test]
     fn a_reason_too_long_to_show_says_it_was_cut() {
+        // Three restart cycles is what systemd allows before it stops trying, and no fixed
+        // budget shows all of it — so the row that ends the block has to say it was cut.
         let mut failed = mount("photos", "failed");
-        failed.reason = Some(a_paragraph());
+        failed.reason = Some(a_real_failure(3));
         let (m, _rx) = connected(vec![failed], vec![]);
         let all = labels(&build(&m));
         assert!(
@@ -1293,5 +1303,79 @@ mod tests {
         let items = build(&m);
         assert!(says(&items, "unaffected"), "{:?}", labels(&items));
         assert!(!says(&items, "mounted"), "{:?}", labels(&items));
+    }
+
+    #[test]
+    fn a_queue_nothing_can_vouch_for_is_never_reported_as_synced() {
+        // A `minimal` cache mode, or any partially observed reading, sees an empty queue it
+        // cannot stand behind. Saying "All synced" about it is the claim DESIGN forbids.
+        let mut t = idle_transfer("photos");
+        t.outstanding_known = false;
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m));
+        assert!(drawn.iter().any(|l| l == "Pending: unknown"), "{drawn:?}");
+        assert!(!drawn.iter().any(|l| l == "All synced"), "{drawn:?}");
+    }
+
+    #[test]
+    fn per_file_progress_is_shown_only_where_the_tier_established_it() {
+        // `bytes_sent` without `has_progress` is a combination the poller does not build, but
+        // the reading is rebuilt from the wire on this side and nothing re-establishes the
+        // pairing — which is what this gate is for.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 1, 1024, 0);
+        t.has_progress = false;
+        t.files = vec![rvt_core::ipc::TransferFileView {
+            name: "clip.mp4".into(),
+            size: Some(1024),
+            in_flight: Some(true),
+            tries: Some(1),
+            bytes_sent: Some(512),
+        }];
+
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m)).join(" ");
+        assert!(drawn.contains("clip.mp4"), "{drawn}");
+        assert!(
+            !drawn.contains("sent"),
+            "a figure the tier never established: {drawn}"
+        );
+    }
+
+    #[test]
+    fn a_notice_arriving_while_reconnecting_is_still_shown() {
+        // A refusal can land in the window between the name changing hands and the handshake
+        // finishing, which can stand for as long as the attach timeout.
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.go_connecting();
+        m.set_notice(None, "could not run systemctl: no such unit", None);
+        assert!(says(&build(&m), "could not run systemctl"));
+    }
+
+    #[test]
+    fn a_reason_says_why_even_when_rclone_was_not_the_first_to_speak() {
+        // The `journalctl -n 20` window opens wherever it opens. With two lines of rclone
+        // output the cycle is longer, so the window starts mid-restart and seven rows go on
+        // systemd before rclone gets a word in. Eight rows reached the start of the error
+        // and stopped; this is the case that showed the budget was the wrong lever (#110).
+        let mut failed = mount("photos", "failed");
+        failed.reason = Some(
+            "rvt-mount-photos.service: Scheduled restart job, restart counter is at 1.\n\
+             Starting rvt-mount-photos.service - rclone mount gdrive:photos at \
+             /home/john/mnt/photos...\n\
+             Started rvt-mount-photos.service - rclone mount gdrive:photos at \
+             /home/john/mnt/photos.\n\
+             NOTICE: rvtlive: --vfs-cache-mode writes with --transfers 4\n\
+             ERROR : rvtlive: failed to open cache file: mkdir \
+             /home/john/.cache/rclone/vfs/rvtlive: permission denied\n\
+             Fatal error: failed to start VFS: permission denied"
+                .to_string(),
+        );
+        let (m, _rx) = connected(vec![failed], vec![]);
+        let drawn = labels(&build(&m)).join(" ");
+        assert!(
+            drawn.contains("permission denied"),
+            "the cause was cut: {drawn}"
+        );
     }
 }

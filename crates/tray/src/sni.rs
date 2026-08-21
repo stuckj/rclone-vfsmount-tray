@@ -190,7 +190,20 @@ mod tests {
             "1 of 2 mounted\n3 files, 1.2 GiB pending\n4 MiB/s · about 5m left"
         );
         assert_eq!(tip.icon_name, TrayState::Syncing.icon_name());
-        assert!(tip.title.contains(TRAY_TITLE));
+        assert_eq!(tip.title, format!("{TRAY_TITLE} — Uploading"));
+    }
+
+    #[test]
+    fn the_tooltip_title_names_its_scope_when_a_mount_is_outside_it() {
+        // The model decides the wording; this is the wiring that carries it to the panel.
+        let (m, _rx) = connected(
+            vec![mount("photos", "mounted"), mount("elsewhere", "foreign")],
+            vec![idle_transfer("photos")],
+        );
+        assert_eq!(
+            m.tool_tip().title,
+            format!("{TRAY_TITLE} — Managed mounts up to date")
+        );
     }
 
     #[test]

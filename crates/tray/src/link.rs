@@ -278,6 +278,11 @@ mod tests {
             classify_error_name("org.freedesktop.DBus.Error.ServiceUnknown"),
             Wire::NotRunning
         ));
+        // Both names a bus daemon uses for "nobody is answering to that".
+        assert!(matches!(
+            classify_error_name("org.freedesktop.DBus.Error.NameHasNoOwner"),
+            Wire::NotRunning
+        ));
         assert!(matches!(
             classify_error_name("org.freedesktop.DBus.Error.UnknownInterface"),
             Wire::Incompatible

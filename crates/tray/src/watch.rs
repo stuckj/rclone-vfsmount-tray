@@ -488,22 +488,22 @@ async fn edit(handle: &Handle<TrayModel>, f: impl FnOnce(&mut TrayModel)) -> boo
 
 /// Carry out one menu action.
 async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Proxy>>, a: Action) {
-    match a {
+    match &a {
         Action::Mount(name) => {
             let Some(p) = current(&proxy) else {
-                return unreachable_now(&handle, &name, true).await;
+                return unreachable_now(&handle, &a).await;
             };
-            let r = call_mount(&p, &name).await;
-            report(&handle, &name, true, r).await;
+            let r = call_mount(&p, name).await;
+            report(&handle, &a, r).await;
         }
         Action::Unmount(name) => {
             let Some(p) = current(&proxy) else {
-                return unreachable_now(&handle, &name, false).await;
+                return unreachable_now(&handle, &a).await;
             };
-            let r = call_unmount(&p, &name).await;
-            report(&handle, &name, false, r).await;
+            let r = call_unmount(&p, name).await;
+            report(&handle, &a, r).await;
         }
-        Action::Open(path) => open_in_file_manager(&handle, &path).await,
+        Action::Open(path) => open_in_file_manager(&handle, path).await,
         Action::StartService => unit(&handle, "start").await,
         Action::StopService => unit(&handle, "stop").await,
         // Both are the linker's or the dispatcher's, not an action to carry out here.
@@ -530,45 +530,41 @@ fn current(proxy: &watch::Receiver<Option<Proxy>>) -> Option<Proxy> {
     proxy.borrow().clone()
 }
 
-async fn unreachable_now(handle: &Handle<TrayModel>, name: &str, wanted_live: bool) {
+async fn unreachable_now(handle: &Handle<TrayModel>, a: &Action) {
+    let (mount, wanted) = target_of(a);
     let _ = handle
-        .update(|m| {
-            m.set_notice(
-                Some(name.to_string()),
-                "The service is not reachable",
-                Some(wanted_live),
-            )
-        })
+        .update(|m| m.set_notice(mount, "The service is not reachable", wanted))
         .await;
 }
 
-/// Say what became of one action. `wanted_live` is the state the mount would be in had it
-/// worked, which is what tells the notice when it has stopped being news.
-async fn report(
-    handle: &Handle<TrayModel>,
-    name: &str,
-    wanted_live: bool,
-    r: Result<(), IpcError>,
-) {
+/// The mount an action names, and where it was trying to send it.
+///
+/// Derived together from the action rather than carried alongside it, so the two cannot be
+/// made to disagree: a notice filed against one mount and answered by another's state is how
+/// a refusal vanishes before it has been read.
+fn target_of(a: &Action) -> (Option<String>, Option<bool>) {
+    match a {
+        Action::Mount(name) => (Some(name.clone()), Some(true)),
+        Action::Unmount(name) => (Some(name.clone()), Some(false)),
+        _ => (None, None),
+    }
+}
+
+/// Say what became of one action.
+async fn report(handle: &Handle<TrayModel>, a: &Action, r: Result<(), IpcError>) {
+    let (mount, wanted) = target_of(a);
     match r {
+        // Nothing to report, and nothing left over from before worth keeping: the action the
+        // user asked for last is the one that worked.
         Ok(()) => {
-            let mount = name.to_string();
-            let _ = handle
-                .update(move |m| {
-                    if m.notice().and_then(|n| n.mount.as_deref()) == Some(mount.as_str()) {
-                        m.clear_notice();
-                    }
-                })
-                .await;
+            let _ = handle.update(|m| m.clear_notice()).await;
         }
         Err(e) => {
             let text = link::from_ipc(e).message();
-            tracing::warn!(mount = name, %text, "the service refused");
-            let notice = format!("{name}: {text}");
-            let mount = name.to_string();
-            let _ = handle
-                .update(|m| m.set_notice(Some(mount), notice, Some(wanted_live)))
-                .await;
+            let named = mount.clone().unwrap_or_default();
+            tracing::warn!(mount = %named, %text, "the service refused");
+            let notice = format!("{named}: {text}");
+            let _ = handle.update(|m| m.set_notice(mount, notice, wanted)).await;
         }
     }
 }
@@ -687,5 +683,82 @@ mod tests {
     #[test]
     fn invalid_utf8_is_still_readable_rather_than_dropped() {
         assert!(complaint(&[0xff, b'h', b'i']).is_some());
+    }
+
+    #[test]
+    fn an_action_says_which_mount_and_where_it_was_sending_it() {
+        // Getting the second half backwards puts the notice back where it was: deleted by the
+        // very state change the refused action produced.
+        assert_eq!(
+            target_of(&Action::Mount("photos".into())),
+            (Some("photos".to_string()), Some(true))
+        );
+        assert_eq!(
+            target_of(&Action::Unmount("photos".into())),
+            (Some("photos".to_string()), Some(false))
+        );
+        for no_mount in [
+            Action::Open("/mnt/photos".into()),
+            Action::StartService,
+            Action::StopService,
+            Action::Refresh,
+            Action::Quit,
+        ] {
+            assert_eq!(target_of(&no_mount), (None, None), "{no_mount:?}");
+        }
+    }
+
+    /// What a refusal leaves in the model, driven through the real wire.
+    async fn refusal_notice(action: Action) -> crate::model::Notice {
+        struct Refuse;
+
+        #[zbus::interface(name = "io.github.stuckj.RcloneVfsmountTray1")]
+        impl Refuse {
+            async fn mount(&self, name: &str) -> Result<(), IpcError> {
+                Err(IpcError::BadMountPoint(format!("{name}: not a directory")))
+            }
+            async fn unmount(&self, name: &str, _force: bool) -> Result<(), IpcError> {
+                Err(IpcError::Busy(format!("{name}: still in use")))
+            }
+            #[zbus(property)]
+            async fn interface_version(&self) -> u32 {
+                rvt_core::ipc::INTERFACE_VERSION
+            }
+        }
+
+        let (_server, client) = crate::fixtures::serve(Refuse).await;
+        let proxy = link::open(&client)
+            .await
+            .expect("the handshake is answered");
+        let (model, _rx) = crate::fixtures::blank();
+        let model = std::sync::Arc::new(std::sync::Mutex::new(model));
+
+        let (mount, wanted) = target_of(&action);
+        let name = mount.clone().expect("the action names a mount");
+        let outcome = match action {
+            Action::Mount(_) => call_mount(&proxy, &name).await,
+            Action::Unmount(_) => call_unmount(&proxy, &name).await,
+            other => panic!("{other:?}"),
+        };
+        let e = outcome.expect_err("the fake refuses");
+        // What `report` does with it, without a panel to hold the model.
+        let text = format!("{name}: {}", link::from_ipc(e).message());
+        model.lock().unwrap().set_notice(Some(name), text, wanted);
+        let guard = model.lock().unwrap();
+        guard.notice().expect("a refusal was recorded").clone()
+    }
+
+    #[tokio::test]
+    async fn a_refused_mount_waits_for_the_mount_to_come_up_before_it_stops_being_news() {
+        let n = refusal_notice(Action::Mount("photos".into())).await;
+        assert_eq!(n.answered_by, Some(true));
+        assert!(n.text.contains("not a directory"), "{}", n.text);
+    }
+
+    #[tokio::test]
+    async fn a_refused_unmount_waits_for_the_mount_to_go() {
+        let n = refusal_notice(Action::Unmount("photos".into())).await;
+        assert_eq!(n.answered_by, Some(false));
+        assert!(n.text.contains("still in use"), "{}", n.text);
     }
 }

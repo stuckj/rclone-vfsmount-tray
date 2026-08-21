@@ -107,6 +107,14 @@ pub(crate) struct Notice {
     pub answered_by: Option<bool>,
 }
 
+/// Whether carrying this out can leave something to say.
+///
+/// [`Action::Refresh`] and [`Action::Quit`] are not requests of the service and report
+/// nothing, so neither supersedes an outcome the user has not read yet.
+fn reports_back(a: &Action) -> bool {
+    !matches!(a, Action::Refresh | Action::Quit)
+}
+
 /// What the icon says.
 ///
 /// Ordered by how loudly: [`Self::Disconnected`] outranks everything because nothing below
@@ -195,7 +203,14 @@ impl TrayModel {
 
     /// Queue an action. A closed channel means the tray is shutting down, which is not
     /// something a menu click can do anything about.
-    pub(crate) fn act(&self, action: Action) {
+    ///
+    /// Asking for something new supersedes what the last request had to report. Without that
+    /// a notice naming no mount — `xdg-open` missing, `systemctl` refusing — has nothing that
+    /// would ever answer it, and sits above every later message for the rest of the session.
+    pub(crate) fn act(&mut self, action: Action) {
+        if reports_back(&action) {
+            self.notice = None;
+        }
         if self.actions.send(action.clone()).is_err() {
             tracing::debug!(?action, "dropped: the tray is shutting down");
         }
@@ -608,12 +623,16 @@ pub(crate) fn eta_phrase(secs: u64) -> String {
 pub(crate) fn wrap(text: &str, width: usize, max_lines: usize) -> Vec<String> {
     // Characters, not bytes. A mount point with an accented letter in it would otherwise
     // wrap short of the width, and the service's own sentences carry em dashes.
+    //
+    // A width of zero terminates without the clamp, but puts every character on a row of its
+    // own; one is the narrowest width that still means something.
     let width = width.max(1);
     let fits = |line: &str, word: &str| line.chars().count() + 1 + word.chars().count() <= width;
     let mut lines: Vec<String> = Vec::new();
     // Break where the text already breaks. A mount's failure reason is its unit's journal,
     // and running those lines together loses the shape that makes it readable at all.
-    for source in text.lines().filter(|l| !l.trim().is_empty()) {
+    // A blank source line yields no words and so no row of its own, which is what is wanted.
+    for source in text.lines() {
         let mut continuing = false;
         for word in source.split_whitespace() {
             // A word wider than the row still has to be broken. The sentence this exists for
@@ -1031,7 +1050,7 @@ mod tests {
 
     #[test]
     fn an_action_reaches_the_task_that_carries_it_out() {
-        let (m, mut rx) = blank();
+        let (mut m, mut rx) = blank();
         m.act(Action::Mount("photos".into()));
         assert_eq!(rx.try_recv(), Ok(Action::Mount("photos".into())));
     }
@@ -1179,9 +1198,10 @@ mod tests {
     }
 
     #[test]
-    fn a_width_of_zero_does_not_spin() {
-        // Nothing passes this today; the loop that breaks a long word would not terminate.
-        assert!(!wrap("something", 0, 4).is_empty());
+    fn a_width_of_zero_is_read_as_the_narrowest_that_means_anything() {
+        // Nothing passes this today. Without the clamp it does not hang — it puts each
+        // character on a row of its own and produces a leading empty one.
+        assert_eq!(wrap("abcd", 0, 8), ["a", "b", "c", "d"]);
     }
 
     #[test]
@@ -1318,5 +1338,66 @@ mod tests {
             ],
             "each line of the source starts its own row, and a blank one is dropped"
         );
+    }
+
+    #[test]
+    fn losing_the_link_while_reconnecting_still_forgets_the_mounts() {
+        // Nothing renders the rows in this state today, so only this says they are gone —
+        // and the whole point of the state is that the tray has stopped knowing them.
+        let (mut m, _rx) = connected(
+            vec![mount("photos", "mounted")],
+            vec![idle_transfer("photos")],
+        );
+        m.go_connecting();
+        assert_eq!(m.mounts().count(), 0);
+        assert!(m.transfer("photos").is_none());
+        assert!(m.notice().is_none());
+    }
+
+    #[test]
+    fn a_cache_walk_is_labelled_in_the_summary_and_not_only_per_mount() {
+        // #27: the UI has to say when a figure is dirty-on-disk state rather than live
+        // upload progress. The two rows that say so read alike, so this pins the summary's.
+        let mut t = idle_transfer("photos");
+        t.fidelity = Some("T4".into());
+        pending(&mut t, 2, 2048, 0);
+        let s = connected(vec![mount("photos", "mounted")], vec![t])
+            .0
+            .summary();
+        assert!(s.dirty_on_disk_only);
+
+        let mut queue = idle_transfer("photos");
+        pending(&mut queue, 2, 2048, 0);
+        let s = connected(vec![mount("photos", "mounted")], vec![queue])
+            .0
+            .summary();
+        assert!(!s.dirty_on_disk_only, "a queue reading is live progress");
+    }
+
+    #[test]
+    fn asking_for_something_new_supersedes_what_the_last_request_said() {
+        // A notice naming no mount has nothing that would ever answer it — `xdg-open`
+        // missing, `systemctl` refusing — so without this it outlives every later action.
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.set_notice(
+            None,
+            "could not run xdg-open: No such file or directory",
+            None,
+        );
+
+        m.act(Action::Open("/mnt/photos".into()));
+        assert!(m.notice().is_none());
+    }
+
+    #[test]
+    fn looking_again_does_not_throw_away_something_unread() {
+        // Refresh and Quit ask the service for nothing and report nothing, so neither
+        // supersedes an outcome the user may not have read.
+        for harmless in [Action::Refresh, Action::Quit] {
+            let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+            m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
+            m.act(harmless.clone());
+            assert!(m.notice().is_some(), "{harmless:?}");
+        }
     }
 }

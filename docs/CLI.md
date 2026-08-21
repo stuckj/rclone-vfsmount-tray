@@ -124,7 +124,12 @@ mounts", the one thing this must never claim when it simply could not ask.
 ```
 
 `reason` is one of `service not running`, `no session bus`, `interface incompatible`,
-`service too old`, `service unreachable`. `start_hint` is present only for a stopped service.
+`service too old`, `service did not answer`, `service unreachable`. `start_hint` is present
+only for a stopped service.
+
+`service did not answer` means the service took the call and did not reply — it is running,
+and either still working or wedged. Only a session bus configured with a `reply_timeout`
+produces it; the default configuration sets none, so a call to a wedged service waits.
 `status --json` exits non-zero in this case, so a script can branch on the exit code or on
 `connected` — the two agree.
 

@@ -75,7 +75,9 @@ impl Down {
             ),
             // `message` already opens with the clause a headline would otherwise repeat,
             // and for a refusal it is the service's own sentence, which stands alone.
-            LinkError::Refused(_) | LinkError::Transport(_) => (e.message(), false),
+            LinkError::Refused(_) | LinkError::Transport(_) | LinkError::Silent => {
+                (e.message(), false)
+            }
         };
         Self {
             headline,
@@ -331,6 +333,12 @@ impl TrayModel {
     }
 
     pub(crate) fn remove_mount(&mut self, name: &str) {
+        // A refusal about a row that has gone names a mount the menu no longer lists, and
+        // nothing else would ever retire it: `answered_by` waits for a state change that is
+        // not coming.
+        if self.notice.as_ref().and_then(|n| n.mount.as_deref()) == Some(name) {
+            self.notice = None;
+        }
         self.mounts.remove(name);
         self.transfers.remove(name);
     }
@@ -1513,5 +1521,118 @@ mod tests {
             assert_eq!(d.offer_start, offer, "{}", d.headline);
             assert!(!d.headline.is_empty());
         }
+    }
+
+    #[test]
+    fn a_refusal_about_one_mount_survives_an_action_on_another() {
+        // "Mount all" calls `act` once per mount. A refusal filed against `photos` — the one
+        // carrying the command that names what is holding it — must not go because `docs`
+        // was asked for at the same time.
+        let (mut m, _rx) = connected(
+            vec![mount("photos", "mounted"), mount("docs", "unmounted")],
+            vec![],
+        );
+        m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
+        m.act(Action::Mount("docs".into()));
+        assert!(m.notice().is_some());
+    }
+
+    #[test]
+    fn a_row_going_away_takes_its_refusal_with_it() {
+        // `answered_by` waits for a state change that is not coming once the row has gone,
+        // so the sentence would name a mount the menu no longer lists.
+        let (mut m, _rx) = connected(vec![mount("photos", "orphaned")], vec![]);
+        m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
+        m.remove_mount("photos");
+        assert!(m.notice().is_none());
+    }
+
+    #[test]
+    fn a_notice_nothing_can_answer_goes_when_anything_is_asked() {
+        // The `answered_by: None` arm, which the mount-targeted tests never reach.
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.set_notice(None, "could not run systemctl: no such unit", None);
+        m.act(Action::Refresh);
+        assert!(
+            m.notice().is_some(),
+            "a refresh asks the service for nothing"
+        );
+        m.act(Action::StartService);
+        assert!(m.notice().is_none());
+    }
+
+    #[test]
+    fn re_reading_the_same_service_replaces_what_it_last_said() {
+        let (mut m, _rx) = connected(
+            vec![mount("photos", "mounted"), mount("docs", "mounted")],
+            vec![idle_transfer("photos")],
+        );
+        m.resync(service(), vec![mount("photos", "unmounted")]);
+        assert_eq!(
+            m.mounts().map(|v| v.name.as_str()).collect::<Vec<_>>(),
+            ["photos"]
+        );
+        assert!(!m.mounts().next().unwrap().live);
+        assert!(m.transfer("photos").is_none(), "readings are re-read too");
+    }
+
+    #[test]
+    fn a_tier_resolved_after_the_tray_attached_reaches_it() {
+        // `restate` is the only consumer of the `PropertiesChanged` plumbing; without this
+        // that whole path could be dead and About would read "unknown" all session.
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.restate(ServiceInfo {
+            capability_tier: "T4".into(),
+            ..service()
+        });
+        match m.link() {
+            Link::Up(info) => assert_eq!(info.capability_tier, "T4"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rate_after_the_queue_drains_is_not_an_estimate_of_nothing() {
+        // The estimator reports a rate for the interval the queue emptied in. With nothing
+        // pending there is nothing to time, and "a few seconds left" beside "All synced" is
+        // a countdown to an event that has happened.
+        let mut t = idle_transfer("photos");
+        t.rate_bytes_per_sec = Some(4 * 1024 * 1024);
+        let s = connected(vec![mount("photos", "mounted")], vec![t])
+            .0
+            .summary();
+        assert_eq!(s.pending_line().as_deref(), Some("All synced"));
+        assert_eq!(
+            s.rate_line().as_deref(),
+            Some("4 MiB/s"),
+            "a rate, but nothing to say is left"
+        );
+    }
+
+    #[test]
+    fn text_that_exactly_fills_the_rows_is_not_marked_as_cut() {
+        let three = "one two\nthree four\nfive six";
+        assert_eq!(wrap(three, 20, 3), ["one two", "three four", "five six"]);
+        assert_eq!(wrap(three, 20, 2), ["one two", "three four …"]);
+    }
+
+    #[test]
+    fn an_idle_mount_that_cannot_give_a_byte_total_does_not_poison_the_estimate() {
+        // The per-mount check runs only for a mount with something pending: a T3 mount with
+        // an empty queue has nothing to contribute and nothing to spoil.
+        let mut busy = idle_transfer("photos");
+        pending(&mut busy, 1, 10 * 1024 * 1024, 0);
+        busy.rate_bytes_per_sec = Some(1024 * 1024);
+        let mut idle_t3 = idle_transfer("docs");
+        idle_t3.fidelity = Some("T3".into());
+
+        let s = connected(
+            vec![mount("photos", "mounted"), mount("docs", "mounted")],
+            vec![busy, idle_t3],
+        )
+        .0
+        .summary();
+        assert_eq!(s.remaining, Some(10 * 1024 * 1024));
+        assert!(s.rate_line().unwrap().contains("left"));
     }
 }

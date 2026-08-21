@@ -1490,4 +1490,98 @@ mod tests {
             [Action::StartService]
         );
     }
+
+    /// Every `StandardItem` in the tree, so its own properties can be looked at.
+    fn plain_items(items: &[MenuItem<TrayModel>]) -> Vec<(String, bool, bool)> {
+        let mut out = Vec::new();
+        walk(items, &mut |i| {
+            if let MenuItem::Standard(s) = i {
+                out.push((s.label.clone(), s.enabled, s.visible));
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn the_rows_holding_the_shape_are_not_drawn() {
+        // Most of the menu is placeholders — the shape is fixed so that a queue draining
+        // cannot invalidate every menu id. Drawn, they are blank rows filling the panel.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 1, 1024, 0);
+        t.files = vec![rvt_core::ipc::TransferFileView {
+            name: "clip.mp4".into(),
+            size: Some(1024),
+            in_flight: Some(true),
+            tries: Some(1),
+            bytes_sent: None,
+        }];
+        let (m, _rx) = connected(
+            vec![mount("photos", "mounted"), mount("docs", "unmounted")],
+            vec![t],
+        );
+
+        let rows = plain_items(&build(&m));
+        let blank = rows.iter().filter(|(l, _, _)| l.is_empty()).count();
+        assert!(
+            blank > 10,
+            "the fixed shape should need placeholders: {blank}"
+        );
+        for (label, _, visible) in &rows {
+            assert_eq!(
+                label.is_empty(),
+                !*visible,
+                "a row is drawn if and only if it says something: {label:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_line_to_read_cannot_be_clicked() {
+        // Informational rows sit among the ones that act; drawn as live they invite a click
+        // that does nothing.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 1, 1024, 0);
+        t.degraded_reason = Some("rclone is not answering".into());
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
+
+        let rows = plain_items(&build(&m));
+        for reading in [
+            "photos: still in use",
+            "1 of 1 mounted",
+            "1 file, 1 KiB pending",
+            "/mnt/photos",
+            "rclone is not answering",
+        ] {
+            let (_, enabled, _) = rows
+                .iter()
+                .find(|(l, _, _)| l == reading)
+                .unwrap_or_else(|| panic!("no row {reading:?} in {:?}", labels(&build(&m))));
+            assert!(!enabled, "{reading:?} reads as a line but can be clicked");
+        }
+    }
+
+    #[test]
+    fn a_queue_exactly_at_the_cap_does_not_claim_more_are_hidden() {
+        let mut t = idle_transfer("photos");
+        pending(&mut t, FILE_CAP as u64, 1024, 0);
+        t.files = (0..FILE_CAP)
+            .map(|i| rvt_core::ipc::TransferFileView {
+                name: format!("clip{i}.mp4"),
+                size: Some(1024),
+                in_flight: Some(false),
+                tries: Some(1),
+                bytes_sent: None,
+            })
+            .collect();
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m));
+        assert!(!drawn.iter().any(|l| l.contains("more…")), "{drawn:?}");
+    }
+
+    #[test]
+    fn unmount_all_is_dead_when_nothing_is_up() {
+        let (m, _rx) = connected(vec![mount("photos", "unmounted")], vec![]);
+        assert!(!item(&build(&m), "Unmount all").enabled);
+    }
 }

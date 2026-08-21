@@ -42,6 +42,9 @@ pub(crate) enum LinkError {
     TooOld { needed: u32, found: u32 },
     /// The service answered and refused. The sentence to show is its own.
     Refused(IpcError),
+    /// The service took the call and did not answer it. Distinct from not being reachable:
+    /// it is there, it heard, and it is either still working or wedged.
+    Silent,
     /// The call reached the bus and failed for some other reason.
     Transport(zbus::Error),
 }
@@ -54,7 +57,7 @@ impl LinkError {
             LinkError::Refused(_) => 1,
             LinkError::NotRunning => 3,
             LinkError::Incompatible | LinkError::TooOld { .. } => 4,
-            LinkError::NoSessionBus(_) | LinkError::Transport(_) => 5,
+            LinkError::NoSessionBus(_) | LinkError::Transport(_) | LinkError::Silent => 5,
         }
     }
 
@@ -82,6 +85,8 @@ impl LinkError {
                 .description()
                 .unwrap_or("the service refused the request")
                 .to_string(),
+            LinkError::Silent => "The service did not answer. It may still be working on it."
+                .to_string(),
             LinkError::Transport(e) => format!("The service could not be reached: {e}"),
         }
     }
@@ -91,6 +96,8 @@ impl LinkError {
 enum Wire {
     NotRunning,
     Incompatible,
+    /// Taken and not answered.
+    Silent,
     Transport,
 }
 
@@ -106,6 +113,11 @@ fn classify_error_name(name: &str) -> Wire {
         | "org.freedesktop.DBus.Error.UnknownObject"
         | "org.freedesktop.DBus.Error.UnknownMethod"
         | "org.freedesktop.DBus.Error.UnknownProperty" => Wire::Incompatible,
+        // A bus daemon configured with a `reply_timeout` answers the caller with this when
+        // the service has taken a call and not replied inside it. The default configuration
+        // sets none, in which case nothing below this level ever gives up — measured on
+        // dbus-daemon 1.16.2, where a call held for 525 seconds drew no error from the bus.
+        "org.freedesktop.DBus.Error.NoReply" => Wire::Silent,
         _ => Wire::Transport,
     }
 }
@@ -140,6 +152,7 @@ pub(crate) fn from_zbus(e: zbus::Error) -> LinkError {
     match classify(&e) {
         Wire::NotRunning => LinkError::NotRunning,
         Wire::Incompatible => LinkError::Incompatible,
+        Wire::Silent => LinkError::Silent,
         Wire::Transport => LinkError::Transport(e),
     }
 }
@@ -287,10 +300,31 @@ mod tests {
             classify_error_name("org.freedesktop.DBus.Error.UnknownInterface"),
             Wire::Incompatible
         ));
+        // A bus configured with a `reply_timeout` answers with this when the service has
+        // taken the call and not replied. Reaching the user as "could not be reached" would
+        // contradict the menu it is drawn above, which is listing that service's mounts.
+        assert!(matches!(
+            classify_error_name("org.freedesktop.DBus.Error.NoReply"),
+            Wire::Silent
+        ));
         assert!(matches!(
             classify_error_name("org.freedesktop.DBus.Error.AccessDenied"),
             Wire::Transport
         ));
+    }
+
+    #[test]
+    fn a_service_that_took_the_call_is_not_called_unreachable() {
+        // It is there and it heard; saying otherwise sends the user looking for a service
+        // that is running, and offers to start one that already is.
+        let silent = LinkError::Silent;
+        assert!(
+            silent.message().contains("did not answer"),
+            "{}",
+            silent.message()
+        );
+        assert!(!silent.message().contains("could not be reached"));
+        assert_eq!(silent.exit_code(), 5);
     }
 
     #[test]

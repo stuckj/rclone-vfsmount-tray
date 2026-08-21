@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use ksni::Handle;
-use rvt_core::ipc::{self, IpcError, RcloneVfsmountTrayProxy};
+use rvt_core::ipc::{self, RcloneVfsmountTrayProxy};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{watch, Notify};
 
@@ -390,20 +390,21 @@ async fn watch_properties(
 
 /// Bound a mount or unmount, so a service that never answers does not swallow the click.
 ///
-/// Generous, because these are the slow ones: `mount` returns once the filesystem is serving,
-/// which for a cold remote is most of a minute, and the service allows itself 45 seconds
-/// before calling it failed. Nothing below this bounds them — zbus sets no reply timeout, and
-/// the bus daemon's `reply_timeout` frees its own pending-reply slot without telling the
-/// caller. Measured: a call held for 400 seconds returned normally.
+/// Well above what the service allows itself, because these are the slow ones: an unmount
+/// that meets the redirect race waits `REDIRECT_LOCK_WAIT` — five minutes — and then a
+/// release, so it can legitimately answer past six. Giving up first would replace the
+/// service's real answer, which names the mount holding things up, with silence.
+///
+/// Nothing below this bounds them. zbus sets no reply timeout, and a session bus is
+/// configured with no `reply_timeout` by default, so a call to a wedged service waits for as
+/// long as the process lives.
 async fn acting(
-    call: impl std::future::Future<Output = Result<(), IpcError>>,
-) -> Result<(), IpcError> {
-    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
+    call: impl std::future::Future<Output = Result<(), LinkError>>,
+) -> Result<(), LinkError> {
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(900);
     match tokio::time::timeout(PATIENCE, call).await {
         Ok(done) => done,
-        Err(_) => Err(IpcError::ZBus(zbus::Error::Failure(
-            "the service did not answer; it may still be working on it".into(),
-        ))),
+        Err(_) => Err(LinkError::Silent),
     }
 }
 
@@ -530,8 +531,8 @@ async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Prox
     }
 }
 
-async fn call_mount(p: &Proxy, name: &str) -> Result<(), IpcError> {
-    acting(p.mount(name)).await
+async fn call_mount(p: &Proxy, name: &str) -> Result<(), LinkError> {
+    acting(async { p.mount(name).await.map_err(link::from_ipc) }).await
 }
 
 /// Take a mount down, never forcing it.
@@ -540,8 +541,8 @@ async fn call_mount(p: &Proxy, name: &str) -> Result<(), IpcError> {
 /// rclone then uploads the partial file as though it were complete. That is a decision to make
 /// deliberately, at the command line, so the menu has no way to express it — which is why this
 /// takes no flag rather than passing `false`. See DESIGN.md, "The unmount order".
-async fn call_unmount(p: &Proxy, name: &str) -> Result<(), IpcError> {
-    acting(p.unmount(name, false)).await
+async fn call_unmount(p: &Proxy, name: &str) -> Result<(), LinkError> {
+    acting(async { p.unmount(name, false).await.map_err(link::from_ipc) }).await
 }
 
 /// The proxy as it stands, cloned so nothing holds the watch lock across an await.
@@ -563,7 +564,7 @@ fn target_of(a: &Action) -> (Option<String>, Option<bool>) {
 }
 
 /// Say what became of one action.
-async fn report(handle: &Handle<TrayModel>, a: &Action, r: Result<(), IpcError>) {
+async fn report(handle: &Handle<TrayModel>, a: &Action, r: Result<(), LinkError>) {
     let Some((mount, text, wanted)) = outcome(a, r) else {
         return;
     };
@@ -576,10 +577,10 @@ async fn report(handle: &Handle<TrayModel>, a: &Action, r: Result<(), IpcError>)
 /// Success records nothing and clears nothing: this action's own notice went when it was
 /// dispatched, so anything showing belongs to another action — and two are in flight together
 /// whenever a slow mount overlaps a refused unmount.
-fn outcome(a: &Action, r: Result<(), IpcError>) -> Option<(Option<String>, String, Option<bool>)> {
+fn outcome(a: &Action, r: Result<(), LinkError>) -> Option<(Option<String>, String, Option<bool>)> {
     let e = r.err()?;
     let (mount, wanted) = target_of(a);
-    let text = link::from_ipc(e).message();
+    let text = e.message();
     let named = mount.clone().unwrap_or_default();
     Some((mount, format!("{named}: {text}"), wanted))
 }
@@ -588,16 +589,17 @@ fn outcome(a: &Action, r: Result<(), IpcError>) -> Option<(Option<String>, Strin
 async fn open_in_file_manager(handle: &Handle<TrayModel>, path: &str) {
     // `status`, not `output`: xdg-open hands the path to a file manager that inherits its
     // standard error, and a captured pipe would stay open until that program exited.
-    let text = match tokio::process::Command::new("xdg-open")
+    let ran = tokio::process::Command::new("xdg-open")
         .arg(path)
         .status()
-        .await
-    {
-        Ok(s) if s.success() => return,
-        Ok(s) => format!("xdg-open could not open {path}: {s}"),
-        Err(e) => format!("could not run xdg-open: {e}"),
+        .await;
+    let told = match ran {
+        Ok(s) => ran_well(s.success(), &format!("xdg-open could not open {path}: {s}")),
+        Err(e) => Some(format!("could not run xdg-open: {e}")),
     };
-    say(handle, text).await;
+    if let Some(text) = told {
+        say(handle, text).await;
+    }
 }
 
 /// Start or stop the service's unit.
@@ -605,22 +607,34 @@ async fn unit(handle: &Handle<TrayModel>, verb: &str) {
     // `output` here, because systemd's refusals are only in its standard error — an exit
     // status of 5 says nothing, "Unit ... not found" says what to fix. systemctl writes a
     // line or two and exits, so nothing is waiting on a pipe a grandchild holds open.
-    let text = match tokio::process::Command::new("systemctl")
+    let ran = tokio::process::Command::new("systemctl")
         .args(["--user", verb, link::UNIT])
         .output()
-        .await
-    {
-        Ok(o) if o.status.success() => return,
-        Ok(o) => match complaint(&o.stderr) {
-            Some(line) => format!("Could not {verb} the service: {line}"),
-            None => format!(
-                "Could not {verb} the service: systemctl exited with {}",
-                o.status
-            ),
-        },
-        Err(e) => format!("could not run systemctl: {e}"),
+        .await;
+    let told = match ran {
+        Ok(o) => {
+            let said = match complaint(&o.stderr) {
+                Some(line) => format!("Could not {verb} the service: {line}"),
+                None => format!(
+                    "Could not {verb} the service: systemctl exited with {}",
+                    o.status
+                ),
+            };
+            ran_well(o.status.success(), &said)
+        }
+        Err(e) => Some(format!("could not run systemctl: {e}")),
     };
-    say(handle, text).await;
+    if let Some(text) = told {
+        say(handle, text).await;
+    }
+}
+
+/// What to say about a program that has finished: nothing at all when it worked.
+///
+/// Split out because the alternative is untestable — running the real `systemctl` in a test
+/// would depend on whether this machine happens to have the unit installed.
+fn ran_well(success: bool, complaint: &str) -> Option<String> {
+    (!success).then(|| complaint.to_string())
 }
 
 /// The last thing a program said before failing, if it said anything.
@@ -645,6 +659,8 @@ async fn say(handle: &Handle<TrayModel>, text: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvt_core::ipc::IpcError;
+
     use crate::fixtures::{recorder, serve};
 
     /// The one destructive thing this crate can ask for, and the one argument that makes it
@@ -757,7 +773,7 @@ mod tests {
         };
         let e = outcome.expect_err("the fake refuses");
         // What `report` does with it, without a panel to hold the model.
-        let text = format!("{name}: {}", link::from_ipc(e).message());
+        let text = format!("{name}: {}", e.message());
         model.lock().unwrap().set_notice(Some(name), text, wanted);
         let guard = model.lock().unwrap();
         guard.notice().expect("a refusal was recorded").clone()
@@ -821,7 +837,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("{call} does not bound itself"))
                 .expect_err("and reports that it did");
-            let said = link::from_ipc(e).message();
+            let said = e.message();
             assert!(said.contains("did not answer"), "{call}: {said}");
         }
     }
@@ -830,7 +846,9 @@ mod tests {
     fn a_refusal_is_recorded_against_the_mount_it_was_about() {
         let (mount, text, wanted) = outcome(
             &Action::Unmount("photos".into()),
-            Err(IpcError::Busy("still in use".into())),
+            Err(LinkError::Refused(rvt_core::ipc::IpcError::Busy(
+                "still in use".into(),
+            ))),
         )
         .expect("a refusal is worth saying");
         assert_eq!(mount.as_deref(), Some("photos"));
@@ -845,5 +863,16 @@ mod tests {
         // mount finishing must not delete the refusal an unmount just produced.
         assert_eq!(outcome(&Action::Mount("photos".into()), Ok(())), None);
         assert_eq!(outcome(&Action::Unmount("photos".into()), Ok(())), None);
+    }
+
+    #[test]
+    fn a_program_that_worked_is_not_reported_and_one_that_did_not_is() {
+        // Inverting this reports nothing when "Start service" fails, and posts a failure
+        // every time a file manager opens.
+        assert_eq!(ran_well(true, "unit not found"), None);
+        assert_eq!(
+            ran_well(false, "unit not found").as_deref(),
+            Some("unit not found")
+        );
     }
 }

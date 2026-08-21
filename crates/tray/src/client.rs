@@ -160,6 +160,7 @@ fn disconnected_json(e: &LinkError) -> String {
         LinkError::NoSessionBus(_) => "no session bus",
         LinkError::Incompatible => "interface incompatible",
         LinkError::TooOld { .. } => "service too old",
+        LinkError::Silent => "service did not answer",
         LinkError::Transport(_) | LinkError::Refused(_) => "service unreachable",
     };
     let mut doc = serde_json::json!({

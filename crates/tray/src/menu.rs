@@ -623,9 +623,7 @@ mod tests {
         let items = build(&m);
         assert!(says(&items, "could not be unmounted"));
         assert!(
-            labels(&items)
-                .iter()
-                .all(|l| l.chars().count() <= ROW_WIDTH + 2),
+            labels(&items).iter().all(|l| l.chars().count() <= 66),
             "a row wider than the panel: {:?}",
             labels(&items)
         );
@@ -691,6 +689,10 @@ mod tests {
             .iter()
             .filter(|l| l.starts_with("clip"))
             .count();
+        assert!(
+            listed <= 10,
+            "{listed} files is more than anyone reads in a menu"
+        );
         assert_eq!(listed, FILE_CAP);
         assert!(says(&items, &format!("and {} more", 25 - FILE_CAP)));
         assert!(says(&items, "clip0.mp4 — 1000 B (uploading)"));
@@ -916,8 +918,8 @@ mod tests {
         for label in &all {
             let row = drawn(label);
             assert!(
-                row.chars().count() <= ROW_WIDTH + 2,
-                "{} columns: {row:?}",
+                row.chars().count() <= 66,
+                "{} columns, which is wider than a panel draws: {row:?}",
                 row.chars().count()
             );
         }
@@ -1376,6 +1378,116 @@ mod tests {
         assert!(
             drawn.contains("permission denied"),
             "the cause was cut: {drawn}"
+        );
+    }
+
+    #[test]
+    fn the_verb_a_settled_mount_offers_is_the_one_it_can_do() {
+        // #26's primary gesture. Swapping these greys out the wrong row on every mount, and
+        // the transitional-state test cannot see it: there, both are disabled either way.
+        let (down, _a) = connected(vec![mount("photos", "unmounted")], vec![]);
+        let items = build(&down);
+        assert!(item(&items, "Mount").enabled);
+        assert!(!item(&items, "Unmount").enabled);
+
+        let (up, _b) = connected(vec![mount("photos", "mounted")], vec![]);
+        let items = build(&up);
+        assert!(!item(&items, "Mount").enabled);
+        assert!(item(&items, "Unmount").enabled);
+    }
+
+    #[test]
+    fn open_hands_over_the_mount_point_and_not_the_name() {
+        let (mut m, mut rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        assert_eq!(
+            click(&mut m, &mut rx, "Open"),
+            [Action::Open("/mnt/photos".into())]
+        );
+    }
+
+    #[test]
+    fn a_cache_walk_is_labelled_on_the_mount_as_well_as_in_the_summary() {
+        // Two rows say this, and they read alike — so a test that matches either passes when
+        // one of them has gone.
+        let mut t = idle_transfer("photos");
+        t.fidelity = Some("T4".into());
+        pending(&mut t, 1, 1024, 0);
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m));
+
+        assert!(
+            drawn
+                .iter()
+                .any(|l| l == "Showing files on disk, not live upload progress."),
+            "the mount's own row: {drawn:?}"
+        );
+        assert!(
+            drawn
+                .iter()
+                .any(|l| l == "Some figures are files on disk, not live upload progress."),
+            "the summary's row: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn a_mount_says_which_of_the_two_things_needs_acting_on() {
+        // Both drive the icon to Attention, so the icon cannot tell them apart; the menu is
+        // the only place that says whether uploads failed or the cache filled up.
+        let mut errored = idle_transfer("photos");
+        errored.errored_files = Some(3);
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![errored]);
+        let drawn = labels(&build(&m));
+        assert!(
+            drawn.iter().any(|l| l == "3 file(s) failed to upload"),
+            "{drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|l| l == "The cache is out of space"),
+            "{drawn:?}"
+        );
+
+        let mut full = idle_transfer("photos");
+        full.out_of_space = Some(true);
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![full]);
+        let drawn = labels(&build(&m));
+        assert!(
+            drawn.iter().any(|l| l == "The cache is out of space"),
+            "{drawn:?}"
+        );
+        assert!(
+            !drawn.iter().any(|l| l.contains("failed to upload")),
+            "{drawn:?}"
+        );
+    }
+
+    #[test]
+    fn a_mount_says_why_its_figures_cannot_be_trusted() {
+        let mut t = idle_transfer("photos");
+        t.degraded_reason = Some(
+            "rclone is not answering on its control socket; showing the last reading".to_string(),
+        );
+        let (m, _rx) = connected(vec![mount("photos", "mounted")], vec![t]);
+        let drawn = labels(&build(&m)).join(" ");
+        assert!(
+            drawn.contains("not answering on its control socket"),
+            "{drawn}"
+        );
+        assert!(drawn.contains("showing the last reading"), "{drawn}");
+    }
+
+    #[test]
+    fn the_disconnected_menu_can_still_be_acted_on() {
+        // A tray with no Quit while the service is down cannot be closed from its own menu.
+        let (mut m, mut rx) = blank();
+        m.go_down(&LinkError::NotRunning);
+        let items = build(&m);
+        assert!(item(&items, QUIT_LABEL).enabled);
+        assert!(item(&items, "Retry now").enabled);
+        assert!(item(&items, "Start service").enabled);
+        assert_eq!(click(&mut m, &mut rx, "Retry now"), [Action::Refresh]);
+        assert_eq!(
+            click(&mut m, &mut rx, "Start service"),
+            [Action::StartService]
         );
     }
 }

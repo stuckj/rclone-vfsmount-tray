@@ -36,6 +36,10 @@ anyhow = { workspace = true }
 # should find `Scratch` rather than an unresolved import.
 [dev-dependencies]
 rvt-testutil = { path = "../testutil" }
+# `test-util` for tokio's paused clock: the tray gives a mount call five minutes before it
+# gives up on it, and a test of that should not take five minutes. Dev-only — the binary is
+# built without it.
+tokio = { workspace = true, features = ["test-util"] }
 # Generate this binary's man page and completions in-test, to check the committed copies
 # under `docs/` and `completions/` still match what the current `clap` command produces.
 clap_mangen = { workspace = true }

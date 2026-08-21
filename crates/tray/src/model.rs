@@ -107,12 +107,43 @@ pub(crate) struct Notice {
     pub answered_by: Option<bool>,
 }
 
-/// Whether carrying this out can leave something to say.
+impl Action {
+    /// The mount this asks about, and the `live` it is trying to reach.
+    ///
+    /// Derived together rather than carried alongside each other, so the two cannot be made
+    /// to disagree: a notice filed against one mount and answered by another's state is how a
+    /// refusal vanishes before it has been read.
+    pub(crate) fn target(&self) -> (Option<&str>, Option<bool>) {
+        match self {
+            Action::Mount(name) => (Some(name), Some(true)),
+            Action::Unmount(name) => (Some(name), Some(false)),
+            _ => (None, None),
+        }
+    }
+
+    /// Whether carrying this out can leave something to say.
+    ///
+    /// [`Self::Refresh`] and [`Self::Quit`] ask the service for nothing and report nothing.
+    fn reports_back(&self) -> bool {
+        !matches!(self, Action::Refresh | Action::Quit)
+    }
+}
+
+/// Whether asking for this replaces what is on screen.
 ///
-/// [`Action::Refresh`] and [`Action::Quit`] are not requests of the service and report
-/// nothing, so neither supersedes an outcome the user has not read yet.
-fn reports_back(a: &Action) -> bool {
-    !matches!(a, Action::Refresh | Action::Quit)
+/// A refusal about a mount stays until that mount reaches where it was being sent, or until
+/// the user asks something of that same mount again. A notice with no mount — `xdg-open`
+/// missing, `systemctl` refusing — has nothing that could ever answer it, so the next request
+/// of any kind is what retires it.
+fn supersedes(action: &Action, showing: Option<&Notice>) -> bool {
+    let Some(notice) = showing else { return false };
+    match notice.answered_by {
+        None => action.reports_back(),
+        Some(_) => {
+            let (about, _) = action.target();
+            about.is_some() && about == notice.mount.as_deref()
+        }
+    }
 }
 
 /// What the icon says.
@@ -204,11 +235,10 @@ impl TrayModel {
     /// Queue an action. A closed channel means the tray is shutting down, which is not
     /// something a menu click can do anything about.
     ///
-    /// Asking for something new supersedes what the last request had to report. Without that
-    /// a notice naming no mount — `xdg-open` missing, `systemctl` refusing — has nothing that
-    /// would ever answer it, and sits above every later message for the rest of the session.
+    /// Asking for something new can retire what the last request had to report — see
+    /// [`supersedes`], which is careful about which.
     pub(crate) fn act(&mut self, action: Action) {
-        if reports_back(&action) {
+        if supersedes(&action, self.notice.as_ref()) {
             self.notice = None;
         }
         if self.actions.send(action.clone()).is_err() {
@@ -240,10 +270,6 @@ impl TrayModel {
             text: text.into(),
             answered_by,
         });
-    }
-
-    pub(crate) fn clear_notice(&mut self) {
-        self.notice = None;
     }
 
     /// Mark the link down and forget everything it told us.
@@ -953,7 +979,9 @@ mod tests {
         m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
         assert!(m.notice().is_some());
 
-        m.upsert_mount(mount("docs", "mounted"));
+        // Unmounted, so it is the *name* that has to keep this notice alive: a mounted `docs`
+        // would be turned away by `answered_by` before the name was looked at.
+        m.upsert_mount(mount("docs", "unmounted"));
         assert!(
             m.notice().is_some(),
             "another mount's news is not this one's"
@@ -1398,6 +1426,92 @@ mod tests {
             m.set_notice(Some("photos".into()), "photos: still in use", Some(false));
             m.act(harmless.clone());
             assert!(m.notice().is_some(), "{harmless:?}");
+        }
+    }
+
+    #[test]
+    fn a_rate_of_zero_is_no_rate_rather_than_a_division() {
+        // The service sends `Some(0)` whenever the estimator has not seen the queue fall and
+        // nothing is in flight. Dividing by it panics inside `Tray::menu`, which `ksni` calls
+        // while holding the model's lock.
+        let mut t = idle_transfer("photos");
+        pending(&mut t, 1, 4096, 0);
+        t.uploading = Some(0);
+        t.rate_bytes_per_sec = Some(0);
+        let s = connected(vec![mount("photos", "mounted")], vec![t])
+            .0
+            .summary();
+        assert_eq!(s.rate_line(), None);
+    }
+
+    #[test]
+    fn looking_at_a_mount_does_not_retire_the_reason_it_is_being_looked_at() {
+        // The refusal ends with the command that names the process holding the mount. Opening
+        // the mount to go and find it must not take the advice away first.
+        let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+        m.set_notice(
+            Some("photos".into()),
+            "photos: still in use — `fuser -m /mnt/photos` names them",
+            Some(false),
+        );
+
+        m.act(Action::Open("/mnt/photos".into()));
+        assert!(m.notice().is_some(), "still true, and still unread");
+
+        // Asking something of that same mount again is what replaces its outcome.
+        m.act(Action::Unmount("photos".into()));
+        assert!(m.notice().is_none());
+    }
+
+    #[test]
+    fn a_notice_with_nothing_to_answer_it_is_retired_by_the_next_request() {
+        for next in [
+            Action::Open("/mnt/photos".into()),
+            Action::Mount("docs".into()),
+            Action::StartService,
+        ] {
+            let (mut m, _rx) = connected(vec![mount("photos", "mounted")], vec![]);
+            m.set_notice(
+                None,
+                "could not run xdg-open: No such file or directory",
+                None,
+            );
+            m.act(next.clone());
+            assert!(m.notice().is_none(), "{next:?}");
+        }
+    }
+
+    #[test]
+    fn every_reason_the_link_can_be_down_says_something_and_offers_the_right_thing() {
+        // Offering to start a service that is running and merely unreachable sends the user
+        // to `systemctl`, which reports it active and leaves them none the wiser.
+        let cases = [
+            (LinkError::NotRunning, true),
+            (
+                LinkError::NoSessionBus(zbus::Error::Failure("no bus".into())),
+                false,
+            ),
+            (LinkError::Incompatible, false),
+            (
+                LinkError::TooOld {
+                    needed: 2,
+                    found: 1,
+                },
+                false,
+            ),
+            (
+                LinkError::Transport(zbus::Error::Failure("reset".into())),
+                false,
+            ),
+            (
+                LinkError::Refused(rvt_core::ipc::IpcError::Busy("in use".into())),
+                false,
+            ),
+        ];
+        for (e, offer) in cases {
+            let d = Down::from_error(&e);
+            assert_eq!(d.offer_start, offer, "{}", d.headline);
+            assert!(!d.headline.is_empty());
         }
     }
 }

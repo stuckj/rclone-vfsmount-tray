@@ -388,12 +388,31 @@ async fn watch_properties(
         .map_err(link::from_zbus)
 }
 
+/// Bound a mount or unmount, so a service that never answers does not swallow the click.
+///
+/// Generous, because these are the slow ones: `mount` returns once the filesystem is serving,
+/// which for a cold remote is most of a minute, and the service allows itself 45 seconds
+/// before calling it failed. Nothing below this bounds them — zbus sets no reply timeout, and
+/// the bus daemon's `reply_timeout` frees its own pending-reply slot without telling the
+/// caller. Measured: a call held for 400 seconds returned normally.
+async fn acting(
+    call: impl std::future::Future<Output = Result<(), IpcError>>,
+) -> Result<(), IpcError> {
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(300);
+    match tokio::time::timeout(PATIENCE, call).await {
+        Ok(done) => done,
+        Err(_) => Err(IpcError::ZBus(zbus::Error::Failure(
+            "the service did not answer; it may still be working on it".into(),
+        ))),
+    }
+}
+
 /// Bound an attach step, so a name owner that never replies cannot hold the tray.
 ///
-/// zbus imposes no reply timeout, and the bus daemon's is five minutes. Everything wrapped
-/// here is answered from memory or from one lock, so a wait this long is not slowness — it is
-/// something that will not answer. Deliberately not applied to `mount`, which legitimately
-/// takes the best part of a minute on a cold remote.
+/// Nothing else bounds it: zbus sets no reply timeout, and the bus daemon's `reply_timeout`
+/// frees its own slot rather than answering the caller. Everything wrapped here is answered
+/// from memory or from one lock, so a wait this long is not slowness — it is something that
+/// will not answer. The mount and unmount calls get [`acting`]'s much longer bound instead.
 async fn attaching<T>(
     step: impl std::future::Future<Output = Result<T, LinkError>>,
 ) -> Result<T, LinkError> {
@@ -512,7 +531,7 @@ async fn carry_out(handle: Handle<TrayModel>, proxy: watch::Receiver<Option<Prox
 }
 
 async fn call_mount(p: &Proxy, name: &str) -> Result<(), IpcError> {
-    p.mount(name).await
+    acting(p.mount(name)).await
 }
 
 /// Take a mount down, never forcing it.
@@ -522,7 +541,7 @@ async fn call_mount(p: &Proxy, name: &str) -> Result<(), IpcError> {
 /// deliberately, at the command line, so the menu has no way to express it — which is why this
 /// takes no flag rather than passing `false`. See DESIGN.md, "The unmount order".
 async fn call_unmount(p: &Proxy, name: &str) -> Result<(), IpcError> {
-    p.unmount(name, false).await
+    acting(p.unmount(name, false)).await
 }
 
 /// The proxy as it stands, cloned so nothing holds the watch lock across an await.
@@ -537,36 +556,32 @@ async fn unreachable_now(handle: &Handle<TrayModel>, a: &Action) {
         .await;
 }
 
-/// The mount an action names, and where it was trying to send it.
-///
-/// Derived together from the action rather than carried alongside it, so the two cannot be
-/// made to disagree: a notice filed against one mount and answered by another's state is how
-/// a refusal vanishes before it has been read.
+/// [`Action::target`], owned, since a notice outlives the borrow.
 fn target_of(a: &Action) -> (Option<String>, Option<bool>) {
-    match a {
-        Action::Mount(name) => (Some(name.clone()), Some(true)),
-        Action::Unmount(name) => (Some(name.clone()), Some(false)),
-        _ => (None, None),
-    }
+    let (mount, wanted) = a.target();
+    (mount.map(str::to_string), wanted)
 }
 
 /// Say what became of one action.
 async fn report(handle: &Handle<TrayModel>, a: &Action, r: Result<(), IpcError>) {
+    let Some((mount, text, wanted)) = outcome(a, r) else {
+        return;
+    };
+    tracing::warn!(mount = ?mount, %text, "the service refused");
+    let _ = handle.update(|m| m.set_notice(mount, text, wanted)).await;
+}
+
+/// What to record about an outcome, or `None` when there is nothing to say.
+///
+/// Success records nothing and clears nothing: this action's own notice went when it was
+/// dispatched, so anything showing belongs to another action — and two are in flight together
+/// whenever a slow mount overlaps a refused unmount.
+fn outcome(a: &Action, r: Result<(), IpcError>) -> Option<(Option<String>, String, Option<bool>)> {
+    let e = r.err()?;
     let (mount, wanted) = target_of(a);
-    match r {
-        // Nothing to report, and nothing left over from before worth keeping: the action the
-        // user asked for last is the one that worked.
-        Ok(()) => {
-            let _ = handle.update(|m| m.clear_notice()).await;
-        }
-        Err(e) => {
-            let text = link::from_ipc(e).message();
-            let named = mount.clone().unwrap_or_default();
-            tracing::warn!(mount = %named, %text, "the service refused");
-            let notice = format!("{named}: {text}");
-            let _ = handle.update(|m| m.set_notice(mount, notice, wanted)).await;
-        }
-    }
+    let text = link::from_ipc(e).message();
+    let named = mount.clone().unwrap_or_default();
+    Some((mount, format!("{named}: {text}"), wanted))
 }
 
 /// Hand a mount point to whatever the desktop opens directories with.
@@ -760,5 +775,75 @@ mod tests {
         let n = refusal_notice(Action::Unmount("photos".into())).await;
         assert_eq!(n.answered_by, Some(false));
         assert!(n.text.contains("still in use"), "{}", n.text);
+    }
+
+    /// A service that takes the call and never answers, which is what an unbounded wait looks
+    /// like from this side.
+    struct Silent;
+
+    #[zbus::interface(name = "io.github.stuckj.RcloneVfsmountTray1")]
+    impl Silent {
+        async fn mount(&self, _name: &str) -> Result<(), IpcError> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+        async fn unmount(&self, _name: &str, _force: bool) -> Result<(), IpcError> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never resolves")
+        }
+        #[zbus(property)]
+        async fn interface_version(&self) -> u32 {
+            rvt_core::ipc::INTERFACE_VERSION
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_service_that_takes_the_call_and_never_answers_does_not_swallow_the_click() {
+        // Nothing below this bounds it: zbus sets no reply timeout, and the bus daemon's
+        // frees its own slot without telling the caller — measured at 400 seconds. Without
+        // the bound the dispatch task waits for the life of the tray and the click reports
+        // nothing at all. The clock is paused, so this costs no wall time.
+        let (_server, client) = crate::fixtures::serve(Silent).await;
+        let proxy = link::open(&client)
+            .await
+            .expect("the handshake is answered");
+
+        // Both of them: `unmount` is the one whose silence a user is most likely to meet,
+        // since it is what they reach for when something is already wrong.
+        for call in ["mount", "unmount"] {
+            let attempt = async {
+                match call {
+                    "mount" => call_mount(&proxy, "photos").await,
+                    _ => call_unmount(&proxy, "photos").await,
+                }
+            };
+            let e = tokio::time::timeout(std::time::Duration::from_secs(3600), attempt)
+                .await
+                .unwrap_or_else(|_| panic!("{call} does not bound itself"))
+                .expect_err("and reports that it did");
+            let said = link::from_ipc(e).message();
+            assert!(said.contains("did not answer"), "{call}: {said}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_against_the_mount_it_was_about() {
+        let (mount, text, wanted) = outcome(
+            &Action::Unmount("photos".into()),
+            Err(IpcError::Busy("still in use".into())),
+        )
+        .expect("a refusal is worth saying");
+        assert_eq!(mount.as_deref(), Some("photos"));
+        assert_eq!(wanted, Some(false));
+        assert!(text.starts_with("photos: "), "{text}");
+        assert!(text.contains("still in use"), "{text}");
+    }
+
+    #[test]
+    fn success_records_nothing_and_so_disturbs_nothing() {
+        // Anything showing at this point belongs to another action still in flight — a slow
+        // mount finishing must not delete the refusal an unmount just produced.
+        assert_eq!(outcome(&Action::Mount("photos".into()), Ok(())), None);
+        assert_eq!(outcome(&Action::Unmount("photos".into()), Ok(())), None);
     }
 }

@@ -1,12 +1,20 @@
-//! The tray client. With a subcommand it is a scriptable D-Bus client — the surface the
-//! integration tests drive (#38, #54) and the way to work over SSH with no panel present.
-//! With none, it will one day raise the StatusNotifierItem icon (#25, #26); until that is
-//! built it says so and exits.
+//! The tray client, in two shapes from one binary.
 //!
-//! The subcommands talk to the service and to nothing else: they neither hold a mount nor
-//! start the service. See [`client`] for how a stopped or mismatched service is handled.
+//! With a subcommand it is a scriptable D-Bus client — the surface the integration tests
+//! drive (#38, #54) and the way to work over SSH with no panel present. With none it raises
+//! the StatusNotifierItem icon and stays up.
+//!
+//! Neither shape holds a mount or starts the service on its own; both reach it through
+//! [`link`]. See DESIGN.md, "The lifetime rule".
 
 mod client;
+#[cfg(test)]
+mod fixtures;
+mod link;
+mod menu;
+mod model;
+mod sni;
+mod watch;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -75,15 +83,14 @@ async fn main() -> ExitCode {
     }
 
     let Some(cmd) = args.command else {
-        tracing::warn!("tray not implemented yet — see issues #25, #26 and #52");
-        return ExitCode::SUCCESS;
+        return run_tray().await;
     };
 
     // The connect failure is carried into `execute` rather than unwrapped here, so that
     // `status --json` can still emit a document saying the service is unreachable.
     let conn = zbus::Connection::session()
         .await
-        .map_err(client::CliError::NoSessionBus);
+        .map_err(link::LinkError::NoSessionBus);
 
     use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
@@ -101,6 +108,88 @@ async fn main() -> ExitCode {
             ExitCode::from(e.exit_code())
         }
     }
+}
+
+/// Raise the icon and stay up until the user or the session ends it.
+///
+/// The link to the service is not waited for: the icon appears whether or not the service is
+/// running, and says which (#52).
+async fn run_tray() -> ExitCode {
+    let (actions, queue) = tokio::sync::mpsc::unbounded_channel();
+    let model = model::TrayModel::new(actions);
+
+    let handle = tokio::select! {
+        h = raise(model) => match h {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("Could not raise the tray icon: {e}");
+                return ExitCode::from(5);
+            }
+        },
+        // Still interruptible while it is waiting for a panel.
+        _ = terminated() => return ExitCode::SUCCESS,
+    };
+
+    tokio::select! {
+        _ = watch::run(handle.clone(), queue) => {}
+        _ = terminated() => { handle.shutdown().await; }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Put the icon up, waiting for a panel that can take it.
+///
+/// `ksni` routes only a `StatusNotifierWatcher` that is absent altogether to
+/// [`ksni::Tray::watcher_offline`]; a watcher that owns the name but is not yet serving the
+/// object, or is answering slowly, or is being replaced, comes back as an error from `spawn`.
+/// At login that is the ordinary shape of a desktop still starting up, and there is nothing
+/// yet to restart the tray if it gives up — so only a session bus that cannot be reached at
+/// all is fatal.
+async fn raise(model: model::TrayModel) -> Result<ksni::Handle<model::TrayModel>, ksni::Error> {
+    use ksni::TrayMethods as _;
+
+    let mut backoff = link::Backoff::new();
+    // `spawn` takes the tray, so each attempt needs its own — built on the one queue, which
+    // the menu's callbacks send to whichever attempt eventually succeeds.
+    let queue = model.actions();
+    let mut attempt = model;
+    loop {
+        // `assume_sni_available`: a panel that starts after us, or a shell restarting, must
+        // leave the icon waiting rather than a process that gave up (#25).
+        match attempt.assume_sni_available(true).spawn().await {
+            Ok(handle) => return Ok(handle),
+            Err(e @ ksni::Error::Dbus(_)) => return Err(e),
+            Err(e) => {
+                let wait = backoff.take();
+                tracing::warn!(error = %e, ?wait, "could not register the icon yet; retrying");
+                tokio::time::sleep(wait).await;
+                attempt = model::TrayModel::new(queue.clone());
+            }
+        }
+    }
+}
+
+/// Resolves on `SIGTERM` or `SIGINT`.
+///
+/// The session sends `SIGTERM` at logout and kills whatever has not gone shortly after, so a
+/// tray that ignores it is killed rather than closed.
+async fn terminated() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut term = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        // Nothing can be done about a handler that will not install, and exiting over it
+        // would be worse than running without one.
+        Err(e) => {
+            tracing::warn!(error = %e, "no SIGTERM handler; the tray will be killed at logout");
+            return std::future::pending().await;
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+    tracing::info!("asked to stop; closing the icon and leaving every mount alone");
 }
 
 /// The man page and shell completions under `docs/` and `completions/` are generated from

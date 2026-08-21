@@ -15,15 +15,14 @@ path = "src/main.rs"
 # Pure Rust — ksni 0.3 speaks StatusNotifierItem over zbus, so this links no system
 # C libraries and stays cheap. It runs all day in a panel; keep it that way.
 #
-# The CLI client uses most of these. `ksni` and `anyhow` are not referenced yet: they are
-# declared ahead of the tray GUI that fills this crate in (#25, #26), deliberately, not by
-# accident. They are what the tier-1 CI job compiles, so if either ever starts pulling in a
-# system C library — `ksni` speaks StatusNotifierItem and is the one to watch — CI breaks on
-# a bare runner and we find out immediately. Do not prune them as "unused"; that disarms the
-# tripwire.
+# `anyhow` is not referenced yet: it is declared ahead of the code that will want it, and it
+# is what the tier-1 CI job compiles, so if it ever starts pulling in a system C library CI
+# breaks on a bare runner and we find out immediately. Do not prune it as "unused"; that
+# disarms the tripwire.
 [dependencies]
 rvt-core = { path = "../core" }
 ksni = "0.3"
+futures-util = { workspace = true }
 tokio = { workspace = true }
 zbus = { workspace = true }
 serde_json = { workspace = true }
@@ -37,6 +36,9 @@ anyhow = { workspace = true }
 # should find `Scratch` rather than an unresolved import.
 [dev-dependencies]
 rvt-testutil = { path = "../testutil" }
+# `test-util` for tokio's paused clock: the tray waits a long time on a mount call before it
+# gives up, and a test of that should not. Dev-only — the binary is built without it.
+tokio = { workspace = true, features = ["test-util"] }
 # Generate this binary's man page and completions in-test, to check the committed copies
 # under `docs/` and `completions/` still match what the current `clap` command produces.
 clap_mangen = { workspace = true }

@@ -434,17 +434,84 @@ pub mod dbus {
 
         fn recent_output<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, String> {
             Box::pin(async move {
+                // `json`, not `cat`, so the unit's own output can be told from systemd's
+                // narration about it — see [`what_the_unit_said`].
                 let out = tokio::process::Command::new("journalctl")
-                    .args(["--user", "-u", unit, "-n", "20", "--no-pager", "-o", "cat"])
+                    .args(["--user", "-u", unit, "-n", "20", "--no-pager", "-o", "json"])
                     .output()
                     .await;
                 match out {
-                    Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                    Ok(o) => what_the_unit_said(&String::from_utf8_lossy(&o.stdout)),
                     Err(_) => String::new(),
                 }
             })
         }
     }
+}
+
+/// The unit's own output, taken out of a journal window that also carries systemd's
+/// narration about the unit.
+///
+/// This becomes a mount's failure reason, and the whole point of it is to say what rclone
+/// objected to. A window of twenty entries around a failure is mostly `Starting…`,
+/// `Started…`, `Main process exited…`, `Failed with result…` and `Scheduled restart job…`,
+/// repeated once per attempt, with rclone's one line somewhere inside — so a reader is given
+/// several screens of systemd before reaching the part that helps.
+///
+/// Told apart by `_COMM`, which is the process that logged the entry: the user manager logs
+/// as `systemd`, and everything the unit runs logs as itself. Not by matching the message
+/// text, which systemd translates.
+///
+/// Falls back to everything when that leaves nothing, since a unit that died before it could
+/// say anything still has systemd's account, and that beats an empty reason.
+fn what_the_unit_said(journal: &str) -> String {
+    let entries: Vec<(bool, String)> = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|e| {
+            let text = match e.get("MESSAGE") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                // Non-UTF-8 output arrives as an array of bytes.
+                Some(serde_json::Value::Array(bytes)) => {
+                    let raw: Vec<u8> = bytes
+                        .iter()
+                        .filter_map(|b| b.as_u64())
+                        .map(|b| b as u8)
+                        .collect();
+                    String::from_utf8_lossy(&raw).into_owned()
+                }
+                _ => return None,
+            };
+            // rclone ends its fatal messages with a newline, which the journal keeps as an
+            // entry of its own. Dropped here, so the repeats around it end up adjacent and
+            // can be collapsed below.
+            if text.trim().is_empty() {
+                return None;
+            }
+            let from_systemd = e.get("_COMM").and_then(|c| c.as_str()) == Some("systemd");
+            Some((from_systemd, text))
+        })
+        .collect();
+
+    let own: Vec<&str> = entries
+        .iter()
+        .filter(|(from_systemd, _)| !from_systemd)
+        .map(|(_, text)| text.as_str())
+        .collect();
+    let shown: Vec<&str> = if own.is_empty() {
+        entries.iter().map(|(_, text)| text.as_str()).collect()
+    } else {
+        own
+    };
+    // `Restart=on-failure` runs the same command into the same wall, so the window holds one
+    // complaint per attempt. Saying it three times does not make it any more informative.
+    let mut said: Vec<&str> = Vec::with_capacity(shown.len());
+    for line in shown {
+        if said.last() != Some(&line) {
+            said.push(line);
+        }
+    }
+    said.join("\n").trim().to_string()
 }
 
 #[cfg(test)]
@@ -767,5 +834,81 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A window around a real failure, captured from `journalctl -o json` on 2026-08-20:
+    /// a mount point that was not empty, retried until systemd gave up. Trimmed to the
+    /// fields this reads, and to one restart cycle of the three that were there.
+    const A_REAL_WINDOW: &str = concat!(
+        r#"{"_COMM":"systemd","MESSAGE":"Starting rvt-mount-bad.service - rclone mount jsrc: at /home/j/mnt..."}"#,
+        "\n",
+        r#"{"_COMM":"systemd","MESSAGE":"Started rvt-mount-bad.service - rclone mount jsrc: at /home/j/mnt."}"#,
+        "\n",
+        r#"{"_COMM":"rclone","MESSAGE":"ERROR+4: Fatal error: failed to mount FUSE fs: \"/home/j/mnt\" is not empty, use --allow-non-empty to mount anyway"}"#,
+        "\n",
+        r#"{"_COMM":"systemd","MESSAGE":"rvt-mount-bad.service: Main process exited, code=exited, status=1/FAILURE"}"#,
+        "\n",
+        r#"{"_COMM":"systemd","MESSAGE":"rvt-mount-bad.service: Failed with result 'exit-code'."}"#,
+        "\n",
+        r#"{"_COMM":"systemd","MESSAGE":"rvt-mount-bad.service: Scheduled restart job, restart counter is at 1."}"#,
+        "\n",
+        r#"{"_COMM":"systemd","MESSAGE":"rvt-mount-bad.service: Start request repeated too quickly."}"#,
+        "\n",
+        r#"{"_COMM":"systemd","MESSAGE":"Failed to start rvt-mount-bad.service - rclone mount jsrc: at /home/j/mnt."}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_failure_reason_is_what_rclone_said_not_what_systemd_said_about_it() {
+        // Three lines in twenty were rclone's in the window this came from. Handing the
+        // whole thing over buries the one sentence that says what to fix.
+        let said = what_the_unit_said(A_REAL_WINDOW);
+        assert_eq!(
+            said,
+            "ERROR+4: Fatal error: failed to mount FUSE fs: \"/home/j/mnt\" is not empty, \
+             use --allow-non-empty to mount anyway"
+        );
+    }
+
+    #[test]
+    fn one_complaint_repeated_by_a_restart_loop_is_said_once() {
+        // systemd retries three times before giving up, and rclone meets the same wall each
+        // time, so the window carries the same sentence three times over — separated by the
+        // blank entry rclone's trailing newline leaves behind.
+        let thrice = A_REAL_WINDOW.repeat(3);
+        let said = what_the_unit_said(&thrice);
+        assert_eq!(said.lines().count(), 1, "{said}");
+        assert!(said.contains("use --allow-non-empty"), "{said}");
+    }
+
+    #[test]
+    fn a_unit_that_died_before_it_spoke_still_gets_systemds_account() {
+        // Better than an empty reason: an exec that could not start, or a binary that is
+        // not there, leaves nothing of its own in the window.
+        let only_systemd = concat!(
+            r#"{"_COMM":"systemd","MESSAGE":"rvt-mount-bad.service: Failed to locate executable /usr/bin/rclone: No such file or directory"}"#,
+            "\n",
+            r#"{"_COMM":"systemd","MESSAGE":"rvt-mount-bad.service: Failed with result 'exit-code'."}"#,
+            "\n",
+        );
+        let said = what_the_unit_said(only_systemd);
+        assert!(said.contains("Failed to locate executable"), "{said}");
+    }
+
+    #[test]
+    fn a_window_that_cannot_be_read_reports_nothing_rather_than_failing() {
+        assert_eq!(what_the_unit_said(""), "");
+        assert_eq!(what_the_unit_said("not json at all\n"), "");
+    }
+
+    #[test]
+    fn output_that_is_not_utf8_still_reaches_the_reason() {
+        // journalctl hands those over as an array of bytes rather than a string.
+        let raw = r#"{"_COMM":"rclone","MESSAGE":[104,105,255,33]}"#;
+        assert!(
+            what_the_unit_said(raw).starts_with("hi"),
+            "{}",
+            what_the_unit_said(raw)
+        );
     }
 }

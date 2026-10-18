@@ -41,9 +41,9 @@ cargo run -p rclone-vfsmount-trayd -- --log-level debug
 ```
 
 It reconciles, takes `io.github.stuckj.RcloneVfsmountTray` on the session bus and stays up
-serving it. It mounts nothing on its own — `auto_mount` is not acted on yet (#98) — so it
-waits to be asked. If a service is already running it exits saying the name is taken, so
-stop that one first. `--foreground` is accepted but does nothing yet: there is no background
+serving it, and brings up the mounts marked `auto_mount` — set `auto_mount = false` on a
+mount to keep it down while you work. If a service is already running it exits saying the
+name is taken, so stop that one first. `--foreground` is accepted but does nothing yet: there is no background
 mode for it to opt out of.
 
 To ask it something, use the client subcommands in another terminal — `cargo run -p

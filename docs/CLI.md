@@ -142,7 +142,9 @@ rclone-vfsmount-trayd [--config PATH] [--log-level LEVEL] [--foreground]
 `--config` overrides the configuration file (default
 `$XDG_CONFIG_HOME/rclone-vfsmount-tray/config.toml`). `--foreground` is accepted for running
 outside systemd while debugging. The service takes the well-known name on the session bus and
-serves until stopped; stopping it leaves every mount exactly as it is.
+serves until stopped. It brings up the mounts marked `auto_mount` as it starts, and stopping
+it leaves every mount exactly as it is unless `unmount_on_service_stop` is on (see
+`config.example.toml`).
 
 ## Man pages and shell completions
 

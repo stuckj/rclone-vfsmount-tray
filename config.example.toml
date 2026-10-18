@@ -4,7 +4,11 @@
 # ~/.config/rclone-vfsmount-tray/config.toml.
 #
 # This file is meant to be hand-edited — the graphical mount editor is not built yet.
-# Restart the service after editing; it does not watch this file yet.
+# The service reads it when it starts and does not watch it, so restart the service after
+# editing. A mount that is already up keeps the options it was started with — restarting
+# the service does not remount it — so a change to one reaches it the next time it is
+# mounted: unmount it and mount it again. The service logs a warning naming each mount
+# that is running with options this file no longer gives it.
 #
 # It references rclone remotes by name, so it needs no credentials of its own: those stay
 # in rclone's own config, which `rclone config` manages. The exception is `extra_args`
@@ -20,20 +24,25 @@ version = 1
 # Use a specific rclone rather than searching $PATH.
 # rclone_path = "/usr/local/bin/rclone"
 
-# Override rclone's cache directory. Normally discovered from `rclone config paths`.
+# Where rclone keeps its cache, for every mount. Passed as `--cache-dir`, so it must be
+# absolute. Without it rclone uses its own default, which `rclone config paths` shows.
 # cache_dir = "/var/cache/rclone"
 
-# Unmount everything when the service stops.
+# Unmount this service's mounts when the service is stopped.
 #
 # Off by default, and worth leaving off. Mounts are deliberately independent of the
 # service's lifetime: it crashes, and it gets restarted, and neither should pull your
 # filesystems out from under whatever is using them. Unuploaded data is safe
-# either way — rclone's cache is on disk and resumes — but a file being written when the
-# mount goes is truncated where it stood, and an unmount you did not ask for is
-# disruptive regardless.
+# either way — rclone's cache is on disk and resumes — but an unmount you did not ask for
+# is disruptive regardless.
 #
-# Not acted on yet (#99), so turning it on does nothing today. Leaving it off is what the
-# service already does.
+# Turned on, it applies only to an explicit stop: `systemctl --user stop`, the tray's
+# "Stop service", or a logout that stops your user services (it does not when lingering is
+# on — see the README). A restart — by hand, or by an upgrade — and a crash
+# still leave every mount up, and so does anything the service cannot confirm with
+# systemd was a stop, including Ctrl-C when it is run from a terminal. Queued uploads get
+# a chance to finish first. The unmount is never forced: a mount something is still using
+# stays up, and the journal says so. Mounts this service did not start are never touched.
 unmount_on_service_stop = false
 
 [global.poll]
@@ -44,6 +53,7 @@ active_secs = 1   # while data is moving
 idle_secs = 15    # while nothing is
 
 [global.notifications]
+# Not acted on yet (#28): there are no desktop notifications, so these do nothing today.
 uploads_complete = true   # everything queued for a mount has finished — "safe to unplug"
 upload_errors = true      # an upload failed or ran out of retries
 mount_failures = true     # a mount failed, or died and could not be restarted
@@ -99,8 +109,11 @@ cache_mode = "writes"
 cache_max_size = "10G"
 cache_max_age = "24h"
 
-# Mount when the service starts. Not acted on yet (#98) — the service comes up and waits
-# to be asked, whatever this says.
+# Mount when the service starts. On by default. A mount that is already up is left as it
+# is. One that fails to come up — a remote that is unreachable at login, say — is tried
+# again, at growing intervals up to every 15 minutes, until it comes up or you mount or
+# unmount it yourself. A problem retrying cannot fix — a mount point that cannot be
+# created, or something else already mounted there — is reported once and left.
 auto_mount = true
 
 # read_only = false

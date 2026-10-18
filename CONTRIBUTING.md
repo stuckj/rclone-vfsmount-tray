@@ -51,6 +51,10 @@ rclone-vfsmount-tray -- list`, `… mount <name>`, `… status --json`. They dri
 same D-Bus interface a front end will (see [docs/CLI.md](docs/CLI.md)), and work with no tray
 running.
 
+The tray is that same binary with no subcommand: `cargo run -p rclone-vfsmount-tray`. It runs
+without a panel, so it works on a headless machine too; [docs/TRAY.md](docs/TRAY.md) shows how
+to read its icon and menu from the command line.
+
 ## Before opening a pull request
 
 ```sh

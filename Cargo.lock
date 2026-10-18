@@ -632,6 +632,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "clap_mangen",
+ "futures-util",
  "ksni",
  "rvt-core",
  "rvt-testutil",

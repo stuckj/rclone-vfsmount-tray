@@ -1,184 +1,18 @@
 //! Driving the service from the command line: connect, check the two sides can understand
 //! each other, run one subcommand, print, exit.
 //!
-//! A one-shot process — it does not subscribe to signals the way the tray will. The care
-//! here is in the failure modes (#52). A service that is not running, or one speaking an
-//! interface this build was not compiled against, must produce a plain sentence and a
-//! distinct exit code; and "cannot reach the service" must never be rendered as "nothing is
-//! mounted", because the two are not the same and confusing them is how a user is told their
-//! files are gone when they are not.
+//! A one-shot process: it asks once and exits, where the tray subscribes and stays. Both
+//! reach the service through [`crate::link`], which is where a stopped service is told apart
+//! from a mismatched one. What is specific here is the rendering — a plain sentence and a
+//! distinct exit code per failure, and "cannot reach the service" never rendered as "nothing
+//! is mounted", because confusing those is how a user is told their files are gone when they
+//! are not.
 
 use std::io::Write;
 
-use rvt_core::ipc::{
-    self, IpcError, MountView, RcloneVfsmountTrayProxy, TransferFileView, TransferView,
-};
-use zbus::proxy::CacheProperties;
-use zbus::DBusError as _;
+use rvt_core::ipc::{self, MountView, TransferFileView, TransferView};
 
-/// What to run `systemctl --user start` against, quoted once so the message and the JSON
-/// `start_hint` cannot drift apart.
-const START_HINT: &str = "systemctl --user start rclone-vfsmount-trayd";
-
-/// The lowest interface version whose vocabulary these subcommands use.
-///
-/// Every method and property they call was published at version 1, so a service reporting
-/// anything lower is too old to answer them. No released service does — but the check turns
-/// a future gap into a sentence rather than an `UnknownMethod` surfacing halfway through.
-const MIN_INTERFACE: u32 = 1;
-
-/// Why a subcommand could not be carried out.
-///
-/// [`Self::Refused`] is set apart from the rest: it is the service answering and saying no,
-/// and it is the only kind that says anything about a mount. Everything else is the question
-/// never being answered, and is reported without ever implying a mount is absent.
-#[derive(Debug)]
-pub(crate) enum CliError {
-    /// No session bus to reach. The desktop session provides one; without it there is
-    /// nothing to connect to, service or not.
-    NoSessionBus(zbus::Error),
-    /// The bus is there and nobody owns the service's name — the service is stopped.
-    NotRunning,
-    /// Something owns the name but does not answer the interface this build calls: a service
-    /// too different to talk to, or an unrelated program holding the name.
-    Incompatible,
-    /// The service is older than the vocabulary a subcommand needs.
-    TooOld { needed: u32, found: u32 },
-    /// The service answered and refused. The sentence to show is its own.
-    Refused(IpcError),
-    /// The call reached the bus and failed for some other reason.
-    Transport(zbus::Error),
-}
-
-impl CliError {
-    /// A distinct code per failure so a script can branch without parsing prose.
-    pub(crate) fn exit_code(&self) -> u8 {
-        match self {
-            CliError::Refused(_) => 1,
-            CliError::NotRunning => 3,
-            CliError::Incompatible | CliError::TooOld { .. } => 4,
-            CliError::NoSessionBus(_) | CliError::Transport(_) => 5,
-        }
-    }
-
-    /// The sentence to print to stderr.
-    pub(crate) fn message(&self) -> String {
-        match self {
-            CliError::NoSessionBus(e) => format!(
-                "No session bus to reach ({e}). This runs inside a desktop session; over SSH, \
-                 point DBUS_SESSION_BUS_ADDRESS at the user bus."
-            ),
-            CliError::NotRunning => format!(
-                "The rclone-vfsmount-tray service is not running. Start it with:\n    {START_HINT}\n\
-                 This says nothing about your mounts: any that were up are still up."
-            ),
-            CliError::Incompatible => format!(
-                "The service on this bus does not answer {}. It is a different, incompatible \
-                 version of the interface; update the client and service to match.",
-                ipc::INTERFACE_NAME
-            ),
-            CliError::TooOld { needed, found } => format!(
-                "This command needs interface version {needed}, but the service provides {found}. \
-                 Update rclone-vfsmount-trayd."
-            ),
-            CliError::Refused(e) => e
-                .description()
-                .unwrap_or("the service refused the request")
-                .to_string(),
-            CliError::Transport(e) => format!("The service could not be reached: {e}"),
-        }
-    }
-}
-
-/// The three ways a call fails at the wire, told apart by the D-Bus error name.
-enum Wire {
-    NotRunning,
-    Incompatible,
-    Transport,
-}
-
-/// Sort a D-Bus error name into [`Wire`]. Split out from the error it came on so the mapping
-/// itself is checkable without fabricating a `zbus::Error`.
-fn classify_error_name(name: &str) -> Wire {
-    match name {
-        "org.freedesktop.DBus.Error.ServiceUnknown"
-        | "org.freedesktop.DBus.Error.NameHasNoOwner" => Wire::NotRunning,
-        // The name is owned, but by something that does not carry this interface, object or
-        // member: a service too new or too different, not a stopped one.
-        "org.freedesktop.DBus.Error.UnknownInterface"
-        | "org.freedesktop.DBus.Error.UnknownObject"
-        | "org.freedesktop.DBus.Error.UnknownMethod"
-        | "org.freedesktop.DBus.Error.UnknownProperty" => Wire::Incompatible,
-        _ => Wire::Transport,
-    }
-}
-
-/// The D-Bus error name behind a failure, whichever shape zbus surfaced it in.
-///
-/// A remote error arrives as [`zbus::Error::MethodError`] when its name is unrecognised, but
-/// zbus lifts the well-known `org.freedesktop.DBus.Error.*` names — the ones that separate a
-/// stopped service from a mismatched one — into [`zbus::Error::FDO`]. Both carry the name;
-/// classification needs it from either.
-fn dbus_error_name(e: &zbus::Error) -> Option<String> {
-    match e {
-        zbus::Error::MethodError(name, _, _) => Some(name.as_str().to_owned()),
-        zbus::Error::FDO(fdo) => Some(fdo.name().as_str().to_owned()),
-        _ => None,
-    }
-}
-
-fn classify(e: &zbus::Error) -> Wire {
-    match dbus_error_name(e) {
-        Some(name) => classify_error_name(&name),
-        None => Wire::Transport,
-    }
-}
-
-/// Sort a bare wire failure into the connection-level kinds.
-///
-/// A stopped service surfaces its `ServiceUnknown` at whichever call reaches for it first —
-/// building the proxy resolves the name, so it can land there rather than at the property
-/// read. Both paths run through here so the verdict does not depend on which call tripped.
-fn from_zbus(e: zbus::Error) -> CliError {
-    match classify(&e) {
-        Wire::NotRunning => CliError::NotRunning,
-        Wire::Incompatible => CliError::Incompatible,
-        Wire::Transport => CliError::Transport(e),
-    }
-}
-
-/// Turn an [`IpcError`] from a call into a [`CliError`]. An application refusal keeps its
-/// identity; a transport failure is sorted into the connection-level kinds.
-fn from_ipc(e: IpcError) -> CliError {
-    match e {
-        IpcError::ZBus(z) => from_zbus(z),
-        // `#[non_exhaustive]`: a new application error still reaches the user as its own
-        // refusal rather than being mistaken for a transport failure.
-        other => CliError::Refused(other),
-    }
-}
-
-/// Build the proxy and confirm the service speaks a version these commands can use.
-///
-/// Reading `InterfaceVersion` first is the handshake: it is the cheapest call, and it is
-/// where an absent or incompatible interface surfaces as one clear failure instead of each
-/// later method failing on its own. Property caching is off — a one-shot process reads each
-/// once and has no use for a `PropertiesChanged` subscription.
-async fn open(conn: &zbus::Connection) -> Result<RcloneVfsmountTrayProxy<'_>, CliError> {
-    let proxy = RcloneVfsmountTrayProxy::builder(conn)
-        .cache_properties(CacheProperties::No)
-        .build()
-        .await
-        .map_err(from_zbus)?;
-    let version = proxy.interface_version().await.map_err(from_ipc)?;
-    if version < MIN_INTERFACE {
-        return Err(CliError::TooOld {
-            needed: MIN_INTERFACE,
-            found: version,
-        });
-    }
-    Ok(proxy)
-}
+use crate::link::{from_ipc, open, LinkError, START_HINT};
 
 /// Run one subcommand against a connection that may itself have failed to open.
 ///
@@ -186,10 +20,10 @@ async fn open(conn: &zbus::Connection) -> Result<RcloneVfsmountTrayProxy<'_>, Cl
 /// `status` can still emit a document describing the disconnection — the case a script most
 /// needs to tell apart from an empty mount list.
 pub(crate) async fn execute(
-    conn: Result<zbus::Connection, CliError>,
+    conn: Result<zbus::Connection, LinkError>,
     cmd: &crate::Command,
     out: &mut impl Write,
-) -> Result<(), CliError> {
+) -> Result<(), LinkError> {
     match cmd {
         crate::Command::Status { json } => run_status(conn, *json, out).await,
         crate::Command::List => {
@@ -232,10 +66,10 @@ struct StatusSnapshot {
 }
 
 async fn run_status(
-    conn: Result<zbus::Connection, CliError>,
+    conn: Result<zbus::Connection, LinkError>,
     json: bool,
     out: &mut impl Write,
-) -> Result<(), CliError> {
+) -> Result<(), LinkError> {
     match conn {
         Ok(conn) => match gather_status(&conn).await {
             Ok(snap) => {
@@ -254,7 +88,7 @@ async fn run_status(
     }
 }
 
-async fn gather_status(conn: &zbus::Connection) -> Result<StatusSnapshot, CliError> {
+async fn gather_status(conn: &zbus::Connection) -> Result<StatusSnapshot, LinkError> {
     let proxy = open(conn).await?;
     let interface_version = proxy.interface_version().await.map_err(from_ipc)?;
     let service_version = proxy.service_version().await.map_err(from_ipc)?;
@@ -291,7 +125,7 @@ fn emit_status(snap: &StatusSnapshot, json: bool, out: &mut impl Write) {
 /// For `status --json`, a failure still produces a JSON document — one that says the service
 /// is unreachable and leaves `mounts` **null**. `null` is not `[]`: an empty array would read
 /// as "the service is up and has no mounts", the exact claim this must never make.
-fn emit_disconnected(e: &CliError, json: bool, out: &mut impl Write) {
+fn emit_disconnected(e: &LinkError, json: bool, out: &mut impl Write) {
     if json {
         let _ = writeln!(out, "{}", disconnected_json(e));
     }
@@ -315,18 +149,19 @@ fn status_json(snap: &StatusSnapshot) -> String {
     .to_string()
 }
 
-fn disconnected_json(e: &CliError) -> String {
+fn disconnected_json(e: &LinkError) -> String {
     // These are exactly the reasons documented in docs/CLI.md. `Refused` is folded into the
     // generic bucket rather than given a name of its own: it cannot reach here — the only
     // caller, `run_status`, reaches this on a failure to gather, and every call it makes is
     // infallible service-side — so a distinct, undocumented reason string would only ever
     // describe a state that does not occur.
     let reason = match e {
-        CliError::NotRunning => "service not running",
-        CliError::NoSessionBus(_) => "no session bus",
-        CliError::Incompatible => "interface incompatible",
-        CliError::TooOld { .. } => "service too old",
-        CliError::Transport(_) | CliError::Refused(_) => "service unreachable",
+        LinkError::NotRunning => "service not running",
+        LinkError::NoSessionBus(_) => "no session bus",
+        LinkError::Incompatible => "interface incompatible",
+        LinkError::TooOld { .. } => "service too old",
+        LinkError::Silent => "service did not answer",
+        LinkError::Transport(_) | LinkError::Refused(_) => "service unreachable",
     };
     let mut doc = serde_json::json!({
         "connected": false,
@@ -334,7 +169,7 @@ fn disconnected_json(e: &CliError) -> String {
         "detail": e.message(),
         "mounts": serde_json::Value::Null,
     });
-    if matches!(e, CliError::NotRunning) {
+    if matches!(e, LinkError::NotRunning) {
         doc["start_hint"] = serde_json::json!(START_HINT);
     }
     doc.to_string()
@@ -462,6 +297,8 @@ fn pending_summary(e: &MountEntry) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::serve;
+    use rvt_core::ipc::IpcError;
     use std::sync::{Arc, Mutex};
 
     /// A minimal service on the far end of a socket pair, so the client is exercised against
@@ -557,29 +394,6 @@ mod tests {
             files: vec![],
             degraded_reason: None,
         }
-    }
-
-    /// Serve one interface over a socket pair and hand back the client's end.
-    async fn serve<I>(iface: I) -> (zbus::Connection, zbus::Connection)
-    where
-        I: zbus::object_server::Interface,
-    {
-        let (server_sock, client_sock) = tokio::net::UnixStream::pair().unwrap();
-        let guid = zbus::Guid::generate();
-        let server = zbus::connection::Builder::socket(server_sock)
-            .server(guid)
-            .unwrap()
-            .p2p()
-            .auth_mechanism(zbus::AuthMechanism::Anonymous)
-            .serve_at(ipc::OBJECT_PATH, iface)
-            .unwrap()
-            .build();
-        let client = zbus::connection::Builder::socket(client_sock)
-            .p2p()
-            .auth_mechanism(zbus::AuthMechanism::Anonymous)
-            .build();
-        let (server, client) = tokio::join!(server, client);
-        (server.unwrap(), client.unwrap())
     }
 
     fn fake(mounts: Vec<MountView>) -> (Fake, Arc<Mutex<Vec<String>>>) {
@@ -695,7 +509,7 @@ mod tests {
             .expect_err("version 0 is below what the commands need");
         assert!(matches!(
             err,
-            CliError::TooOld {
+            LinkError::TooOld {
                 needed: 1,
                 found: 0
             }
@@ -710,7 +524,7 @@ mod tests {
         let err = execute(Ok(client), &crate::Command::List, &mut out)
             .await
             .expect_err("the wrong interface must not read as success");
-        assert!(matches!(err, CliError::Incompatible), "{err:?}");
+        assert!(matches!(err, LinkError::Incompatible), "{err:?}");
         assert_eq!(err.exit_code(), 4);
     }
 
@@ -743,37 +557,10 @@ mod tests {
         // service with no mounts. `null` and `[]` are different answers and a script keys on
         // the difference.
         let doc: serde_json::Value =
-            serde_json::from_str(&disconnected_json(&CliError::NotRunning)).unwrap();
+            serde_json::from_str(&disconnected_json(&LinkError::NotRunning)).unwrap();
         assert_eq!(doc["connected"], serde_json::json!(false));
         assert_eq!(doc["mounts"], serde_json::Value::Null);
         assert_eq!(doc["reason"], serde_json::json!("service not running"));
         assert_eq!(doc["start_hint"], serde_json::json!(START_HINT));
-    }
-
-    #[test]
-    fn the_not_running_message_offers_the_start_command_and_denies_the_inference() {
-        let m = CliError::NotRunning.message();
-        assert!(m.contains(START_HINT), "{m}");
-        assert!(
-            m.contains("still up"),
-            "the message must refuse the disconnected-means-unmounted reading: {m}"
-        );
-        assert_eq!(CliError::NotRunning.exit_code(), 3);
-    }
-
-    #[test]
-    fn error_names_sort_into_the_right_bucket() {
-        assert!(matches!(
-            classify_error_name("org.freedesktop.DBus.Error.ServiceUnknown"),
-            Wire::NotRunning
-        ));
-        assert!(matches!(
-            classify_error_name("org.freedesktop.DBus.Error.UnknownInterface"),
-            Wire::Incompatible
-        ));
-        assert!(matches!(
-            classify_error_name("org.freedesktop.DBus.Error.AccessDenied"),
-            Wire::Transport
-        ));
     }
 }

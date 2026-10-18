@@ -124,6 +124,17 @@ The cache is on disk and resumes, but the file that was mid-write does not un-tr
 | Session ends / logout | depends on `loginctl enable-linger` |
 | Suspend / resume | mounts survive; stale handles recovered |
 
+Adopting a mount adopts the flags it was started with. A config edit reaches a running mount
+only when it is next mounted; the service says which mounts are behind, and does not remount
+them to catch up.
+
+**An explicit stop is told from a restart by the job systemd has queued on the service's own
+unit**, since both arrive as the same `SIGTERM`. During the stop half of a restart that job
+reads `restart`, not `stop` (measured on systemd 259, #99). Anything that cannot be shown to
+be a stop — no job behind the signal, a job of another type, a systemd that cannot be asked —
+counts as not one, so `unmount_on_service_stop` fails toward leaving mounts up. The unmount it
+does make is never forced.
+
 This is the kind of property that regresses quietly — a `KillMode`, a cgroup setting, or a
 tidy-looking `Drop` impl that unmounts "for cleanliness". The matrix is therefore a
 specification for tests rather than a description of them; asserting it against a real rclone

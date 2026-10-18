@@ -102,8 +102,10 @@ credential can end up in this file is if you put one there yourself, by passing 
 `--s3-secret-access-key` through `extra_args`; check for that before sharing the file.
 
 The graphical editor is not built yet, so this file is the way to set things up today. The
-service reads it once at start-up and does not watch it, so any edit takes effect the next
-time you start it.
+service reads it once at start-up and does not watch it, so restart the service after an edit.
+A mount that is already up keeps the options it was started with, though — restarting the
+service deliberately leaves it running — so a change to one takes effect the next time that
+mount is mounted. The service's log names any mount running with out-of-date options.
 
 ## Running it
 
@@ -113,8 +115,10 @@ time you start it.
 
 That finds rclone, reads your config and stays running. It watches every mount it can see —
 including any rclone mount already running that this project did not start — and will mount
-and unmount on request. It does **not** bring anything up on its own yet, so a fresh setup
-starts with all of your mounts unmounted.
+and unmount on request. As it starts it brings up every mount marked `auto_mount`, which is
+the default, and leaves alone any that are already up. A mount that cannot come up yet — its
+remote unreachable at login, say — is retried until it does, or until you mount or unmount it
+yourself.
 
 The `rclone-vfsmount-tray` binary is both the tray icon and a command-line client. With a
 subcommand it is the client — the way to drive the service from a terminal, a script, or over
@@ -135,7 +139,9 @@ itself, and never reports "no mounts" when it simply could not reach it. See
 schema.
 
 The service takes `--config <path>` to point it at a different file, and `--log-level debug`
-for more detail. Stopping it leaves every mount exactly as it is.
+for more detail. Stopping it leaves every mount exactly as it is, unless you turn on
+`unmount_on_service_stop` — see [`config.example.toml`](config.example.toml) for exactly when
+that applies. Restarting it never unmounts anything.
 
 ## The tray icon
 

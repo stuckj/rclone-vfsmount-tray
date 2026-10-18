@@ -2,7 +2,7 @@
 
 The `rclone-vfsmount-tray` binary is two things in one. Run with a subcommand it is a
 scriptable D-Bus client that drives the service; run with none it raises the tray icon, which
-the [README](../README.md#the-tray-icon) describes. The subcommands need no graphical session —
+[docs/TRAY.md](TRAY.md) describes. The subcommands need no graphical session —
 they work over SSH, and they are how the integration tests drive the system.
 
 They talk to the service and to nothing else. They hold no mount, and they do not start the

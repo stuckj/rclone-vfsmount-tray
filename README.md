@@ -145,40 +145,14 @@ Run the same binary with no subcommand and it puts an icon in your panel:
 rclone-vfsmount-tray
 ```
 
-It needs a panel that speaks **StatusNotifierItem**: KDE Plasma does natively, and GNOME needs
-the AppIndicator extension. The old XEmbed system tray is not supported — it does not exist on
-Wayland. If nothing is listening the tray waits for a panel to appear rather than exiting, so
-starting it before your desktop has finished coming up is fine.
-
-The icon says what is happening, and its tooltip spells it out:
-
-| It says | Meaning |
-| --- | --- |
-| Up to date | Everything that is mounted has finished uploading |
-| Uploading | Files are still on their way to the remote |
-| Needs attention | A mount failed, an upload errored, or the cache is full. The only state that asks the panel to emphasise the icon — uploads in progress do not |
-| State partly unknown | A mount this service manages is up, and what it has left to upload cannot be read: rclone is unreachable, or the mount has no write-back cache to look in. Mounts you started yourself are never counted here — the tray simply says nothing about those |
-| Nothing mounted | No mount is serving |
-| Service unreachable | The tray cannot reach the service. **This says nothing about your mounts** — any that were up are still up |
-
-The menu lists every mount with its state. Each opens onto where it is mounted, an **Open**
-item that hands the mount point to your file manager, and **Mount** or **Unmount**. Mounts this
-service did not start are listed apart, and offer only **Open**: the service will not mount or
-unmount something it did not start. What is still to upload is summarised at the top — "3 files, 1.2 GiB pending", a rate,
-and an estimate where one can be derived honestly — and again per mount, listing up to ten
-files. When a figure comes from reading the cache directory rather than from rclone, the menu
-says so instead of passing it off as live progress.
-
-**Quit closes the icon and nothing else.** Your mounts keep serving and so does the service.
-Stopping the service is a separate item behind a second click, which says what will happen to
-your mounts first.
-
-The tray starts whether or not the service is running, and never starts it for you. If the
-service is not there the menu says so and offers to start it; if the service is restarted
-underneath it, the tray notices and reconnects on its own.
+It needs a panel that speaks StatusNotifierItem — KDE Plasma natively, GNOME with the
+AppIndicator extension. The menu lists your mounts and what each still has to upload, and
+mounts or unmounts them. **Quit closes the icon and nothing else**: your mounts keep serving.
+See [docs/TRAY.md](docs/TRAY.md) for what the icon and menu show.
 
 ## Documentation
 
+- [docs/TRAY.md](docs/TRAY.md) — the tray icon: what it shows, and its menu
 - [docs/CLI.md](docs/CLI.md) — the command-line client: subcommands, exit codes, `status --json`
 - [DESIGN.md](DESIGN.md) — how the pieces fit together and why
 - [CONTRIBUTING.md](CONTRIBUTING.md) — building, testing and submitting changes

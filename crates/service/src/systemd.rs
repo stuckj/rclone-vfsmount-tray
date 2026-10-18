@@ -148,6 +148,11 @@ pub mod dbus {
         #[zbus(name = "GetUnitByPID")]
         fn get_unit_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath>;
 
+        /// `"stopping"` while the manager itself is shutting down, as a user manager does
+        /// at logout.
+        #[zbus(property)]
+        fn system_state(&self) -> zbus::Result<String>;
+
         /// Loaded units whose names match any of the globs, optionally narrowed to a set
         /// of active states. An empty `states` means every state.
         fn list_units_by_patterns(
@@ -274,6 +279,15 @@ pub mod dbus {
             match svc.timeout_stop_usec().await.ok()? {
                 u64::MAX => None,
                 usec => Some(std::time::Duration::from_micros(usec)),
+            }
+        }
+
+        /// Whether the user manager is shutting down — a logout, rather than a stop of this
+        /// service alone. `false` when it cannot be asked.
+        pub async fn manager_stopping(&self) -> bool {
+            match self.manager().await {
+                Ok(m) => m.system_state().await.is_ok_and(|s| s == "stopping"),
+                Err(_) => false,
             }
         }
 

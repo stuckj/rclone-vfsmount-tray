@@ -192,9 +192,11 @@ async fn main() -> anyhow::Result<()> {
     // process exits.
     let stop = shutdown::Stop::from_job(own_unit.own_pending_job().await);
     if shutdown::unmounts(&config, &stop) {
-        let budget = shutdown::budget(own_unit.own_stop_timeout().await);
+        let logout = own_unit.manager_stopping().await;
+        let budget = shutdown::budget(own_unit.own_stop_timeout().await, logout);
         tracing::info!(
             budget_secs = budget.as_secs(),
+            logout,
             "stopped explicitly with unmount_on_service_stop on"
         );
         shutdown::unmount_all(sup, &config, budget, shutdown::rc_drain(runtime_dir)).await;

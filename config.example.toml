@@ -45,9 +45,12 @@ version = 1
 #
 # A logout that stops your user services (it does not when lingering is on — see the
 # README) takes every mount down whatever this says. With it on, the service goes first and
-# unmounts in the same careful way; whatever it had to leave is then stopped by systemd,
-# as with it off. Asking systemd why it is stopping needs the session bus, so the
-# service's own unit should be ordered after it (`After=dbus.socket`).
+# unmounts in the same careful way, but gives itself only 3 seconds, because some
+# distributions — Ubuntu among them — kill everything left in the session 5 seconds into a
+# logout. Uploads still queued then stay in the cache and resume next time, and whatever
+# the service had to leave is stopped by systemd, as with it off. Asking systemd why it is
+# stopping needs the session bus, so the service's own unit should be ordered after the
+# bus (`After=dbus.service`), or the bus may be gone before it asks.
 unmount_on_service_stop = false
 
 [global.poll]

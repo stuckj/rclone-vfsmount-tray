@@ -176,7 +176,7 @@ fn the_real_unit_auto_mounts_and_tells_a_stop_from_a_restart() {
         "a restart must be read as one, whatever the option says: {left}"
     );
     assert!(
-        stopped.contains("budget_secs=15"),
+        stopped.contains("budget_secs=15") && stopped.contains("logout=false"),
         "an explicit stop with the option on takes the unmount path, inside the unit's \
          stop timeout less a margin:\n{stopped}"
     );

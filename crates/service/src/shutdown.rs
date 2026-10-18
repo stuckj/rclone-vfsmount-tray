@@ -49,14 +49,25 @@ pub fn unmounts(config: &Config, stop: &Stop) -> bool {
 const MARGIN: Duration = Duration::from_secs(5);
 /// Used when the unit's own stop timeout is unbounded or cannot be read.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
-/// However long systemd would wait, a logout should not.
+/// However long systemd would wait, nobody waiting on a stop should.
 const MAX_BUDGET: Duration = Duration::from_secs(120);
+/// The whole budget while the user manager itself is stopping. Ubuntu's `user@.service`
+/// carries `TimeoutStopSec=5`, so everything left in the session is killed 5s into a
+/// logout. The mount units are ordered after this service, and finishing inside that is
+/// what lets rclone still be stopped with a `SIGTERM` rather than killed.
+const LOGOUT_BUDGET: Duration = Duration::from_secs(3);
 
-/// How long the whole unmount may take, given how long systemd will wait for this process.
-pub fn budget(timeout_stop: Option<Duration>) -> Duration {
-    match timeout_stop {
+/// How long the whole unmount may take, given how long systemd will wait for this process
+/// and whether the whole user manager is going down with it.
+pub fn budget(timeout_stop: Option<Duration>, manager_stopping: bool) -> Duration {
+    let own = match timeout_stop {
         Some(t) => t.saturating_sub(MARGIN).max(t / 2).min(MAX_BUDGET),
         None => DEFAULT_BUDGET,
+    };
+    if manager_stopping {
+        own.min(LOGOUT_BUDGET)
+    } else {
+        own
     }
 }
 
@@ -196,13 +207,24 @@ mod tests {
 
     #[test]
     fn the_budget_leaves_systemd_room_before_it_kills() {
+        let secs = Duration::from_secs;
+        assert_eq!(budget(Some(secs(90)), false), secs(85));
+        assert_eq!(budget(Some(secs(6)), false), secs(3));
+        assert_eq!(budget(Some(secs(3600)), false), MAX_BUDGET);
+        assert_eq!(budget(None, false), DEFAULT_BUDGET);
+    }
+
+    #[test]
+    fn at_logout_the_budget_fits_inside_a_five_second_session_kill() {
+        let secs = Duration::from_secs;
+        assert_eq!(budget(Some(secs(90)), true), LOGOUT_BUDGET);
+        assert_eq!(budget(None, true), LOGOUT_BUDGET);
         assert_eq!(
-            budget(Some(Duration::from_secs(90))),
-            Duration::from_secs(85)
+            budget(Some(secs(4)), true),
+            secs(2),
+            "never longer than its own"
         );
-        assert_eq!(budget(Some(Duration::from_secs(6))), Duration::from_secs(3));
-        assert_eq!(budget(Some(Duration::from_secs(3600))), MAX_BUDGET);
-        assert_eq!(budget(None), DEFAULT_BUDGET);
+        assert!(LOGOUT_BUDGET < secs(5));
     }
 
     /// Answers `state` from a table and records every unmount, with its `force`.

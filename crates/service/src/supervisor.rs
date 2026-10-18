@@ -85,6 +85,9 @@ pub struct SystemdSupervisor<M: UnitManager> {
     /// neither `XDG_CONFIG_HOME` nor `--config`.
     config_path: PathBuf,
     ready_timeout: Duration,
+    /// The service's own unit, which each mount unit is ordered before. See
+    /// `UnitSpec::before`.
+    stop_after: Option<String>,
     /// How long to wait for a mount point to be released after stopping its unit.
     gone_timeout: Duration,
     /// How long to wait for systemd to free the unit name.
@@ -126,6 +129,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             runtime_dir,
             config_path,
             ready_timeout: READY_TIMEOUT,
+            stop_after: None,
             gone_timeout: Duration::from_secs(30),
             unit_gone_timeout: Duration::from_secs(35),
             #[cfg(test)]
@@ -136,6 +140,12 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             events: Arc::new(std::sync::Mutex::new(Vec::new())),
             locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Order every mount unit started from here before `unit`.
+    pub fn stopping_after(mut self, unit: Option<String>) -> Self {
+        self.stop_after = unit;
+        self
     }
 
     /// Point state reads at a fixture instead of `/proc`, and shorten the readiness wait.
@@ -1020,6 +1030,7 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                 // the mount. A mount with `allow_other` set so another service account
                 // can read it would get 0600 files and fail with EACCES on all of them.
                 umask: 0o022,
+                before: self.stop_after.clone(),
             };
             self.units.start_transient(&spec).await?;
             self.await_ready(m).await
@@ -1725,6 +1736,23 @@ mod tests {
             .position(|a| a == "--cache-dir")
             .expect("{args:?}");
         assert_eq!(args[at + 1], "/var/cache/rvt-test");
+    }
+
+    #[tokio::test]
+    async fn a_mount_unit_is_ordered_before_the_service_that_started_it() {
+        // So a logout, which stops both at once, stops the service first.
+        let (_sc, s) = with_flags("flags-before", UnitStatus::Inactive);
+        let s = s.stopping_after(Some("rclone-vfsmount-trayd.service".into()));
+        let _ = s.mount("backup").await;
+        let started = s.units.started.lock().unwrap();
+        assert_eq!(
+            started
+                .first()
+                .expect("a unit was started")
+                .before
+                .as_deref(),
+            Some("rclone-vfsmount-trayd.service")
+        );
     }
 
     #[tokio::test]

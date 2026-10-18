@@ -36,13 +36,18 @@ version = 1
 # either way — rclone's cache is on disk and resumes — but an unmount you did not ask for
 # is disruptive regardless.
 #
-# Turned on, it applies only to an explicit stop: `systemctl --user stop`, the tray's
-# "Stop service", or a logout that stops your user services (it does not when lingering is
-# on — see the README). A restart — by hand, or by an upgrade — and a crash
-# still leave every mount up, and so does anything the service cannot confirm with
-# systemd was a stop, including Ctrl-C when it is run from a terminal. Queued uploads get
-# a chance to finish first. The unmount is never forced: a mount something is still using
-# stays up, and the journal says so. Mounts this service did not start are never touched.
+# Turned on, it applies only to an explicit stop: `systemctl --user stop`, or the tray's
+# "Stop service". A restart — by hand, or by an upgrade — and a crash still leave every
+# mount up, and so does anything the service cannot confirm with systemd was a stop,
+# including Ctrl-C when it is run from a terminal. Queued uploads get a chance to finish
+# first. The unmount is never forced: a mount something is still using stays up, and the
+# journal says so. Mounts this service did not start are never touched.
+#
+# A logout that stops your user services (it does not when lingering is on — see the
+# README) takes every mount down whatever this says. With it on, the service goes first and
+# unmounts in the same careful way; whatever it had to leave is then stopped by systemd,
+# as with it off. Asking systemd why it is stopping needs the session bus, so the
+# service's own unit should be ordered after it (`After=dbus.socket`).
 unmount_on_service_stop = false
 
 [global.poll]
@@ -113,7 +118,9 @@ cache_max_age = "24h"
 # is. One that fails to come up — a remote that is unreachable at login, say — is tried
 # again, at growing intervals up to every 15 minutes, until it comes up or you mount or
 # unmount it yourself. A problem retrying cannot fix — a mount point that cannot be
-# created, or something else already mounted there — is reported once and left.
+# created, or something else already mounted there — is reported once and left. It applies
+# each time the service starts, so a mount you unmounted comes back after a restart; set
+# this to false to keep one down.
 auto_mount = true
 
 # read_only = false

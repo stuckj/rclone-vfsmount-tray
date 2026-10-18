@@ -59,6 +59,34 @@ fn await_line(unit: &str, needle: &str, times: usize) -> String {
     }
 }
 
+/// Stops and clears units however the test leaves.
+struct StopOnDrop([String; 2]);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        for unit in &self.0 {
+            systemctl(&["stop", unit]);
+            systemctl(&["reset-failed", unit]);
+        }
+    }
+}
+
+/// The units a mount unit is ordered before, once it has been started.
+fn mount_unit_before(unit: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let out = Command::new("systemctl")
+            .args(["--user", "show", "-p", "Before", "--value", unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if !out.is_empty() || Instant::now() > deadline {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 #[test]
 fn the_real_unit_auto_mounts_and_tells_a_stop_from_a_restart() {
     if !systemctl(&["show-environment"]) {
@@ -111,25 +139,29 @@ fn the_real_unit_auto_mounts_and_tells_a_stop_from_a_restart() {
         &config.display().to_string(),
     ]));
     assert!(started, "systemd-run could not start the service");
+    // A running one holds the real bus name, so it must not outlive a failed assertion.
+    let _cleanup = StopOnDrop([unit.clone(), mount_unit.clone()]);
 
     let up = await_line(&unit, "serving", 1);
     if up.contains("already owns") {
-        systemctl(&["stop", &unit]);
         eprintln!("skipped: a service took the bus name first");
         return;
     }
     assert!(up.contains("serving"), "the service never came up:\n{up}");
     let attempted = await_line(&unit, "auto-mounting", 1);
+    let ordered = mount_unit_before(&mount_unit);
 
     assert!(systemctl(&["restart", &unit]));
     let restarted = await_line(&unit, "serving", 2);
 
     assert!(systemctl(&["stop", &unit]));
     let stopped = await_line(&unit, "budget_secs", 1);
-    let _ = systemctl(&["reset-failed", &unit]);
-    let _ = systemctl(&["stop", &mount_unit]);
-    let _ = systemctl(&["reset-failed", &mount_unit]);
 
+    assert!(
+        ordered.split_whitespace().any(|u| u == unit),
+        "a mount unit must be ordered before the service's own unit, so a logout stops \
+         the service first; it had Before={ordered}"
+    );
     assert!(
         attempted.contains(&format!("auto-mounting mount=\"{mount}\"")),
         "a mount marked auto_mount (the default) must be brought up at start:\n{attempted}"

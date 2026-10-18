@@ -79,6 +79,24 @@ pub async fn unmount_all(
     budget: Duration,
     drain: Drain,
 ) {
+    // Choosing what to unmount counts too: a wedged mount point can take seconds to say.
+    if tokio::time::timeout(budget, unmount_within(sup, config, budget, drain))
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            secs = budget.as_secs(),
+            "unmount_on_service_stop ran out of time; anything not yet unmounted is left up"
+        );
+    }
+}
+
+async fn unmount_within(
+    sup: Arc<dyn MountSupervisor>,
+    config: &Config,
+    budget: Duration,
+    drain: Drain,
+) {
     let mut targets = Vec::new();
     for m in &config.mounts {
         match sup.state(&m.name).await {
@@ -111,14 +129,7 @@ pub async fn unmount_all(
             }
         });
     }
-    let finished =
-        tokio::time::timeout(budget, async { while tasks.join_next().await.is_some() {} }).await;
-    if finished.is_err() {
-        tracing::warn!(
-            secs = budget.as_secs(),
-            "unmount_on_service_stop ran out of time; anything not yet unmounted is left up"
-        );
-    }
+    while tasks.join_next().await.is_some() {}
 }
 
 /// A [`Drain`] that asks each mount's rclone what it still has queued.
@@ -200,6 +211,8 @@ mod tests {
         states: BTreeMap<String, MountState>,
         refuse: Option<String>,
         hang: Option<String>,
+        /// A mount whose state never comes back, as one behind a wedged mount point.
+        wedged: Option<String>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -232,7 +245,12 @@ mod tests {
             &'a self,
             name: &'a str,
         ) -> BoxFuture<'a, Result<MountState, SupervisorError>> {
-            Box::pin(async move { Ok(self.states[name].clone()) })
+            Box::pin(async move {
+                if self.wedged.as_deref() == Some(name) {
+                    std::future::pending::<()>().await;
+                }
+                Ok(self.states[name].clone())
+            })
         }
         fn reconcile(&self) -> BoxFuture<'_, Result<Vec<DiscoveredMount>, SupervisorError>> {
             Box::pin(async { Ok(Vec::new()) })
@@ -336,6 +354,25 @@ mod tests {
             ["unmount fine force=false", "unmount stuck force=false"],
             "a drain that does not finish still ends in an unmount"
         );
+    }
+
+    #[tokio::test]
+    async fn deciding_what_to_unmount_is_inside_the_budget_too() {
+        let (config, mut sup) = setup(&[("wedged", MountState::Mounted)]);
+        sup.wedged = Some("wedged".into());
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            unmount_all(
+                Arc::new(sup),
+                &config,
+                Duration::from_millis(300),
+                no_drain(),
+            ),
+        )
+        .await
+        .expect("a state that never answers held the stop past its budget");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]

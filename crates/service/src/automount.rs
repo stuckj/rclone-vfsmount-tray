@@ -7,7 +7,8 @@
 //! A failure that may be transient is retried with backoff, so a remote that is down at
 //! login does not leave its mount down until someone notices. The retrying belongs to the
 //! start-up intent only: once a client mounts or unmounts a name, the decision is theirs
-//! and nothing here touches it again.
+//! for the rest of this process's life. Nothing records it, so the next start brings the
+//! mount up again.
 
 use crate::watch::Nudge;
 use rvt_core::supervisor::{MountState, MountSupervisor, SupervisorError};
@@ -102,6 +103,10 @@ impl AutoMount {
                         retry_in_secs = wait.as_secs(),
                         "auto-mount failed; will try again"
                     ),
+                    Attempt::Settling => tracing::debug!(
+                        mount = name,
+                        "auto-mount: on its way up; looking again later"
+                    ),
                 }
             }
             tokio::time::sleep(wait).await;
@@ -113,7 +118,9 @@ impl AutoMount {
         match sup.state(name).await {
             // Down, or left failed by an rclone that died: both are a mount to bring up.
             Ok(MountState::Unmounted | MountState::Failed { .. }) => {}
-            // Serving, already on its way up or down, or somebody else's: not ours to touch.
+            // Coming up — or systemd between restarts, which can still end in `Failed`.
+            Ok(MountState::Mounting) => return Attempt::Settling,
+            // Serving, on its way down, or somebody else's: not ours to touch.
             Ok(state) => {
                 tracing::debug!(mount = name, state = ?state, "auto-mount: leaving as found");
                 return Attempt::Done;
@@ -151,6 +158,8 @@ enum Attempt {
     /// Up, left as found, or failed for good. Nothing more to do either way.
     Done,
     Retry(SupervisorError),
+    /// Not settled yet; look again after the next wait.
+    Settling,
 }
 
 /// Whether trying again later could succeed without anyone changing anything.
@@ -277,7 +286,7 @@ mod tests {
             mount("down", true),
             mount("failed", true),
             mount("adopted", true),
-            mount("coming", true),
+            mount("going", true),
             mount("theirs", true),
             mount("manual", false),
         ]);
@@ -290,7 +299,7 @@ mod tests {
                 },
             ),
             ("adopted".to_string(), MountState::Mounted),
-            ("coming".to_string(), MountState::Mounting),
+            ("going".to_string(), MountState::Unmounting),
             ("theirs".to_string(), MountState::Foreign),
         ]);
 
@@ -301,10 +310,41 @@ mod tests {
         assert_eq!(
             mounted,
             ["down", "failed"],
-            "an adopted, starting or foreign mount must not be touched, nor one that is \
+            "an adopted, stopping or foreign mount must not be touched, nor one that is \
              not marked auto_mount"
         );
         assert!(sup.unmounted.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mount_still_coming_up_is_looked_at_again_rather_than_given_up_on() {
+        // systemd between restarts reads as `Mounting`, and can still end in `Failed`.
+        let c = config(vec![mount("coming", true)]);
+        let sup = Arc::new(Recorder::default());
+        sup.states
+            .lock()
+            .unwrap()
+            .insert("coming".into(), MountState::Mounting);
+        let auto =
+            AutoMount::new(&c).with_retry(Duration::from_millis(5), Duration::from_millis(5));
+        let running = tokio::spawn(Arc::new(auto).run(sup.clone(), Arc::new(Nudge::default())));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            sup.mounted.lock().unwrap().is_empty(),
+            "left alone while coming up"
+        );
+        sup.states.lock().unwrap().insert(
+            "coming".into(),
+            MountState::Failed {
+                reason: "start limit hit".into(),
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .expect("brought up once it failed")
+            .unwrap();
+        assert_eq!(*sup.mounted.lock().unwrap(), ["coming"]);
     }
 
     #[tokio::test]

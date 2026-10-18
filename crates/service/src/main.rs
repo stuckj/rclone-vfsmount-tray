@@ -123,13 +123,16 @@ async fn main() -> anyhow::Result<()> {
     let units = systemd::dbus::SystemdUnits::connect().await?;
     // A second handle, kept for the way out: the first moves into the supervisor.
     let own_unit = systemd::dbus::SystemdUnits::connect().await?;
-    let sup = Arc::new(supervisor::SystemdSupervisor::new(
-        config.clone(),
-        rclone.path().to_path_buf(),
-        units,
-        runtime_dir.clone(),
-        config_path.clone(),
-    ));
+    let sup = Arc::new(
+        supervisor::SystemdSupervisor::new(
+            config.clone(),
+            rclone.path().to_path_buf(),
+            units,
+            runtime_dir.clone(),
+            config_path.clone(),
+        )
+        .stopping_after(own_unit.own_service_name().await),
+    );
 
     let registry = Arc::new(tokio::sync::Mutex::new(registry::Registry::default()));
     let nudge = Arc::new(watch::Nudge::default());

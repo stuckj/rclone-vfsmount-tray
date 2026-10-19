@@ -43,7 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sy
 # and the async-io half is dead weight in three tokio binaries. `p2p` is what lets a test
 # serve the interface over a socket pair, so the wire is exercised without a bus daemon —
 # tier-1 CI has none, and would not be allowed one.
-zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "p2p"] }
 # Pure Rust HTTP/1.1. rclone's rc server chunks larger responses, so this is not a
 # place to hand-roll a parser.
 hyper = { version = "1", features = ["client", "http1"] }

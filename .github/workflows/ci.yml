@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # tag v2 (annotated) -> this commit
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # tag v2 (annotated) -> this commit
 
       - name: rustfmt
         run: cargo fmt --all -- --check
@@ -101,7 +101,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # head of the `stable` branch; no release tag
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # tag v2 (annotated) -> this commit
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # tag v2 (annotated) -> this commit
       # VERSION comes via env rather than being interpolated into the script body:
       # it is read from the PR's own Cargo.toml, so textual interpolation is the
       # classic injection shape even though the blast radius here is nil.
@@ -129,7 +129,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
         with:
           tool: cargo-audit
       # Vulnerabilities, unsound advisories and yanked crates fail the build.

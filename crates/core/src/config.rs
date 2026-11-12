@@ -74,9 +74,10 @@ struct VersionProbe {
 pub struct Global {
     /// Use this rclone instead of searching `PATH`.
     pub rclone_path: Option<PathBuf>,
-    /// Override rclone's cache directory. Normally taken from `rclone config paths`.
+    /// `--cache-dir` for every mount. Absent, rclone uses its own default.
     pub cache_dir: Option<PathBuf>,
-    /// Unmount everything when the service stops.
+    /// Unmount this service's mounts when it is stopped explicitly — never on a restart,
+    /// and never forced.
     ///
     /// **Off by default, deliberately.** The service crashes, and it gets restarted, and
     /// neither may take a filesystem with it (#54).
@@ -105,6 +106,8 @@ impl Default for Poll {
 }
 
 /// Which events are worth interrupting someone for.
+///
+/// Parsed and nothing more: there is no notifier yet (#28).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Notifications {
@@ -199,7 +202,7 @@ pub struct Mount {
     #[serde(default)]
     pub cache_max_age: Option<String>,
 
-    /// Mount when the service starts.
+    /// Mount when the service starts, unless it is already up.
     #[serde(default = "yes")]
     pub auto_mount: bool,
     #[serde(default)]
@@ -255,11 +258,12 @@ impl Mount {
         format!("{UNIT_PREFIX}{slug}.service")
     }
 
-    /// The rclone argv for this mount, excluding the binary itself.
+    /// The rclone argv for this mount, excluding the binary itself. `cache_dir` is
+    /// [`Global::cache_dir`], which is global rather than per mount.
     ///
     /// Order matters only for `extra_args`, which comes last so a user can override any
     /// flag composed here — rclone takes the last occurrence of a repeated flag.
-    pub fn mount_args(&self, rc_socket: &Path) -> Vec<String> {
+    pub fn mount_args(&self, rc_socket: &Path, cache_dir: Option<&Path>) -> Vec<String> {
         let mut a: Vec<String> = vec![
             "mount".into(),
             self.fs_spec(),
@@ -275,6 +279,10 @@ impl Mount {
         if let Some(age) = &self.cache_max_age {
             a.push("--vfs-cache-max-age".into());
             a.push(age.clone());
+        }
+        if let Some(dir) = cache_dir {
+            a.push("--cache-dir".into());
+            a.push(dir.to_string_lossy().into_owned());
         }
 
         if self.read_only {
@@ -585,6 +593,15 @@ impl Config {
             if !p.is_absolute() {
                 return Err(ConfigError::Invalid(format!(
                     "global.rclone_path must be absolute, got {}",
+                    p.display()
+                )));
+            }
+        }
+        // rclone runs from the systemd user manager's working directory, not this one.
+        if let Some(p) = &self.global.cache_dir {
+            if !p.is_absolute() {
+                return Err(ConfigError::Invalid(format!(
+                    "global.cache_dir must be absolute, got {}",
                     p.display()
                 )));
             }
@@ -933,6 +950,36 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_dir_override_reaches_rclone_and_extra_args_still_wins() {
+        let mut m = a_mount("backup");
+        let a = m.mount_args(Path::new("/run/s.sock"), Some(Path::new("/var/cache/rv")));
+        let at = a
+            .iter()
+            .position(|x| x == "--cache-dir")
+            .expect("--cache-dir");
+        assert_eq!(a[at + 1], "/var/cache/rv");
+
+        m.extra_args = vec!["--cache-dir".into(), "/elsewhere".into()];
+        let a = m.mount_args(Path::new("/run/s.sock"), Some(Path::new("/var/cache/rv")));
+        let last = a.iter().rposition(|x| x == "--cache-dir").unwrap();
+        assert!(last > at, "extra_args must come after the composed flag");
+        assert_eq!(a[last + 1], "/elsewhere");
+
+        assert!(!a_mount("backup")
+            .mount_args(Path::new("/run/s.sock"), None)
+            .contains(&"--cache-dir".to_string()));
+    }
+
+    #[test]
+    fn a_relative_cache_dir_is_rejected() {
+        let mut c = with(vec![mount("a", "/mnt/one")]);
+        c.global.cache_dir = Some(PathBuf::from("cache"));
+        assert!(c.validate().is_err(), "would resolve against systemd's CWD");
+        c.global.cache_dir = Some(PathBuf::from("/var/cache/rv"));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
     fn a_relative_rclone_path_override_is_rejected() {
         let mut c = with(vec![mount("a", "/mnt/one")]);
         c.global.rclone_path = Some(PathBuf::from("./rclone"));
@@ -1066,7 +1113,7 @@ mod tests {
 
     #[test]
     fn mount_args_carry_the_fs_spec_the_point_and_the_rc_socket() {
-        let a = a_mount("backup").mount_args(Path::new("/run/user/1000/rvt/backup.sock"));
+        let a = a_mount("backup").mount_args(Path::new("/run/user/1000/rvt/backup.sock"), None);
         assert_eq!(a[0], "mount");
         assert_eq!(a[1], "backup:pictures");
         assert_eq!(a[2], "/home/user/mnt/backup");
@@ -1085,7 +1132,7 @@ mod tests {
         // extra_args an escape hatch rather than a suggestion.
         let mut m = a_mount("backup");
         m.extra_args = vec!["--vfs-cache-mode".into(), "full".into()];
-        let a = m.mount_args(Path::new("/run/s.sock"));
+        let a = m.mount_args(Path::new("/run/s.sock"), None);
         let first = a.iter().position(|x| x == "--vfs-cache-mode").unwrap();
         let last = a.iter().rposition(|x| x == "--vfs-cache-mode").unwrap();
         assert!(
@@ -1097,7 +1144,7 @@ mod tests {
 
     #[test]
     fn optional_flags_appear_only_when_set() {
-        let plain = a_mount("backup").mount_args(Path::new("/run/s.sock"));
+        let plain = a_mount("backup").mount_args(Path::new("/run/s.sock"), None);
         for absent in ["--read-only", "--allow-other", "--uid", "--umask"] {
             assert!(
                 !plain.contains(&absent.to_string()),
@@ -1113,7 +1160,7 @@ mod tests {
         m.umask = Some("0022".into());
         m.cache_max_size = Some("10G".into());
         m.cache_max_age = Some("24h".into());
-        let full = m.mount_args(Path::new("/run/s.sock")).join(" ");
+        let full = m.mount_args(Path::new("/run/s.sock"), None).join(" ");
         for present in [
             "--read-only",
             "--allow-other",
@@ -1131,7 +1178,7 @@ mod tests {
     fn umask_arg(spelling: &str) -> Option<String> {
         let mut m = a_mount("backup");
         m.umask = Some(spelling.into());
-        let a = m.mount_args(Path::new("/run/s.sock"));
+        let a = m.mount_args(Path::new("/run/s.sock"), None);
         let i = a.iter().position(|x| x == "--umask")?;
         a.get(i + 1).cloned()
     }
@@ -1422,7 +1469,7 @@ mod tests {
     fn a_root_mount_keeps_the_bare_colon() {
         let mut m = a_mount("backup");
         m.path = String::new();
-        assert_eq!(m.mount_args(Path::new("/run/s.sock"))[1], "backup:");
+        assert_eq!(m.mount_args(Path::new("/run/s.sock"), None)[1], "backup:");
     }
 
     #[test]

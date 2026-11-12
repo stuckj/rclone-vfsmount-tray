@@ -3,9 +3,11 @@
 //!
 //! Mounts outlive it — restarting the service leaves them up. See DESIGN.md.
 
+mod automount;
 mod dbus;
 mod poller;
 mod registry;
+mod shutdown;
 mod supervisor;
 mod systemd;
 mod watch;
@@ -119,13 +121,18 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %rclone.path().display(), version = %rclone.version(), "found rclone");
 
     let units = systemd::dbus::SystemdUnits::connect().await?;
-    let sup = Arc::new(supervisor::SystemdSupervisor::new(
-        config.clone(),
-        rclone.path().to_path_buf(),
-        units,
-        runtime_dir.clone(),
-        config_path.clone(),
-    ));
+    // A second handle, kept for the way out: the first moves into the supervisor.
+    let own_unit = systemd::dbus::SystemdUnits::connect().await?;
+    let sup = Arc::new(
+        supervisor::SystemdSupervisor::new(
+            config.clone(),
+            rclone.path().to_path_buf(),
+            units,
+            runtime_dir.clone(),
+            config_path.clone(),
+        )
+        .stopping_after(own_unit.own_service_name().await),
+    );
 
     let registry = Arc::new(tokio::sync::Mutex::new(registry::Registry::default()));
     let nudge = Arc::new(watch::Nudge::default());
@@ -134,7 +141,7 @@ async fn main() -> anyhow::Result<()> {
         sup.clone(),
         registry.clone(),
         config.clone(),
-        runtime_dir,
+        runtime_dir.clone(),
         nudge.clone(),
     );
 
@@ -147,26 +154,61 @@ async fn main() -> anyhow::Result<()> {
     for change in &found {
         report(change);
     }
+    match sup.out_of_date().await {
+        Ok(stale) => {
+            for name in stale {
+                tracing::warn!(
+                    mount = %name,
+                    "running with options the config no longer gives it; they apply the \
+                     next time it is mounted"
+                );
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "could not compare running mounts to the config"),
+    }
 
+    let auto = Arc::new(automount::AutoMount::new(&config));
     let conn = dbus::serve(dbus::MountManager::new(
-        sup,
+        sup.clone(),
         registry,
-        config,
-        nudge,
+        config.clone(),
+        nudge.clone(),
+        auto.clone(),
         rclone.version().to_string(),
     ))
     .await?;
     tracing::info!(name = rvt_core::ipc::BUS_NAME, "serving");
 
     let emitter = zbus::object_server::SignalEmitter::new(&conn, rvt_core::ipc::OBJECT_PATH)?;
+    let auto_mounting = tokio::spawn(auto.run(sup.clone(), nudge));
 
     tokio::select! {
         _ = watcher.run(emitter, report) => {}
         result = stop_requested() => result?,
     }
+    auto_mounting.abort();
 
-    // Nothing is unmounted on the way out. See DESIGN.md, "The lifetime rule".
-    tracing::info!("stopping; mounts are left as they are");
+    // Asked first: the job is what says why the signal came, and it is gone once this
+    // process exits.
+    let stop = shutdown::Stop::from_job(own_unit.own_pending_job().await);
+    if shutdown::unmounts(&config, &stop) {
+        let logout = own_unit.manager_stopping().await;
+        let budget = shutdown::budget(own_unit.own_stop_timeout().await, logout);
+        tracing::info!(
+            budget_secs = budget.as_secs(),
+            logout,
+            "stopped explicitly with unmount_on_service_stop on"
+        );
+        shutdown::unmount_all(sup, &config, budget, shutdown::rc_drain(runtime_dir)).await;
+        tracing::info!("stopped");
+    } else {
+        // See DESIGN.md, "The lifetime rule".
+        tracing::info!(
+            why = ?stop,
+            unmount_on_service_stop = config.global.unmount_on_service_stop,
+            "stopping; mounts are left as they are"
+        );
+    }
     Ok(())
 }
 

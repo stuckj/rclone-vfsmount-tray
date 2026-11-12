@@ -26,6 +26,10 @@ pub struct UnitSpec {
     /// `--umask` defaults to the process umask. So it must stay ordinary — the rc socket
     /// is protected by the mode of the directory holding it.
     pub umask: u32,
+    /// A unit this one is ordered before, so that when both are stopped together — a
+    /// logout stops everything at once — that one is stopped first and this one after.
+    /// The service's own unit, so it can unmount before systemd signals rclone.
+    pub before: Option<String>,
 }
 
 /// Whether a unit is running, from systemd's point of view.
@@ -66,6 +70,9 @@ pub struct Serving {
     /// The `remote:path` rclone was given.
     pub fs_spec: String,
     pub mount_point: PathBuf,
+    /// The whole argv after the binary, to compare against what the config would start
+    /// now. A running mount keeps the flags it was started with.
+    pub args: Vec<String>,
 }
 
 /// A unit systemd has loaded.
@@ -138,6 +145,14 @@ pub mod dbus {
 
         fn get_unit(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
 
+        #[zbus(name = "GetUnitByPID")]
+        fn get_unit_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath>;
+
+        /// `"stopping"` while the manager itself is shutting down, as a user manager does
+        /// at logout.
+        #[zbus(property)]
+        fn system_state(&self) -> zbus::Result<String>;
+
         /// Loaded units whose names match any of the globs, optionally narrowed to a set
         /// of active states. An empty `states` means every state.
         fn list_units_by_patterns(
@@ -175,6 +190,10 @@ pub mod dbus {
     trait Service {
         #[zbus(property)]
         fn exec_start(&self) -> zbus::Result<Vec<ExecCommand>>;
+
+        /// Microseconds; `u64::MAX` is infinity.
+        #[zbus(property, name = "TimeoutStopUSec")]
+        fn timeout_stop_usec(&self) -> zbus::Result<u64>;
     }
 
     #[zbus::proxy(
@@ -184,6 +203,22 @@ pub mod dbus {
     trait Unit {
         #[zbus(property)]
         fn active_state(&self) -> zbus::Result<String>;
+
+        #[zbus(property)]
+        fn id(&self) -> zbus::Result<String>;
+
+        /// The queued job's id and path; id 0 and path `/` when there is none.
+        #[zbus(property)]
+        fn job(&self) -> zbus::Result<(u32, OwnedObjectPath)>;
+    }
+
+    #[zbus::proxy(
+        interface = "org.freedesktop.systemd1.Job",
+        default_service = "org.freedesktop.systemd1"
+    )]
+    trait Job {
+        #[zbus(property)]
+        fn job_type(&self) -> zbus::Result<String>;
     }
 
     /// Talks to the systemd user instance on the session bus.
@@ -200,6 +235,109 @@ pub mod dbus {
                 )
             })?;
             Ok(Self { conn })
+        }
+
+        /// [`Self::own_pending_job`] for a named unit, which a test can stop and restart.
+        #[cfg(test)]
+        pub async fn pending_job(&self, unit: &str) -> Result<Option<String>, SupervisorError> {
+            let path = self
+                .manager()
+                .await?
+                .get_unit(unit)
+                .await
+                .map_err(|e| supervision(&format!("looking up unit {unit}"), e))?;
+            self.job_at(path).await
+        }
+
+        #[cfg(test)]
+        pub fn connection(&self) -> &zbus::Connection {
+            &self.conn
+        }
+
+        /// The type of the job systemd has queued on the unit this process runs in —
+        /// `"stop"`, `"restart"` and so on — or `None` when nothing is queued.
+        ///
+        /// While a unit is being stopped as the first half of a restart its job reads
+        /// `"restart"`, not `"stop"`: that is what tells the two apart from inside the
+        /// process receiving the `SIGTERM`. A bare `kill` queues no job at all.
+        /// `a_stopping_unit_can_tell_a_stop_from_a_restart` holds systemd to this.
+        pub async fn own_pending_job(&self) -> Result<Option<String>, SupervisorError> {
+            self.job_at(self.own_unit().await?).await
+        }
+
+        /// How long systemd waits for this process to exit after asking it to, before
+        /// killing it. `None` when it cannot be read or is unbounded.
+        pub async fn own_stop_timeout(&self) -> Option<std::time::Duration> {
+            let path = self.own_unit().await.ok()?;
+            let svc = ServiceProxy::builder(&self.conn)
+                .path(path)
+                .ok()?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+                .ok()?;
+            match svc.timeout_stop_usec().await.ok()? {
+                u64::MAX => None,
+                usec => Some(std::time::Duration::from_micros(usec)),
+            }
+        }
+
+        /// Whether the user manager is shutting down — a logout, rather than a stop of this
+        /// service alone. `false` when it cannot be asked.
+        pub async fn manager_stopping(&self) -> bool {
+            match self.manager().await {
+                Ok(m) => m.system_state().await.is_ok_and(|s| s == "stopping"),
+                Err(_) => false,
+            }
+        }
+
+        /// The name of the service unit this process runs as. `None` when it is not run as
+        /// one — from a terminal it is in a scope, which a mount must not be ordered by.
+        pub async fn own_service_name(&self) -> Option<String> {
+            let unit = UnitProxy::builder(&self.conn)
+                .path(self.own_unit().await.ok()?)
+                .ok()?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+                .ok()?;
+            unit.id().await.ok().filter(|id| id.ends_with(".service"))
+        }
+
+        async fn own_unit(&self) -> Result<OwnedObjectPath, SupervisorError> {
+            self.manager()
+                .await?
+                .get_unit_by_pid(std::process::id())
+                .await
+                .map_err(|e| supervision("looking up the unit this service runs in", e))
+        }
+
+        async fn job_at(&self, unit: OwnedObjectPath) -> Result<Option<String>, SupervisorError> {
+            let unit = UnitProxy::builder(&self.conn)
+                .path(unit)
+                .map_err(|e| supervision("addressing the unit", e))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+                .map_err(|e| supervision("opening the unit interface", e))?;
+            let (id, job) = unit
+                .job()
+                .await
+                .map_err(|e| supervision("reading the unit's queued job", e))?;
+            if id == 0 {
+                return Ok(None);
+            }
+            let job = JobProxy::builder(&self.conn)
+                .path(job)
+                .map_err(|e| supervision("addressing the job", e))?
+                .cache_properties(zbus::proxy::CacheProperties::No)
+                .build()
+                .await
+                .map_err(|e| supervision("opening the job interface", e))?;
+            job.job_type()
+                .await
+                .map(Some)
+                .map_err(|e| supervision("reading the job's type", e))
         }
 
         async fn manager(&self) -> Result<ManagerProxy<'_>, SupervisorError> {
@@ -257,6 +395,7 @@ pub mod dbus {
             Some(Serving {
                 fs_spec: argv.get(2)?.clone(),
                 mount_point: PathBuf::from(argv.get(3)?),
+                args: argv[1..].to_vec(),
             })
         }
     }
@@ -330,6 +469,9 @@ pub mod dbus {
                     // The trailing `true` is `ignore_errors`.
                     properties.push(("ExecStartPre", Value::from(vec![(exe, argv, true)])));
                 }
+                if let Some(before) = &spec.before {
+                    properties.push(("Before", Value::from(vec![before.clone()])));
+                }
 
                 // "fail" rather than "replace": if something already holds this unit
                 // name we want to hear about it, not silently displace it.
@@ -343,7 +485,10 @@ pub mod dbus {
         fn stop<'a>(&'a self, unit: &'a str) -> BoxFuture<'a, Result<(), SupervisorError>> {
             Box::pin(async move {
                 let mgr = self.manager().await?;
-                match mgr.stop_unit(unit, "replace").await {
+                // Not "replace": a mount unit is ordered before the service (see
+                // `UnitSpec::before`), so while the service is itself stopping a plain stop
+                // job would wait for the service to exit — which is waiting on this.
+                match mgr.stop_unit(unit, "ignore-dependencies").await {
                     Ok(_) => Ok(()),
                     // It stopped between the status read and here, and systemd collected
                     // it. The caller asked for it to be stopped, and it is.
@@ -543,6 +688,7 @@ mod tests {
             args: vec!["30".into()],
             pre_start: None,
             umask: 0o077,
+            before: None,
         };
 
         let started = units.start_transient(&spec).await;
@@ -591,6 +737,7 @@ mod tests {
             args: vec![],
             pre_start: None,
             umask: 0o022,
+            before: None,
         };
         if units.start_transient(&spec).await.is_err() {
             eprintln!("skipped: no systemd user instance");
@@ -643,6 +790,7 @@ mod tests {
                 vec!["-f".into(), marker.to_string_lossy().into_owned()],
             )),
             umask: 0o022,
+            before: None,
         };
 
         let started = units.start_transient(&spec).await;
@@ -668,6 +816,174 @@ mod tests {
 
         let _ = units.stop(&name).await;
         let _ = units.reset_failed(&name).await;
+    }
+
+    /// What `unmount_on_service_stop` decides on: a unit being stopped can tell a stop from
+    /// the stop half of a restart, and a signal sent with no job behind it from either.
+    #[tokio::test]
+    async fn a_stopping_unit_can_tell_a_stop_from_a_restart() {
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+        let name = format!("rvt-jobtest-{}.service", std::process::id());
+        let _ = units.reset_failed(&name).await;
+        // Takes two seconds to honour a SIGTERM, so the job is still queued when read.
+        let spec = UnitSpec {
+            name: name.clone(),
+            description: "job type self test".into(),
+            executable: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".into(),
+                "trap 'sleep 2; exit 0' TERM; trap '' USR1; while :; do sleep 0.1; done".into(),
+            ],
+            pre_start: None,
+            umask: 0o022,
+            before: None,
+        };
+        if units.start_transient(&spec).await.is_err() {
+            eprintln!("skipped: no systemd user instance");
+            return;
+        }
+        let manager = zbus::Proxy::new(
+            units.connection(),
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .await
+        .unwrap();
+        let settle = || async {
+            for _ in 0..80 {
+                if units.status(&name).await.ok() == Some(UnitStatus::Active) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        settle().await;
+
+        let _: zbus::zvariant::OwnedObjectPath = manager
+            .call("RestartUnit", &(name.as_str(), "replace"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let restart = units.pending_job(&name).await;
+        settle().await;
+
+        let () = manager
+            .call("KillUnit", &(name.as_str(), "main", 10_i32))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let killed = units.pending_job(&name).await;
+
+        units.stop(&name).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let stop = units.pending_job(&name).await;
+
+        for _ in 0..40 {
+            if units.status(&name).await.ok() == Some(UnitStatus::Inactive) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = units.reset_failed(&name).await;
+
+        assert_eq!(restart.unwrap().as_deref(), Some("restart"));
+        assert_eq!(killed.unwrap(), None, "a bare signal queues no job");
+        assert_eq!(stop.unwrap().as_deref(), Some("stop"));
+    }
+
+    /// A mount unit ordered before the service is stopped after it when both stop together,
+    /// as at logout — and the service's own stop of it does not wait behind that ordering,
+    /// or an unmount during the service's stop would wait for the service to exit.
+    #[tokio::test]
+    async fn a_unit_ordered_before_another_stops_after_it_but_not_when_asked() {
+        let Ok(units) = dbus::SystemdUnits::connect().await else {
+            eprintln!("skipped: no session bus");
+            return;
+        };
+        let pid = std::process::id();
+        let first = format!("rvt-ordertest-s-{pid}.service");
+        let after = format!("rvt-ordertest-m-{pid}.service");
+        let spec = |name: &str, script: &str, before: Option<String>| UnitSpec {
+            name: name.to_string(),
+            description: "ordering self test".into(),
+            executable: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), script.into()],
+            pre_start: None,
+            umask: 0o022,
+            before,
+        };
+        // Takes two seconds to honour a SIGTERM, standing in for the service unmounting.
+        let slow = "trap 'sleep 2; exit 0' TERM; while :; do sleep 0.1; done";
+        let quick = "trap 'exit 0' TERM; while :; do sleep 0.1; done";
+        if units
+            .start_transient(&spec(&first, slow, None))
+            .await
+            .is_err()
+        {
+            eprintln!("skipped: no systemd user instance");
+            return;
+        }
+        units
+            .start_transient(&spec(&after, quick, Some(first.clone())))
+            .await
+            .expect("Before= must be accepted on a transient unit");
+        let wait = |ms| tokio::time::sleep(std::time::Duration::from_millis(ms));
+        wait(500).await;
+
+        let both = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "--no-block", &first, &after])
+            .status()
+            .is_ok_and(|s| s.success());
+        wait(700).await;
+        let held = units.status(&after).await.ok();
+        wait(2500).await;
+
+        for u in [&first, &after] {
+            let _ = units.reset_failed(u).await;
+        }
+        units
+            .start_transient(&spec(&first, slow, None))
+            .await
+            .unwrap();
+        units
+            .start_transient(&spec(&after, quick, Some(first.clone())))
+            .await
+            .unwrap();
+        wait(500).await;
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "--no-block", &first])
+            .status();
+        wait(300).await;
+        units.stop(&after).await.unwrap();
+        wait(500).await;
+        let asked = units.status(&after).await.ok();
+        let first_then = units.status(&first).await.ok();
+        wait(2500).await;
+        for u in [&first, &after] {
+            let _ = units.stop(u).await;
+            let _ = units.reset_failed(u).await;
+        }
+
+        assert!(both);
+        assert_eq!(
+            held,
+            Some(UnitStatus::Active),
+            "stopped together, the unit ordered before must wait for the other to stop"
+        );
+        assert_eq!(
+            first_then,
+            Some(UnitStatus::Deactivating),
+            "the test needs the other unit still stopping"
+        );
+        assert_eq!(
+            asked,
+            Some(UnitStatus::Inactive),
+            "a stop asked for directly must not wait behind the ordering"
+        );
     }
 
     #[tokio::test]
@@ -703,6 +1019,7 @@ mod tests {
                 ],
             )),
             umask: 0o022,
+            before: None,
         };
         if units.start_transient(&spec).await.is_err() {
             eprintln!("skipped: no systemd user instance");
@@ -774,9 +1091,16 @@ mod tests {
             description: "sweep self test".into(),
             executable: stub,
             // Shaped like a mount unit's argv, so the mount point can be read back out.
-            args: vec!["mount".into(), "selftest:".into(), point.into()],
+            args: vec![
+                "mount".into(),
+                "selftest:".into(),
+                point.into(),
+                "--bwlimit".into(),
+                "2M".into(),
+            ],
             pre_start: None,
             umask: 0o022,
+            before: None,
         };
         if units.start_transient(&spec).await.is_err() {
             eprintln!("skipped: no systemd user instance");
@@ -808,6 +1132,7 @@ mod tests {
             Some(Serving {
                 fs_spec: "selftest:".into(),
                 mount_point: PathBuf::from(point),
+                args: spec.args.clone(),
             }),
             "the mount point has to come back out of the unit's own argv, or an orphan \
              can never be matched to what it is serving"

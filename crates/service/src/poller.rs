@@ -484,7 +484,7 @@ fn empty() -> serde_json::Value {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rvt_testutil::Scratch;
     use std::os::unix::fs::PermissionsExt;
@@ -506,9 +506,9 @@ mod tests {
     }
 
     /// Answers a body per rc command path, so a poll can be driven end to end.
-    struct FakeRc {
+    pub(crate) struct FakeRc {
         _dir: Scratch,
-        socket: PathBuf,
+        pub(crate) socket: PathBuf,
         routes: Routes,
         handle: tokio::task::JoinHandle<()>,
     }
@@ -522,7 +522,7 @@ mod tests {
 
         /// Replace one route's body. Anything a poll derives by differencing two polls is
         /// invisible to a server that answers identically every time.
-        fn set(&self, path: &str, body: String) {
+        pub(crate) fn set(&self, path: &str, body: String) {
             let mut rs = self.routes.lock().unwrap();
             for r in rs.iter_mut() {
                 if r.0 == path {
@@ -533,7 +533,7 @@ mod tests {
             panic!("no such route: {path}");
         }
 
-        async fn new(tag: &str, routes: Vec<(&'static str, String)>) -> Self {
+        pub(crate) async fn new(tag: &str, routes: Vec<(&'static str, String)>) -> Self {
             let dir = Scratch::new(tag);
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
             let socket = dir.join("rc.sock");
@@ -593,7 +593,7 @@ mod tests {
         }
     }
 
-    fn fixture(name: &str) -> String {
+    pub(crate) fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!(
             "{}/../../testdata/{name}",
             env!("CARGO_MANIFEST_DIR")
@@ -601,7 +601,7 @@ mod tests {
         .expect("captured fixture")
     }
 
-    fn rc_list(commands: &[&str]) -> String {
+    pub(crate) fn rc_list(commands: &[&str]) -> String {
         let cs: Vec<_> = commands
             .iter()
             .map(|c| serde_json::json!({ "Path": c }))

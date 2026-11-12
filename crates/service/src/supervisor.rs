@@ -85,6 +85,9 @@ pub struct SystemdSupervisor<M: UnitManager> {
     /// neither `XDG_CONFIG_HOME` nor `--config`.
     config_path: PathBuf,
     ready_timeout: Duration,
+    /// The service's own unit, which each mount unit is ordered before. See
+    /// `UnitSpec::before`.
+    stop_after: Option<String>,
     /// How long to wait for a mount point to be released after stopping its unit.
     gone_timeout: Duration,
     /// How long to wait for systemd to free the unit name.
@@ -126,6 +129,7 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             runtime_dir,
             config_path,
             ready_timeout: READY_TIMEOUT,
+            stop_after: None,
             gone_timeout: Duration::from_secs(30),
             unit_gone_timeout: Duration::from_secs(35),
             #[cfg(test)]
@@ -136,6 +140,12 @@ impl<M: UnitManager> SystemdSupervisor<M> {
             events: Arc::new(std::sync::Mutex::new(Vec::new())),
             locks: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Order every mount unit started from here before `unit`.
+    pub fn stopping_after(mut self, unit: Option<String>) -> Self {
+        self.stop_after = unit;
+        self
     }
 
     /// Point state reads at a fixture instead of `/proc`, and shorten the readiness wait.
@@ -229,6 +239,39 @@ impl<M: UnitManager> SystemdSupervisor<M> {
     /// The rc socket for a mount.
     pub fn socket_path(&self, name: &str) -> PathBuf {
         rc_socket_path(&self.runtime_dir, name)
+    }
+
+    /// The rclone argv this config starts a mount with.
+    fn argv_for(&self, m: &Mount) -> Vec<String> {
+        m.mount_args(
+            &self.socket_path(&m.name),
+            self.config.global.cache_dir.as_deref(),
+        )
+    }
+
+    /// Configured mounts whose unit is serving with a different argv from the one the
+    /// config would start it with now.
+    ///
+    /// A running mount keeps the flags it was started with, so an edited config reaches
+    /// it only when it is next mounted. A unit whose argv could not be read is not
+    /// reported: nothing is known about it either way.
+    pub async fn out_of_date(&self) -> Result<Vec<String>, SupervisorError> {
+        let loaded = self.units.list_units(UNIT_PREFIX).await?;
+        Ok(self
+            .config
+            .mounts
+            .iter()
+            .filter(|m| {
+                loaded.iter().any(|u| {
+                    u.name == m.unit_name()
+                        && u.status.is_serving()
+                        && u.serving
+                            .as_ref()
+                            .is_some_and(|s| s.args != self.argv_for(m))
+                })
+            })
+            .map(|m| m.name.clone())
+            .collect())
     }
 
     /// The `ExecStartPre` that clears leftovers before rclone is exec'd.
@@ -980,13 +1023,14 @@ impl<M: UnitManager> MountSupervisor for SystemdSupervisor<M> {
                     m.mount_point.display()
                 ),
                 executable: self.rclone.clone(),
-                args: m.mount_args(&self.socket_path(&m.name)),
+                args: self.argv_for(m),
                 // This binary, re-invoked to clear a stale socket or mount point.
                 pre_start: self.pre_start_hook(&m.name),
                 // Ordinary, because rclone applies this to every file it creates inside
                 // the mount. A mount with `allow_other` set so another service account
                 // can read it would get 0600 files and fail with EACCES on all of them.
                 umask: 0o022,
+                before: self.stop_after.clone(),
             };
             self.units.start_transient(&spec).await?;
             self.await_ready(m).await
@@ -1651,6 +1695,92 @@ mod tests {
             s.units.started.lock().unwrap().is_empty(),
             "an already-serving mount must not be started again"
         );
+    }
+
+    /// A supervisor over one `backup` mount carrying `extra_args`, with a `cache_dir`.
+    fn with_flags(tag: &str, status: UnitStatus) -> (Scratch, SystemdSupervisor<FakeUnits>) {
+        let scratch = Scratch::new(tag);
+        let mut config = Config::default();
+        config.global.cache_dir = Some(PathBuf::from("/var/cache/rvt-test"));
+        let mut m = a_mount("backup", mount_point(&scratch));
+        m.extra_args = vec!["--bwlimit".into(), "2M".into()];
+        config.mounts.push(m);
+        let units = FakeUnits::default();
+        *units.status.lock().unwrap() = status;
+        let s = SystemdSupervisor::new(
+            Arc::new(config),
+            PathBuf::from("/usr/bin/rclone"),
+            units,
+            scratch.join("run"),
+            PathBuf::from("/nonexistent/config.toml"),
+        )
+        .with_test_overrides(
+            fixture(&scratch, tag, &mountinfo_with(&[])),
+            Duration::from_millis(50),
+        );
+        (scratch, s)
+    }
+
+    #[tokio::test]
+    async fn extra_args_and_cache_dir_reach_the_unit_rclone_runs_in() {
+        let (_sc, s) = with_flags("flags-reach", UnitStatus::Inactive);
+        let _ = s.mount("backup").await;
+        let started = s.units.started.lock().unwrap();
+        let args = &started.first().expect("a unit was started").args;
+        assert!(
+            args.ends_with(&["--bwlimit".to_string(), "2M".to_string()]),
+            "extra_args must end the argv systemd runs: {args:?}"
+        );
+        let at = args
+            .iter()
+            .position(|a| a == "--cache-dir")
+            .expect("{args:?}");
+        assert_eq!(args[at + 1], "/var/cache/rvt-test");
+    }
+
+    #[tokio::test]
+    async fn a_mount_unit_is_ordered_before_the_service_that_started_it() {
+        // So a logout, which stops both at once, stops the service first.
+        let (_sc, s) = with_flags("flags-before", UnitStatus::Inactive);
+        let s = s.stopping_after(Some("rclone-vfsmount-trayd.service".into()));
+        let _ = s.mount("backup").await;
+        let started = s.units.started.lock().unwrap();
+        assert_eq!(
+            started
+                .first()
+                .expect("a unit was started")
+                .before
+                .as_deref(),
+            Some("rclone-vfsmount-trayd.service")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_unit_started_with_other_flags_is_reported_out_of_date() {
+        let (_sc, s) = with_flags("flags-drift", UnitStatus::Active);
+        let m = s.config.mounts[0].clone();
+        let unit = |args: Vec<String>| LoadedUnit {
+            name: m.unit_name(),
+            status: UnitStatus::Active,
+            serving: Some(Serving {
+                fs_spec: m.fs_spec(),
+                mount_point: m.mount_point.clone(),
+                args,
+            }),
+        };
+
+        *s.units.loaded.lock().unwrap() = vec![unit(s.argv_for(&m))];
+        assert!(s.out_of_date().await.unwrap().is_empty(), "argv matches");
+
+        // What adopting a mount started before `extra_args` was edited looks like.
+        let mut old = s.argv_for(&m);
+        old.truncate(old.len() - 2);
+        *s.units.loaded.lock().unwrap() = vec![unit(old.clone())];
+        assert_eq!(s.out_of_date().await.unwrap(), ["backup"]);
+
+        // Not serving, so there is nothing running to be out of date.
+        s.units.loaded.lock().unwrap()[0].status = UnitStatus::Failed;
+        assert!(s.out_of_date().await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -2563,6 +2693,7 @@ mod tests {
             serving: Some(Serving {
                 fs_spec: "backup:pictures".into(),
                 mount_point: mp.clone(),
+                args: Vec::new(),
             }),
         });
 
@@ -2607,6 +2738,7 @@ mod tests {
             serving: Some(Serving {
                 fs_spec: "backup:pictures".into(),
                 mount_point: held.clone(),
+                args: Vec::new(),
             }),
         });
 
@@ -2737,6 +2869,7 @@ mod tests {
             serving: Some(Serving {
                 fs_spec: "backup:pictures".into(),
                 mount_point: link,
+                args: Vec::new(),
             }),
         });
 
@@ -2815,6 +2948,7 @@ mod tests {
                 serving: Some(Serving {
                     fs_spec: "backup:pictures".into(),
                     mount_point: one.clone(),
+                    args: Vec::new(),
                 }),
             },
             LoadedUnit {
@@ -2823,6 +2957,7 @@ mod tests {
                 serving: Some(Serving {
                     fs_spec: "backup:pictures".into(),
                     mount_point: two.clone(),
+                    args: Vec::new(),
                 }),
             },
         ]);
@@ -3047,6 +3182,7 @@ mod tests {
                     serving: Some(Serving {
                         fs_spec: "backup:pictures".into(),
                         mount_point: point.clone(),
+                        args: Vec::new(),
                     }),
                 },
                 LoadedUnit {
@@ -3055,6 +3191,7 @@ mod tests {
                     serving: Some(Serving {
                         fs_spec: "backup:pictures".into(),
                         mount_point: point.clone(),
+                        args: Vec::new(),
                     }),
                 },
             ]);
@@ -3103,6 +3240,7 @@ mod tests {
                 serving: Some(Serving {
                     fs_spec: "backup:pictures".into(),
                     mount_point: point.clone(),
+                    args: Vec::new(),
                 }),
             });
         }
@@ -3154,6 +3292,7 @@ mod tests {
         s.units.loaded.lock().unwrap()[0].serving = Some(Serving {
             fs_spec: "ali:".into(),
             mount_point: mount_point(&sc),
+            args: Vec::new(),
         });
 
         let found = s.reconcile().await.unwrap();
@@ -3185,6 +3324,7 @@ mod tests {
             serving: Some(Serving {
                 fs_spec: "backup:pictures".into(),
                 mount_point: point.clone(),
+                args: Vec::new(),
             }),
         };
 
@@ -3219,6 +3359,7 @@ mod tests {
                 serving: Some(Serving {
                     fs_spec: "ali:".into(),
                     mount_point: mount_point(&sc),
+                    args: Vec::new(),
                 }),
             };
 
@@ -3247,6 +3388,7 @@ mod tests {
             serving: Some(Serving {
                 fs_spec: "backup:pictures".into(),
                 mount_point: PathBuf::from(other),
+                args: Vec::new(),
             }),
         });
 
@@ -3322,6 +3464,7 @@ mod tests {
                 serving: Some(Serving {
                     fs_spec: "backup:gone".into(),
                     mount_point: PathBuf::from("/tmp/never-mounted"),
+                    args: Vec::new(),
                 }),
             },
             LoadedUnit {

@@ -4,6 +4,7 @@
 //! `/proc` and systemd. `Mount` and `Unmount` are the exceptions — they act, and return
 //! when the mount is actually up or down.
 
+use crate::automount::AutoMount;
 use crate::registry::{self, Change, Registry};
 use crate::watch::Nudge;
 use rvt_core::ipc::{self, IpcError, MountView, TransferView};
@@ -24,6 +25,8 @@ pub struct MountManager {
     /// Poked after an action so the watcher publishes its result now rather than at the
     /// next sweep, and re-probes the mount that was acted on.
     nudge: Arc<Nudge>,
+    /// Told when a client acts on a mount, which ends any auto-mount retry for it.
+    auto: Arc<AutoMount>,
     rclone_version: String,
 }
 
@@ -33,6 +36,7 @@ impl MountManager {
         registry: Arc<Mutex<Registry>>,
         config: Arc<Config>,
         nudge: Arc<Nudge>,
+        auto: Arc<AutoMount>,
         rclone_version: impl Into<String>,
     ) -> Self {
         Self {
@@ -40,6 +44,7 @@ impl MountManager {
             registry,
             config,
             nudge,
+            auto,
             rclone_version: rclone_version.into(),
         }
     }
@@ -81,6 +86,7 @@ impl MountManager {
 
     async fn mount(&self, name: &str) -> Result<(), IpcError> {
         self.must_know(name).await?;
+        self.auto.release(name).await;
         let result = self.sup.mount(name).await;
         if touched_something(&result) {
             self.nudge.acted_on(name);
@@ -103,6 +109,7 @@ impl MountManager {
         // arbitrary text into the journal. See DESIGN.md, "D-Bus, and only for sandboxed
         // callers".
         self.must_know(name).await?;
+        self.auto.release(name).await;
         if force {
             tracing::warn!(
                 mount = name,
@@ -352,7 +359,8 @@ mod tests {
         mounts: Vec<MountView>,
         config: Arc<Config>,
     ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
-        connected_inner(sup, mounts, Arc::new(Nudge::default()), config).await
+        let auto = Arc::new(AutoMount::new(&config));
+        connected_inner(sup, mounts, Arc::new(Nudge::default()), config, auto).await
     }
 
     async fn connected_with(
@@ -360,7 +368,9 @@ mod tests {
         mounts: Vec<MountView>,
         nudge: Arc<Nudge>,
     ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
-        connected_inner(sup, mounts, nudge, Arc::new(Config::default())).await
+        let config = Arc::new(Config::default());
+        let auto = Arc::new(AutoMount::new(&config));
+        connected_inner(sup, mounts, nudge, config, auto).await
     }
 
     async fn connected_inner(
@@ -368,14 +378,21 @@ mod tests {
         mounts: Vec<MountView>,
         nudge: Arc<Nudge>,
         config: Arc<Config>,
+        auto: Arc<AutoMount>,
     ) -> (zbus::Connection, zbus::Connection, Arc<Mutex<Registry>>) {
         let registry = Arc::new(Mutex::new(Registry::default()));
         registry.lock().await.observe_mounts(mounts);
 
         let (server_sock, client_sock) = tokio::net::UnixStream::pair().unwrap();
         let guid = zbus::Guid::generate();
-        let manager =
-            MountManager::new(sup, registry.clone(), config, nudge, "v1.75.0".to_string());
+        let manager = MountManager::new(
+            sup,
+            registry.clone(),
+            config,
+            nudge,
+            auto,
+            "v1.75.0".to_string(),
+        );
 
         let server = zbus::connection::Builder::socket(server_sock)
             .server(guid)
@@ -422,6 +439,7 @@ mod tests {
                 Arc::new(Mutex::new(Registry::default())),
                 Arc::new(Config::default()),
                 Arc::new(Nudge::default()),
+                Arc::new(AutoMount::new(&Config::default())),
                 "v1.75.0".to_string(),
             )
         };
@@ -548,6 +566,7 @@ mod tests {
             registry,
             Arc::new(config),
             Arc::new(Nudge::default()),
+            Arc::new(AutoMount::new(&Config::default())),
             "v1.75.0".to_string(),
         );
 
@@ -588,6 +607,36 @@ mod tests {
         assert!(view.degraded_reason.is_some());
 
         assert!(p.get_transfer_state("nope").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_client_acting_on_a_mount_takes_it_away_from_auto_mount() {
+        // Otherwise a mount the user just unmounted is brought back up by the next retry.
+        let config: Arc<rvt_core::Config> = Arc::new(
+            toml::from_str(
+                "version = 1\n\
+                 [[mount]]\nname = \"down\"\nremote = \"d\"\nmount_point = \"/mnt/down\"\n\
+                 [[mount]]\nname = \"up\"\nremote = \"d\"\nmount_point = \"/mnt/up\"\n",
+            )
+            .expect("fixture config"),
+        );
+        let auto = Arc::new(AutoMount::new(&config));
+        let (_server, client, _reg) = connected_inner(
+            Arc::new(FakeSupervisor::default()),
+            Vec::new(),
+            Arc::new(Nudge::default()),
+            config,
+            auto.clone(),
+        )
+        .await;
+        let p = proxy(&client).await;
+
+        assert!(auto.is_wanted("down").await && auto.is_wanted("up").await);
+        p.unmount("down", false).await.unwrap();
+        assert!(!auto.is_wanted("down").await, "Unmount must release it");
+        assert!(auto.is_wanted("up").await, "and nothing else");
+        p.mount("up").await.unwrap();
+        assert!(!auto.is_wanted("up").await, "Mount must release it too");
     }
 
     #[tokio::test]
